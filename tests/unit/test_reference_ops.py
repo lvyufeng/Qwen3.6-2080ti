@@ -9,11 +9,18 @@ from reference_ops import (
     embedding,
     full_attention,
     linear,
+    linear_attention,
     rms_norm,
     topk_route,
 )
 from runtime_config import parse_runtime_config
-from weight_mapping import ExpertMapping, FullAttentionMapping, LinearTensor, MoEMapping
+from weight_mapping import (
+    ExpertMapping,
+    FullAttentionMapping,
+    LinearAttentionMapping,
+    LinearTensor,
+    MoEMapping,
+)
 
 
 def test_embedding_matches_torch_indexing() -> None:
@@ -72,7 +79,17 @@ def test_topk_route_matches_qwen_softmax_then_renormalize() -> None:
 
 
 def test_full_attention_preserves_shape_and_causal_mask() -> None:
-    config = parse_runtime_config(_attention_config())
+    q_proj = torch.cat((torch.eye(4), torch.zeros((4, 4))), dim=0)
+    loader = _FakeLoader(
+        {
+            "q": q_proj,
+            "k": torch.eye(4),
+            "v": torch.eye(4),
+            "o": torch.eye(4),
+            "q_norm": torch.zeros(4),
+            "k_norm": torch.zeros(4),
+        }
+    )
     mapping = FullAttentionMapping(
         q_proj=_linear_shape("q", (8, 4)),
         k_proj=_linear_shape("k", (4, 4)),
@@ -81,25 +98,57 @@ def test_full_attention_preserves_shape_and_causal_mask() -> None:
         q_norm=_info("q_norm", (4,)),
         k_norm=_info("k_norm", (4,)),
     )
-    tensors = {
-        "q": torch.cat((torch.eye(4), torch.full((4, 4), 20.0)), dim=0),
-        "k": torch.eye(4),
-        "v": torch.eye(4),
-        "o": torch.eye(4),
-        "q_norm": torch.zeros(4),
-        "k_norm": torch.zeros(4),
-    }
-    weights = ReferenceWeights(_FakeLoader(tensors))
-    hidden = torch.tensor([[[1.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0]]])
-    changed_future = hidden.clone()
-    changed_future[:, 1] = torch.tensor([9.0, 9.0, 9.0, 9.0])
+    config = parse_runtime_config(_attention_config())
+    hidden = torch.tensor([[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]])
 
-    out = full_attention(hidden, mapping, config, weights)
-    changed_out = full_attention(changed_future, mapping, config, weights)
+    out = full_attention(hidden, mapping, config, ReferenceWeights(loader))
+    changed_future = hidden.clone()
+    changed_future[:, 2] = torch.tensor([10.0, 20.0, 30.0, 40.0])
+    changed_out = full_attention(changed_future, mapping, config, ReferenceWeights(loader))
 
     assert out.shape == hidden.shape
-    torch.testing.assert_close(out[:, 0], changed_out[:, 0])
-    assert not torch.allclose(out[:, 1], changed_out[:, 1])
+    torch.testing.assert_close(out[:, :2], changed_out[:, :2])
+    assert not torch.allclose(out[:, 2], changed_out[:, 2])
+
+
+def test_linear_attention_preserves_shape_and_causal_conv() -> None:
+    conv = torch.zeros((3, 1, 4))
+    conv[:, :, -1] = 1.0
+    loader = _FakeLoader(
+        {
+            "qkv": torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+            "z": torch.tensor([[1.0, 0.0]]),
+            "out": torch.tensor([[1.0], [2.0]]),
+            "a": torch.zeros((1, 2)),
+            "b": torch.zeros((1, 2)),
+            "conv": conv,
+            "a_log": torch.zeros(1),
+            "dt_bias": torch.zeros(1),
+            "norm": torch.ones(1),
+        }
+    )
+    mapping = LinearAttentionMapping(
+        in_proj_qkv=_linear_shape("qkv", (3, 2)),
+        in_proj_z=_linear_shape("z", (1, 2)),
+        out_proj=_linear_shape("out", (2, 1)),
+        in_proj_a=_linear_shape("a", (1, 2)),
+        in_proj_b=_linear_shape("b", (1, 2)),
+        conv1d_weight=_info("conv", (3, 1, 4)),
+        a_log=_info("a_log", (1,)),
+        dt_bias=_info("dt_bias", (1,)),
+        norm=_info("norm", (1,)),
+    )
+    config = parse_runtime_config(_config())
+    hidden = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]])
+
+    out = linear_attention(hidden, mapping, config, ReferenceWeights(loader))
+    changed_future = hidden.clone()
+    changed_future[:, 2] = torch.tensor([50.0, 60.0])
+    changed_out = linear_attention(changed_future, mapping, config, ReferenceWeights(loader))
+
+    assert out.shape == hidden.shape
+    torch.testing.assert_close(out[:, :2], changed_out[:, :2])
+    assert not torch.allclose(out[:, 2], changed_out[:, 2])
 
 
 def test_reference_weights_moe_matches_manual_top1_expert_path() -> None:

@@ -5,7 +5,7 @@ from typing import Any
 
 from loader import TensorLoader
 from runtime_config import RuntimeConfig
-from weight_mapping import ExpertMapping, FullAttentionMapping, LayerMapping, LinearTensor, MoEMapping
+from weight_mapping import ExpertMapping, FullAttentionMapping, LayerMapping, LinearAttentionMapping, LinearTensor, MoEMapping
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,20 @@ def rms_norm(hidden_states: Any, weight: Any, eps: float) -> Any:
     variance = hidden_states.float().pow(2).mean(dim=-1, keepdim=True)
     normalized = hidden_states.float() * variance.add(eps).rsqrt()
     return (normalized * (1.0 + weight.float())).to(hidden_states.dtype)
+
+
+def gated_rms_norm(hidden_states: Any, weight: Any, gate: Any, eps: float) -> Any:
+    import torch.nn.functional as F
+
+    variance = hidden_states.float().pow(2).mean(dim=-1, keepdim=True)
+    normalized = hidden_states.float() * variance.add(eps).rsqrt()
+    out = weight.float() * normalized.to(hidden_states.dtype)
+    return (out * F.silu(gate.float())).to(hidden_states.dtype)
+
+
+def l2_norm(hidden_states: Any, eps: float = 1e-6) -> Any:
+    states = hidden_states.float()
+    return states * (states * states).sum(dim=-1, keepdim=True).add(eps).rsqrt()
 
 
 def silu_mul(gate: Any, up: Any) -> Any:
@@ -68,6 +82,80 @@ def apply_rotary_pos_emb(query: Any, key: Any, cos: Any, sin: Any) -> tuple[Any,
     )
 
 
+def linear_attention(
+    hidden_states: Any,
+    mapping: LinearAttentionMapping,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+) -> Any:
+    import torch
+    import torch.nn.functional as F
+
+    batch, seq_len, _ = hidden_states.shape
+    linear_cfg = config.linear_attention
+    mixed_qkv = weights.linear(hidden_states, mapping.in_proj_qkv).transpose(1, 2)
+    conv_weight = weights.tensor(mapping.conv1d_weight.name).float()
+    mixed_qkv = F.conv1d(
+        mixed_qkv.float(),
+        conv_weight,
+        padding=linear_cfg.conv_kernel_dim - 1,
+        groups=linear_cfg.qkv_dim,
+    )[:, :, :seq_len]
+    mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)
+    query, key, value = torch.split(
+        mixed_qkv,
+        [
+            linear_cfg.key_heads * linear_cfg.key_head_dim,
+            linear_cfg.key_heads * linear_cfg.key_head_dim,
+            linear_cfg.value_state_dim,
+        ],
+        dim=-1,
+    )
+    query = query.reshape(batch, seq_len, linear_cfg.key_heads, linear_cfg.key_head_dim)
+    key = key.reshape(batch, seq_len, linear_cfg.key_heads, linear_cfg.key_head_dim)
+    value = value.reshape(batch, seq_len, linear_cfg.value_heads, linear_cfg.value_head_dim)
+    beta = torch.sigmoid(weights.linear(hidden_states, mapping.in_proj_b))
+    a = weights.linear(hidden_states, mapping.in_proj_a)
+    a_log = weights.tensor(mapping.a_log.name).float()
+    dt_bias = weights.tensor(mapping.dt_bias.name).float()
+    g = -a_log.exp() * F.softplus(a.float() + dt_bias)
+    repeats = linear_cfg.value_heads // linear_cfg.key_heads
+    if repeats > 1:
+        query = query.repeat_interleave(repeats, dim=2)
+        key = key.repeat_interleave(repeats, dim=2)
+    core = recurrent_gated_delta_rule(query, key, value, g, beta).reshape(-1, linear_cfg.value_head_dim)
+    z = weights.linear(hidden_states, mapping.in_proj_z).reshape(-1, linear_cfg.value_head_dim)
+    core = gated_rms_norm(core, weights.tensor(mapping.norm.name), z, config.rms_norm_eps)
+    core = core.reshape(batch, seq_len, linear_cfg.value_state_dim)
+    return weights.linear(core, mapping.out_proj).to(hidden_states.dtype)
+
+
+def recurrent_gated_delta_rule(query: Any, key: Any, value: Any, g: Any, beta: Any) -> Any:
+    import torch
+
+    initial_dtype = query.dtype
+    query = l2_norm(query).transpose(1, 2).float()
+    key = l2_norm(key).transpose(1, 2).float()
+    value = value.transpose(1, 2).float()
+    beta = beta.transpose(1, 2).float()
+    g = g.transpose(1, 2).float()
+    batch, heads, seq_len, key_dim = key.shape
+    value_dim = value.shape[-1]
+    query = query * (key_dim**-0.5)
+    state = torch.zeros(batch, heads, key_dim, value_dim, device=query.device, dtype=torch.float32)
+    output = torch.zeros(batch, heads, seq_len, value_dim, device=query.device, dtype=torch.float32)
+    for index in range(seq_len):
+        q_t = query[:, :, index]
+        k_t = key[:, :, index]
+        v_t = value[:, :, index]
+        state = state * g[:, :, index].exp().unsqueeze(-1).unsqueeze(-1)
+        kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
+        delta = (v_t - kv_mem) * beta[:, :, index].unsqueeze(-1)
+        state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        output[:, :, index] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
+    return output.transpose(1, 2).contiguous().to(initial_dtype)
+
+
 def full_attention(hidden_states: Any, mapping: FullAttentionMapping, config: RuntimeConfig, weights: ReferenceWeights) -> Any:
     import torch
 
@@ -96,11 +184,14 @@ def full_attention(hidden_states: Any, mapping: FullAttentionMapping, config: Ru
 
 
 def decoder_layer(hidden_states: Any, mapping: LayerMapping, config: RuntimeConfig, weights: ReferenceWeights) -> Any:
-    if mapping.layer_type != "full_attention":
-        raise ValueError(f"reference decoder layer only supports full_attention, got {mapping.layer_type}")
     residual = hidden_states
     hidden_states = rms_norm(hidden_states, weights.tensor(mapping.input_layernorm.name), config.rms_norm_eps)
-    hidden_states = residual + full_attention(hidden_states, mapping.attention, config, weights)
+    if mapping.layer_type == "full_attention":
+        hidden_states = residual + full_attention(hidden_states, mapping.attention, config, weights)
+    elif mapping.layer_type == "linear_attention":
+        hidden_states = residual + linear_attention(hidden_states, mapping.attention, config, weights)
+    else:
+        raise ValueError(f"unsupported reference layer type: {mapping.layer_type}")
     residual = hidden_states
     hidden_states = rms_norm(hidden_states, weights.tensor(mapping.post_attention_layernorm.name), config.rms_norm_eps)
     return residual + weights.moe(hidden_states, mapping.mlp, config)
