@@ -1,30 +1,17 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-from typing import Any
+
+from qwen36_2080ti.checkpoint import CheckpointError, Manifest, build_manifest
 
 
 class CliError(RuntimeError):
     pass
 
 
-def _load_config(model_dir: Path) -> dict[str, Any]:
-    config_path = model_dir / "config.json"
-    if not config_path.is_file():
-        raise CliError(f"missing config.json under {model_dir}")
-    try:
-        with config_path.open("r", encoding="utf-8") as f:
-            config = json.load(f)
-    except json.JSONDecodeError as exc:
-        raise CliError(f"invalid JSON in {config_path}: {exc}") from exc
-    if not isinstance(config, dict):
-        raise CliError(f"expected object in {config_path}")
-    return config
 
-
-def _summarize_config(config: dict[str, Any]) -> list[str]:
+def _summarize_config(config: dict[str, object]) -> list[str]:
     keys = [
         "model_type",
         "architectures",
@@ -45,16 +32,36 @@ def _summarize_config(config: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _summarize_manifest(manifest: Manifest) -> list[str]:
+    shard_count = len({tensor.shard for tensor in manifest.tensors.values()})
+    return [
+        f"safetensors_shards: {shard_count}",
+        f"tensor_count: {len(manifest.tensors)}",
+        f"fp8_tensor_count: {manifest.fp8_tensor_count}",
+        f"scale_links: {len(manifest.scale_of)}",
+        f"manifest_bytes: {manifest.total_bytes}",
+        f"manifest_params_without_scales: {manifest.param_count}",
+    ]
+
+
 def run(args: argparse.Namespace) -> int:
     model_dir = args.model.expanduser().resolve()
     if not model_dir.is_dir():
         raise CliError(f"model path is not a directory: {model_dir}")
 
-    config = _load_config(model_dir)
+    try:
+        manifest = build_manifest(model_dir)
+    except CheckpointError as exc:
+        raise CliError(str(exc)) from exc
+    config = manifest.config
     print("Loaded model config")
     print(f"model_dir: {model_dir}")
     for line in _summarize_config(config):
         print(line)
+    if args.inspect_checkpoint:
+        print("Loaded checkpoint manifest")
+        for line in _summarize_manifest(manifest):
+            print(line)
     print(f"prompt_tokens: pending tokenizer ({len(args.prompt)} prompt chars)")
     print(f"max_new_tokens: {args.max_new_tokens}")
     print("inference: not implemented yet")
@@ -69,6 +76,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=Path, required=True, help="Path to a Hugging Face model snapshot directory.")
     parser.add_argument("--prompt", required=True, help="Prompt text to generate from.")
     parser.add_argument("--max-new-tokens", type=int, default=16, help="Maximum number of tokens to generate.")
+    parser.add_argument(
+        "--inspect-checkpoint",
+        action="store_true",
+        help="Print safetensors manifest metadata without reading tensor payloads.",
+    )
     return parser
 
 

@@ -20,6 +20,8 @@ def test_cli_summarizes_model_config(tmp_path: Path, capsys) -> None:
         encoding="utf-8",
     )
 
+    (tmp_path / "model.safetensors").write_bytes(b"\x02\x00\x00\x00\x00\x00\x00\x00{}")
+
     rc = main(["--model", str(tmp_path), "--prompt", "hello", "--max-new-tokens", "1"])
 
     out = capsys.readouterr().out
