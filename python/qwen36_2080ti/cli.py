@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from qwen36_2080ti.checkpoint import CheckpointError, Manifest, build_manifest
+from qwen36_2080ti.fp8_smoke import Fp8SmokeReport, inspect_fp8_checkpoint
 
 
 class CliError(RuntimeError):
@@ -44,6 +45,21 @@ def _summarize_manifest(manifest: Manifest) -> list[str]:
     ]
 
 
+def _summarize_fp8(report: Fp8SmokeReport) -> list[str]:
+    missing = ",".join(report.missing_scales[:8])
+    if len(report.missing_scales) > 8:
+        missing += f",...(+{len(report.missing_scales) - 8})"
+    return [
+        f"fp8_smoke_ok: {report.ok}",
+        f"fp8_weight_tensors: {report.fp8_tensors}",
+        f"fp8_scale_links: {report.scale_links}",
+        f"fp8_missing_scales: {len(report.missing_scales)}",
+        f"fp8_weight_bytes: {report.fp8_bytes}",
+        f"fp8_scale_bytes: {report.scale_bytes}",
+        f"fp8_missing_scale_examples: {missing}" if missing else "fp8_missing_scale_examples: none",
+    ]
+
+
 def run(args: argparse.Namespace) -> int:
     model_dir = args.model.expanduser().resolve()
     if not model_dir.is_dir():
@@ -62,6 +78,13 @@ def run(args: argparse.Namespace) -> int:
         print("Loaded checkpoint manifest")
         for line in _summarize_manifest(manifest):
             print(line)
+    if args.smoke_fp8:
+        report = inspect_fp8_checkpoint(manifest)
+        print("FP8 checkpoint smoke")
+        for line in _summarize_fp8(report):
+            print(line)
+        if not report.ok:
+            raise CliError("FP8 checkpoint smoke failed")
     print(f"prompt_tokens: pending tokenizer ({len(args.prompt)} prompt chars)")
     print(f"max_new_tokens: {args.max_new_tokens}")
     print("inference: not implemented yet")
@@ -80,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--inspect-checkpoint",
         action="store_true",
         help="Print safetensors manifest metadata without reading tensor payloads.",
+    )
+    parser.add_argument(
+        "--smoke-fp8",
+        action="store_true",
+        help="Validate FP8 tensors have linked scale metadata before inference.",
     )
     return parser
 
