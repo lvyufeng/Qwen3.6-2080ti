@@ -5,6 +5,7 @@ from pathlib import Path
 
 from qwen36_2080ti.checkpoint import CheckpointError, Manifest, build_manifest
 from qwen36_2080ti.fp8_smoke import Fp8SmokeReport, inspect_fp8_checkpoint
+from qwen36_2080ti.weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 
 
 class CliError(RuntimeError):
@@ -13,6 +14,9 @@ class CliError(RuntimeError):
 
 
 def _summarize_config(config: dict[str, object]) -> list[str]:
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        config = text_config
     keys = [
         "model_type",
         "architectures",
@@ -60,6 +64,19 @@ def _summarize_fp8(report: Fp8SmokeReport) -> list[str]:
     ]
 
 
+def _summarize_mapping(mapping: LanguageModelMapping) -> list[str]:
+    return [
+        f"layers: {len(mapping.layers)}",
+        f"linear_attention_layers: {mapping.linear_attention_layers}",
+        f"full_attention_layers: {mapping.full_attention_layers}",
+        f"experts_per_layer: {mapping.experts_per_layer}",
+        f"routed_experts_total: {mapping.routed_experts}",
+        f"mapped_tensors: {len(mapping.mapped_tensor_names)}",
+        f"ignored_tensors: {len(mapping.ignored_tensor_names)}",
+        f"unmapped_language_tensors: {len(mapping.unmapped_language_tensor_names)}",
+    ]
+
+
 def run(args: argparse.Namespace) -> int:
     model_dir = args.model.expanduser().resolve()
     if not model_dir.is_dir():
@@ -85,6 +102,14 @@ def run(args: argparse.Namespace) -> int:
             print(line)
         if not report.ok:
             raise CliError("FP8 checkpoint smoke failed")
+    if args.inspect_mapping:
+        try:
+            mapping = build_language_model_mapping(manifest, strict=True)
+        except MappingError as exc:
+            raise CliError(str(exc)) from exc
+        print("Loaded language model mapping")
+        for line in _summarize_mapping(mapping):
+            print(line)
     print(f"prompt_tokens: pending tokenizer ({len(args.prompt)} prompt chars)")
     print(f"max_new_tokens: {args.max_new_tokens}")
     print("inference: not implemented yet")
@@ -108,6 +133,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--smoke-fp8",
         action="store_true",
         help="Validate FP8 tensors have linked scale metadata before inference.",
+    )
+    parser.add_argument(
+        "--inspect-mapping",
+        action="store_true",
+        help="Validate and summarize the text MoE tensor mapping.",
     )
     return parser
 
