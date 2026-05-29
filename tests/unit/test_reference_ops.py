@@ -8,6 +8,7 @@ import torch
 from checkpoint import TensorInfo
 from reference_ops import (
     ReferenceWeights,
+    decoder_layer,
     dequantize_fp8_weight,
     embedding,
     full_attention,
@@ -241,6 +242,71 @@ def test_language_model_logits_match_transformers_tiny_full_attention() -> None:
     torch.testing.assert_close(ref_logits, hf_logits, atol=0.0, rtol=0.0)
 
 
+def test_decoder_layer_matches_transformers_tiny_linear_attention() -> None:
+    transformers = pytest.importorskip("transformers")
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer, Qwen3_5MoeTextRotaryEmbedding
+
+    torch.manual_seed(1)
+    hidden_size = 4
+    vocab_size = 8
+    intermediate_size = 4
+    num_experts = 2
+    hf_config = Qwen3_5MoeTextConfig(
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        num_hidden_layers=1,
+        layer_types=["linear_attention"],
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=hidden_size,
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+        linear_conv_kernel_dim=4,
+        moe_intermediate_size=intermediate_size,
+        shared_expert_intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        num_experts_per_tok=1,
+        max_position_embeddings=8,
+        tie_word_embeddings=False,
+        use_cache=False,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000,
+            "partial_rotary_factor": 0.5,
+            "mrope_section": [1, 1, 1],
+        },
+    )
+    hf_layer = Qwen3_5MoeDecoderLayer(hf_config, 0).eval()
+    with torch.no_grad():
+        for parameter in hf_layer.parameters():
+            parameter.copy_(torch.randn_like(parameter) * 0.1)
+        hf_layer.mlp.gate.weight.zero_()
+        hf_layer.mlp.gate.weight[0, 0] = 5.0
+        hf_layer.mlp.gate.weight[1, 1] = 5.0
+
+    hidden = torch.randn(1, 3, hidden_size)
+    position_ids = torch.arange(hidden.shape[1]).unsqueeze(0)
+    rotary = Qwen3_5MoeTextRotaryEmbedding(hf_config)
+    position_embeddings = rotary(hidden, position_ids)
+    tensors = _tensors_from_transformers_tiny_linear_attention(hf_layer)
+    mapping = _tiny_linear_attention_layer_mapping(hidden_size, intermediate_size, num_experts)
+    config = parse_runtime_config(_tiny_linear_attention_config(hidden_size, vocab_size, intermediate_size, num_experts))
+
+    with torch.no_grad():
+        hf_out = hf_layer(
+            hidden,
+            position_embeddings=position_embeddings,
+            attention_mask=None,
+            position_ids=position_ids,
+        )
+        ref_out = decoder_layer(hidden, mapping, config, ReferenceWeights(_FakeLoader(tensors)))
+
+    torch.testing.assert_close(ref_out, hf_out, atol=0.0, rtol=0.0)
+
+
 def test_reference_weights_moe_matches_manual_top1_expert_path() -> None:
     loader = _FakeLoader(
         {
@@ -412,6 +478,115 @@ def _tiny_full_attention_mapping(
         ignored_tensor_names=frozenset(),
         unmapped_language_tensor_names=(),
     )
+
+
+def _tensors_from_transformers_tiny_linear_attention(layer) -> dict[str, torch.Tensor]:
+    tensors = {
+        "input_norm": layer.input_layernorm.weight.detach().clone(),
+        "post_norm": layer.post_attention_layernorm.weight.detach().clone(),
+        "qkv": layer.linear_attn.in_proj_qkv.weight.detach().clone(),
+        "z": layer.linear_attn.in_proj_z.weight.detach().clone(),
+        "out": layer.linear_attn.out_proj.weight.detach().clone(),
+        "a": layer.linear_attn.in_proj_a.weight.detach().clone(),
+        "b": layer.linear_attn.in_proj_b.weight.detach().clone(),
+        "conv": layer.linear_attn.conv1d.weight.detach().clone(),
+        "a_log": layer.linear_attn.A_log.detach().clone(),
+        "dt_bias": layer.linear_attn.dt_bias.detach().clone(),
+        "norm": layer.linear_attn.norm.weight.detach().clone(),
+        "gate": layer.mlp.gate.weight.detach().clone(),
+        "shared_gate": layer.mlp.shared_expert_gate.weight.detach().clone(),
+        "shared_gate_proj": layer.mlp.shared_expert.gate_proj.weight.detach().clone(),
+        "shared_up_proj": layer.mlp.shared_expert.up_proj.weight.detach().clone(),
+        "shared_down_proj": layer.mlp.shared_expert.down_proj.weight.detach().clone(),
+    }
+    for expert in range(layer.mlp.experts.gate_up_proj.shape[0]):
+        packed = layer.mlp.experts.gate_up_proj.detach()[expert]
+        intermediate = packed.shape[0] // 2
+        tensors[f"e{expert}_gate"] = packed[:intermediate].clone()
+        tensors[f"e{expert}_up"] = packed[intermediate:].clone()
+        tensors[f"e{expert}_down"] = layer.mlp.experts.down_proj.detach()[expert].clone()
+    return tensors
+
+
+def _tiny_linear_attention_layer_mapping(hidden_size: int, intermediate_size: int, num_experts: int) -> LayerMapping:
+    return LayerMapping(
+        index=0,
+        layer_type="linear_attention",
+        input_layernorm=_info("input_norm", (hidden_size,)),
+        attention=LinearAttentionMapping(
+            in_proj_qkv=_linear_shape("qkv", (6, hidden_size)),
+            in_proj_z=_linear_shape("z", (2, hidden_size)),
+            out_proj=_linear_shape("out", (hidden_size, 2)),
+            in_proj_a=_linear_shape("a", (1, hidden_size)),
+            in_proj_b=_linear_shape("b", (1, hidden_size)),
+            conv1d_weight=_info("conv", (6, 1, 4)),
+            a_log=_info("a_log", (1,)),
+            dt_bias=_info("dt_bias", (1,)),
+            norm=_info("norm", (2,)),
+        ),
+        post_attention_layernorm=_info("post_norm", (hidden_size,)),
+        mlp=_tiny_moe_mapping(hidden_size, intermediate_size, num_experts),
+    )
+
+
+def _tiny_moe_mapping(hidden_size: int, intermediate_size: int, num_experts: int) -> MoEMapping:
+    return MoEMapping(
+        gate=_info("gate", (num_experts, hidden_size)),
+        experts=tuple(
+            ExpertMapping(
+                expert,
+                _linear_shape(f"e{expert}_gate", (intermediate_size, hidden_size)),
+                _linear_shape(f"e{expert}_up", (intermediate_size, hidden_size)),
+                _linear_shape(f"e{expert}_down", (hidden_size, intermediate_size)),
+            )
+            for expert in range(num_experts)
+        ),
+        shared_expert=ExpertMapping(
+            -1,
+            _linear_shape("shared_gate_proj", (intermediate_size, hidden_size)),
+            _linear_shape("shared_up_proj", (intermediate_size, hidden_size)),
+            _linear_shape("shared_down_proj", (hidden_size, intermediate_size)),
+        ),
+        shared_expert_gate=_info("shared_gate", (1, hidden_size)),
+        expert_start=0,
+        expert_end=num_experts,
+        num_experts=num_experts,
+        tp=TensorParallel(world_size=1, rank=0),
+    )
+
+
+def _tiny_linear_attention_config(
+    hidden_size: int,
+    vocab_size: int,
+    intermediate_size: int,
+    num_experts: int,
+) -> dict[str, object]:
+    return {
+        "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "hidden_size": hidden_size,
+            "vocab_size": vocab_size,
+            "num_hidden_layers": 1,
+            "layer_types": ["linear_attention"],
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 1,
+            "linear_key_head_dim": 2,
+            "linear_value_head_dim": 2,
+            "linear_conv_kernel_dim": 4,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": hidden_size,
+            "attn_output_gate": True,
+            "num_experts": num_experts,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": intermediate_size,
+            "shared_expert_intermediate_size": intermediate_size,
+            "max_position_embeddings": 8,
+            "rms_norm_eps": 1e-6,
+            "partial_rotary_factor": 0.5,
+            "rope_parameters": {"rope_theta": 10000},
+        }
+    }
 
 
 def _tiny_full_attention_config(
