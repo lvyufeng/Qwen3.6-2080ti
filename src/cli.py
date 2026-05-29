@@ -6,7 +6,7 @@ from pathlib import Path
 from checkpoint import CheckpointError, Manifest, build_manifest
 from fp8_smoke import Fp8SmokeReport, inspect_fp8_checkpoint
 from loader import LoaderError, TensorLoader
-from reference_ops import ReferenceWeights, decoder_layer, embedding
+from reference_ops import ReferenceWeights, decoder_layer, embedding, language_model
 from runtime_config import ConfigError, RuntimeConfig, parse_runtime_config
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 
@@ -146,6 +146,34 @@ def _summarize_reference_prefill(
     ]
 
 
+def _summarize_reference_forward(
+    manifest: Manifest,
+    config: RuntimeConfig,
+    mapping: LanguageModelMapping,
+    prompt: str,
+    device: str,
+    max_tokens: int,
+) -> list[str]:
+    import torch
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(manifest.model_dir, local_files_only=True, trust_remote_code=True)
+    encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+    input_ids = encoded["input_ids"][:, :max_tokens].to(device)
+    with TensorLoader(manifest) as loader:
+        logits = language_model(input_ids, mapping, config, ReferenceWeights(loader, device=device))
+    return [
+        f"reference_device: {device}",
+        f"reference_prompt_tokens: {input_ids.numel()}",
+        f"reference_max_tokens: {max_tokens}",
+        f"reference_token_id_examples: {','.join(str(x) for x in input_ids.reshape(-1)[:8].tolist())}",
+        f"reference_layers: {len(mapping.layers)}",
+        f"reference_logits_shape: {tuple(logits.shape)}",
+        f"reference_logits_dtype: {logits.dtype}",
+        f"reference_logits_finite: {torch.isfinite(logits.float()).all().item()}",
+    ]
+
+
 def _reference_layer(mapping: LanguageModelMapping, layer_index: int | None):
     if layer_index is None:
         for layer in mapping.layers:
@@ -228,6 +256,25 @@ def run(args: argparse.Namespace) -> int:
             raise CliError(str(exc)) from exc
         except Exception as exc:
             raise CliError(f"reference prefill failed: {exc}") from exc
+    if args.reference_forward:
+        try:
+            runtime_config = parse_runtime_config(config)
+            mapping = build_language_model_mapping(manifest, strict=True)
+            device = args.reference_device or args.tensor_device or "cpu"
+            print("Reference forward smoke")
+            for line in _summarize_reference_forward(
+                manifest,
+                runtime_config,
+                mapping,
+                args.prompt,
+                device,
+                args.reference_max_tokens,
+            ):
+                print(line)
+        except (ConfigError, MappingError, LoaderError) as exc:
+            raise CliError(str(exc)) from exc
+        except Exception as exc:
+            raise CliError(f"reference forward failed: {exc}") from exc
     print(f"prompt_tokens: pending tokenizer ({len(args.prompt)} prompt chars)")
     print(f"max_new_tokens: {args.max_new_tokens}")
     print("inference: not implemented yet")
@@ -274,6 +321,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--reference-prefill",
         action="store_true",
         help="Tokenize the prompt and run embedding plus one full-attention reference decoder layer.",
+    )
+    parser.add_argument(
+        "--reference-forward",
+        action="store_true",
+        help="Tokenize the prompt and run the full reference language model to logits.",
     )
     parser.add_argument(
         "--reference-layer",

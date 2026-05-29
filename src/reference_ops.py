@@ -5,7 +5,15 @@ from typing import Any
 
 from loader import TensorLoader
 from runtime_config import RuntimeConfig
-from weight_mapping import ExpertMapping, FullAttentionMapping, LayerMapping, LinearAttentionMapping, LinearTensor, MoEMapping
+from weight_mapping import (
+    ExpertMapping,
+    FullAttentionMapping,
+    LanguageModelMapping,
+    LayerMapping,
+    LinearAttentionMapping,
+    LinearTensor,
+    MoEMapping,
+)
 
 
 @dataclass(frozen=True)
@@ -195,6 +203,14 @@ def decoder_layer(hidden_states: Any, mapping: LayerMapping, config: RuntimeConf
     residual = hidden_states
     hidden_states = rms_norm(hidden_states, weights.tensor(mapping.post_attention_layernorm.name), config.rms_norm_eps)
     return residual + weights.moe(hidden_states, mapping.mlp, config)
+
+
+def language_model(input_ids: Any, mapping: LanguageModelMapping, config: RuntimeConfig, weights: ReferenceWeights) -> Any:
+    hidden_states = embedding(input_ids, weights.tensor(mapping.embed_tokens.name))
+    for layer in mapping.layers:
+        hidden_states = decoder_layer(hidden_states, layer, config, weights)
+    hidden_states = rms_norm(hidden_states, weights.tensor(mapping.final_norm.name), config.rms_norm_eps)
+    return weights.linear(hidden_states, LinearTensor(weight=mapping.lm_head, scale=None))
 
 
 def _repeat_kv(hidden_states: Any, repeats: int) -> Any:

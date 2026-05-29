@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 
 from checkpoint import TensorInfo
@@ -8,6 +10,7 @@ from reference_ops import (
     dequantize_fp8_weight,
     embedding,
     full_attention,
+    language_model,
     linear,
     linear_attention,
     rms_norm,
@@ -17,6 +20,7 @@ from runtime_config import parse_runtime_config
 from weight_mapping import (
     ExpertMapping,
     FullAttentionMapping,
+    LanguageModelMapping,
     LinearAttentionMapping,
     LinearTensor,
     MoEMapping,
@@ -149,6 +153,33 @@ def test_linear_attention_preserves_shape_and_causal_conv() -> None:
     assert out.shape == hidden.shape
     torch.testing.assert_close(out[:, :2], changed_out[:, :2])
     assert not torch.allclose(out[:, 2], changed_out[:, 2])
+
+
+def test_language_model_runs_layers_final_norm_and_lm_head() -> None:
+    loader = _FakeLoader(
+        {
+            "embed": torch.eye(4, 2),
+            "final_norm": torch.zeros(2),
+            "lm_head": torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [-1.0, 0.0]]),
+        }
+    )
+    mapping = LanguageModelMapping(
+        model_dir=Path("."),
+        embed_tokens=_info("embed", (4, 2)),
+        final_norm=_info("final_norm", (2,)),
+        lm_head=_info("lm_head", (4, 2)),
+        layers=(),
+        mapped_tensor_names=frozenset(),
+        ignored_tensor_names=frozenset(),
+        unmapped_language_tensor_names=(),
+    )
+    config = parse_runtime_config(_config())
+    input_ids = torch.tensor([[0, 1]])
+
+    out = language_model(input_ids, mapping, config, ReferenceWeights(loader))
+
+    expected_hidden = rms_norm(embedding(input_ids, loader.tensor("embed")), loader.tensor("final_norm"), config.rms_norm_eps)
+    torch.testing.assert_close(out, expected_hidden.float() @ loader.tensor("lm_head").t())
 
 
 def test_reference_weights_moe_matches_manual_top1_expert_path() -> None:
