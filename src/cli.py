@@ -9,7 +9,7 @@ from loader import LoaderError, TensorLoader
 from reference_ops import ReferenceWeights, decoder_layer, embedding, language_model
 from runtime_config import ConfigError, RuntimeConfig, parse_runtime_config
 from tensor_parallel import TensorParallel
-from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes
+from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_language_model
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 
 
@@ -122,21 +122,14 @@ def _summarize_tp_mapping(manifest: Manifest, world_size: int) -> list[str]:
 def _summarize_tp_runtime_smoke(
     manifest: Manifest,
     runtime_config: RuntimeConfig,
-    world_size: int,
-    rank: int,
-    local_rank: int,
+    world_size: int | None,
+    rank: int | None,
+    local_rank: int | None,
     backend: str,
     init_method: str | None,
     device: str | None,
 ) -> list[str]:
-    launch = TpLaunchConfig.from_env(
-        world_size=world_size,
-        rank=rank,
-        local_rank=local_rank,
-        backend=backend,
-        init_method=init_method,
-        device=device,
-    )
+    launch = _tp_launch_from_args(world_size, rank, local_rank, backend, init_method, device)
     tp = TensorParallel(world_size=launch.world_size, rank=launch.rank)
     mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=tp)
     with TpRuntime(launch) as runtime:
@@ -155,6 +148,73 @@ def _summarize_tp_runtime_smoke(
             f"tp_runtime_mapped_tensors: {len(mapping.mapped_tensor_names)}",
             f"tp_runtime_mapped_bytes: {mapped_tensor_bytes(mapping)}",
         ]
+        runtime.barrier()
+        return lines
+
+
+def _tp_launch_from_args(
+    world_size: int | None,
+    rank: int | None,
+    local_rank: int | None,
+    backend: str,
+    init_method: str | None,
+    device: str | None,
+) -> TpLaunchConfig:
+    return TpLaunchConfig.from_env(
+        world_size=world_size,
+        rank=rank,
+        local_rank=local_rank,
+        backend=backend,
+        init_method=init_method,
+        device=device,
+    )
+
+
+def _summarize_tp_reference_forward(
+    manifest: Manifest,
+    runtime_config: RuntimeConfig,
+    prompt: str,
+    max_tokens: int,
+    world_size: int | None,
+    rank: int | None,
+    local_rank: int | None,
+    backend: str,
+    init_method: str | None,
+    device: str | None,
+) -> list[str]:
+    import torch
+    from transformers import AutoTokenizer
+
+    launch = _tp_launch_from_args(world_size, rank, local_rank, backend, init_method, device)
+    tp = TensorParallel(world_size=launch.world_size, rank=launch.rank)
+    mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=tp)
+    with TpRuntime(launch) as runtime:
+        tokenizer = AutoTokenizer.from_pretrained(manifest.model_dir, local_files_only=True, trust_remote_code=True)
+        encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+        input_ids = encoded["input_ids"][:, :max_tokens].to(runtime.device)
+        with TensorLoader(manifest) as loader:
+            logits = tp_language_model(input_ids, mapping, runtime_config, ReferenceWeights(loader, device=str(runtime.device)), runtime)
+        last_logits = logits[:, -1].float()
+        top_value, top_index = torch.max(last_logits, dim=-1)
+        runtime.barrier()
+        lines = [
+            f"tp_reference_backend: {backend}",
+            f"tp_reference_world_size: {launch.world_size}",
+            f"tp_reference_rank: {launch.rank}",
+            f"tp_reference_device: {runtime.device}",
+            f"tp_reference_prompt_tokens: {input_ids.numel()}",
+            f"tp_reference_layers: {len(mapping.layers)}",
+            f"tp_reference_logits_shape: {tuple(logits.shape)}",
+            f"tp_reference_logits_dtype: {logits.dtype}",
+            f"tp_reference_logits_finite: {torch.isfinite(logits.float()).all().item()}",
+        ]
+        if launch.rank == 0:
+            lines.extend(
+                [
+                    f"tp_reference_next_token: {int(top_index.item())}",
+                    f"tp_reference_next_logit: {float(top_value.item())}",
+                ]
+            )
         runtime.barrier()
         return lines
 
@@ -323,6 +383,27 @@ def run(args: argparse.Namespace) -> int:
                 print(line)
         except (ConfigError, MappingError, TpRuntimeError) as exc:
             raise CliError(str(exc)) from exc
+    if args.tp_reference_forward:
+        try:
+            runtime_config = parse_runtime_config(config)
+            print("TP reference forward smoke")
+            for line in _summarize_tp_reference_forward(
+                manifest,
+                runtime_config,
+                args.prompt,
+                args.reference_max_tokens,
+                args.tp_world_size,
+                args.tp_rank,
+                args.tp_local_rank,
+                args.tp_backend,
+                args.tp_init_method,
+                args.tp_device,
+            ):
+                print(line)
+        except (ConfigError, MappingError, LoaderError, TpRuntimeError) as exc:
+            raise CliError(str(exc)) from exc
+        except Exception as exc:
+            raise CliError(f"TP reference forward failed: {exc}") from exc
     if args.reference_prefill:
         try:
             runtime_config = parse_runtime_config(config)
@@ -414,6 +495,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--tp-runtime-smoke",
         action="store_true",
         help="Initialize the TP runtime and print this rank's expert-parallel mapping summary.",
+    )
+    parser.add_argument(
+        "--tp-reference-forward",
+        action="store_true",
+        help="Run the prompt through the TP reference language model and report logits metadata.",
     )
     parser.add_argument("--tp-world-size", type=int, help="TP runtime world size; defaults to WORLD_SIZE or 1.")
     parser.add_argument("--tp-rank", type=int, help="TP runtime global rank; defaults to RANK or 0.")

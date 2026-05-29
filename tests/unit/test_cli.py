@@ -5,9 +5,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from cli import CliError, _reference_layer, main
-from test_weight_mapping import add_linear_attention_layer, add_moe, write_safetensors
+from test_weight_mapping import add_full_attention_layer, add_linear_attention_layer, add_moe, write_safetensors
 
 
 def test_cli_summarizes_model_config(tmp_path: Path, capsys) -> None:
@@ -127,6 +128,58 @@ def test_cli_tp_runtime_smoke_single_rank(tmp_path: Path, capsys) -> None:
     assert "tp_runtime_rank: 0" in out
     assert "tp_runtime_expert_range: [0,8)" in out
     assert "tp_runtime_experts_per_layer: 8" in out
+
+
+def test_cli_tp_reference_forward_single_rank(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _runtime_config()
+    text = config["text_config"]
+    text["hidden_size"] = 256
+    text["vocab_size"] = 320
+    text["num_hidden_layers"] = 1
+    text["layer_types"] = ["full_attention"]
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    tensors = {
+        "model.language_model.embed_tokens.weight": ("BF16", (320, 256)),
+        "model.language_model.norm.weight": ("BF16", (256,)),
+        "lm_head.weight": ("BF16", (320, 256)),
+    }
+    add_full_attention_layer(tensors, 0)
+    add_moe(tensors, 0)
+    write_safetensors(tmp_path / "model.safetensors", tensors)
+
+    class FakeTokenizer:
+        def __call__(self, prompt: str, *, return_tensors: str, add_special_tokens: bool):
+            assert return_tensors == "pt"
+            assert add_special_tokens is True
+            return {"input_ids": torch.tensor([[1]])}
+
+    transformers = pytest.importorskip("transformers")
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *_, **__: FakeTokenizer())
+
+    rc = main(
+        [
+            "--model",
+            str(tmp_path),
+            "--prompt",
+            "hello",
+            "--max-new-tokens",
+            "1",
+            "--tp-reference-forward",
+            "--tp-world-size",
+            "1",
+            "--tp-backend",
+            "gloo",
+            "--tp-device",
+            "cpu",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "TP reference forward smoke" in out
+    assert "tp_reference_logits_shape: (1, 1, 320)" in out
+    assert "tp_reference_logits_finite: True" in out
+    assert "tp_reference_next_token:" in out
 
 
 def test_reference_layer_defaults_to_first_full_attention_layer() -> None:
