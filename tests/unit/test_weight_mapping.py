@@ -41,8 +41,13 @@ def test_build_language_model_mapping_for_mixed_layers(tmp_path: Path) -> None:
             "linear_value_head_dim": 32,
             "linear_conv_kernel_dim": 4,
             "num_experts": 2,
+            "num_experts_per_tok": 1,
             "moe_intermediate_size": 128,
             "shared_expert_intermediate_size": 128,
+            "max_position_embeddings": 1024,
+            "rms_norm_eps": 1e-6,
+            "partial_rotary_factor": 0.25,
+            "rope_parameters": {"rope_theta": 10000000},
         }
     }
     (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")

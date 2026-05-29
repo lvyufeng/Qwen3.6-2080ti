@@ -18,7 +18,7 @@ dev = [
 qwen36-run = "cli:main"
 
 [tool.setuptools]
-py-modules = ["checkpoint", "cli", "fp8_smoke", "loader", "weight_mapping"]
+py-modules = ["checkpoint", "cli", "fp8_smoke", "loader", "runtime_config", "weight_mapping"]
 
 [tool.setuptools.package-dir]
 "" = "src"

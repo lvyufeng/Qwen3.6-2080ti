@@ -6,6 +6,7 @@ from pathlib import Path
 from checkpoint import CheckpointError, Manifest, build_manifest
 from fp8_smoke import Fp8SmokeReport, inspect_fp8_checkpoint
 from loader import LoaderError, TensorLoader
+from runtime_config import ConfigError, RuntimeConfig, parse_runtime_config
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 
 
@@ -36,6 +37,23 @@ def _summarize_config(config: dict[str, object]) -> list[str]:
         if key in config:
             lines.append(f"{key}: {config[key]}")
     return lines
+
+
+def _summarize_runtime_config(config: RuntimeConfig) -> list[str]:
+    return [
+        f"runtime_model_type: {config.model_type}",
+        f"runtime_layers: {config.num_hidden_layers}",
+        f"runtime_linear_attention_layers: {config.linear_attention_layers}",
+        f"runtime_full_attention_layers: {config.full_attention_layers}",
+        f"runtime_hidden_size: {config.hidden_size}",
+        f"runtime_linear_qkv_dim: {config.linear_attention.qkv_dim}",
+        f"runtime_linear_value_state_dim: {config.linear_attention.value_state_dim}",
+        f"runtime_attention_q_dim: {config.full_attention.q_dim}",
+        f"runtime_attention_kv_dim: {config.full_attention.kv_dim}",
+        f"runtime_experts_per_layer: {config.moe.num_experts}",
+        f"runtime_experts_per_token: {config.moe.experts_per_token}",
+        f"runtime_fp8_block_size: {config.fp8_block_size}",
+    ]
 
 
 def _summarize_manifest(manifest: Manifest) -> list[str]:
@@ -108,6 +126,14 @@ def run(args: argparse.Namespace) -> int:
     print(f"model_dir: {model_dir}")
     for line in _summarize_config(config):
         print(line)
+    if args.inspect_config:
+        try:
+            runtime_config = parse_runtime_config(config)
+        except ConfigError as exc:
+            raise CliError(str(exc)) from exc
+        print("Loaded runtime config")
+        for line in _summarize_runtime_config(runtime_config):
+            print(line)
     if args.inspect_checkpoint:
         print("Loaded checkpoint manifest")
         for line in _summarize_manifest(manifest):
@@ -148,6 +174,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=Path, required=True, help="Path to a Hugging Face model snapshot directory.")
     parser.add_argument("--prompt", required=True, help="Prompt text to generate from.")
     parser.add_argument("--max-new-tokens", type=int, default=16, help="Maximum number of tokens to generate.")
+    parser.add_argument(
+        "--inspect-config",
+        action="store_true",
+        help="Validate and summarize runtime dimensions derived from config.json.",
+    )
     parser.add_argument(
         "--inspect-checkpoint",
         action="store_true",

@@ -2,11 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
 
 from checkpoint import Manifest, TensorInfo
-
-LayerType = Literal["linear_attention", "full_attention"]
+from runtime_config import ConfigError, LayerType, RuntimeConfig, parse_runtime_config
 
 
 class MappingError(RuntimeError):
@@ -96,8 +94,9 @@ class LanguageModelMapping:
 
 
 class _Builder:
-    def __init__(self, manifest: Manifest) -> None:
+    def __init__(self, manifest: Manifest, config: RuntimeConfig) -> None:
         self.manifest = manifest
+        self.config = config
         self.mapped: set[str] = set()
 
     def tensor(
@@ -139,20 +138,21 @@ class _Builder:
         except KeyError as exc:
             raise MappingError(f"{name}: missing FP8 scale tensor") from exc
         scale = self.tensor(scale_name)
-        expected_scale_shape = (_ceil_div(weight.shape[0], 128), _ceil_div(weight.shape[1], 128))
+        expected_scale_shape = self.config.fp8_scale_shape(weight.shape)
         if scale.shape != expected_scale_shape:
             raise MappingError(f"{scale.name}: expected shape {expected_scale_shape}, got {scale.shape}")
         return LinearTensor(weight=weight, scale=scale)
 
 
 def build_language_model_mapping(manifest: Manifest, *, strict: bool = True) -> LanguageModelMapping:
-    config = _text_config(manifest.config)
-    hidden_size = _required_int(config, "hidden_size")
-    vocab_size = _required_int(config, "vocab_size")
-    num_layers = _required_int(config, "num_hidden_layers")
-    layer_types = _layer_types(config, num_layers)
+    try:
+        config = parse_runtime_config(manifest.config)
+    except ConfigError as exc:
+        raise MappingError(str(exc)) from exc
+    hidden_size = config.hidden_size
+    vocab_size = config.vocab_size
 
-    builder = _Builder(manifest)
+    builder = _Builder(manifest, config)
     embed_tokens = builder.tensor(
         "model.language_model.embed_tokens.weight",
         shape=(vocab_size, hidden_size),
@@ -160,7 +160,7 @@ def build_language_model_mapping(manifest: Manifest, *, strict: bool = True) -> 
     )
     final_norm = builder.tensor("model.language_model.norm.weight", shape=(hidden_size,), dtype="BF16")
     lm_head = builder.tensor("lm_head.weight", shape=(vocab_size, hidden_size), dtype="BF16")
-    layers = tuple(_map_layer(builder, config, index, layer_type) for index, layer_type in enumerate(layer_types))
+    layers = tuple(_map_layer(builder, config, index, layer_type) for index, layer_type in enumerate(config.layer_types))
     mapped = frozenset(builder.mapped)
     unmapped_language = tuple(sorted(name for name in manifest.tensors if _is_language_tensor(name) and name not in mapped))
     if strict and unmapped_language:
@@ -178,8 +178,8 @@ def build_language_model_mapping(manifest: Manifest, *, strict: bool = True) -> 
     )
 
 
-def _map_layer(builder: _Builder, config: dict[str, Any], index: int, layer_type: LayerType) -> LayerMapping:
-    hidden_size = _required_int(config, "hidden_size")
+def _map_layer(builder: _Builder, config: RuntimeConfig, index: int, layer_type: LayerType) -> LayerMapping:
+    hidden_size = config.hidden_size
     prefix = f"model.language_model.layers.{index}."
     input_layernorm = builder.tensor(prefix + "input_layernorm.weight", shape=(hidden_size,), dtype="BF16")
     if layer_type == "linear_attention":
@@ -202,57 +202,47 @@ def _map_layer(builder: _Builder, config: dict[str, Any], index: int, layer_type
     )
 
 
-def _map_linear_attention(builder: _Builder, config: dict[str, Any], prefix: str) -> LinearAttentionMapping:
-    hidden_size = _required_int(config, "hidden_size")
-    key_heads = _required_int(config, "linear_num_key_heads")
-    value_heads = _required_int(config, "linear_num_value_heads")
-    key_dim = _required_int(config, "linear_key_head_dim")
-    value_dim = _required_int(config, "linear_value_head_dim")
-    conv_kernel = _required_int(config, "linear_conv_kernel_dim")
-    qkv_dim = key_heads * key_dim * 2 + value_heads * value_dim
-    value_state = value_heads * value_dim
+def _map_linear_attention(builder: _Builder, config: RuntimeConfig, prefix: str) -> LinearAttentionMapping:
+    hidden_size = config.hidden_size
+    linear = config.linear_attention
     p = prefix + "linear_attn."
     return LinearAttentionMapping(
-        in_proj_qkv=builder.linear(p + "in_proj_qkv.weight", shape=(qkv_dim, hidden_size), fp8=True),
-        in_proj_z=builder.linear(p + "in_proj_z.weight", shape=(value_state, hidden_size), fp8=True),
-        out_proj=builder.linear(p + "out_proj.weight", shape=(hidden_size, value_state), fp8=True),
-        in_proj_a=builder.linear(p + "in_proj_a.weight", shape=(value_heads, hidden_size), fp8=False),
-        in_proj_b=builder.linear(p + "in_proj_b.weight", shape=(value_heads, hidden_size), fp8=False),
-        conv1d_weight=builder.tensor(p + "conv1d.weight", shape=(qkv_dim, 1, conv_kernel), dtype="BF16"),
-        a_log=builder.tensor(p + "A_log", shape=(value_heads,), dtype="BF16"),
-        dt_bias=builder.tensor(p + "dt_bias", shape=(value_heads,), dtype="BF16"),
-        norm=builder.tensor(p + "norm.weight", shape=(value_dim,), dtype="BF16"),
+        in_proj_qkv=builder.linear(p + "in_proj_qkv.weight", shape=(linear.qkv_dim, hidden_size), fp8=True),
+        in_proj_z=builder.linear(p + "in_proj_z.weight", shape=(linear.value_state_dim, hidden_size), fp8=True),
+        out_proj=builder.linear(p + "out_proj.weight", shape=(hidden_size, linear.value_state_dim), fp8=True),
+        in_proj_a=builder.linear(p + "in_proj_a.weight", shape=(linear.value_heads, hidden_size), fp8=False),
+        in_proj_b=builder.linear(p + "in_proj_b.weight", shape=(linear.value_heads, hidden_size), fp8=False),
+        conv1d_weight=builder.tensor(p + "conv1d.weight", shape=(linear.qkv_dim, 1, linear.conv_kernel_dim), dtype="BF16"),
+        a_log=builder.tensor(p + "A_log", shape=(linear.value_heads,), dtype="BF16"),
+        dt_bias=builder.tensor(p + "dt_bias", shape=(linear.value_heads,), dtype="BF16"),
+        norm=builder.tensor(p + "norm.weight", shape=(linear.value_head_dim,), dtype="BF16"),
     )
 
 
-def _map_full_attention(builder: _Builder, config: dict[str, Any], prefix: str) -> FullAttentionMapping:
-    hidden_size = _required_int(config, "hidden_size")
-    num_heads = _required_int(config, "num_attention_heads")
-    num_kv_heads = _required_int(config, "num_key_value_heads")
-    head_dim = _required_int(config, "head_dim")
-    attn_dim = num_heads * head_dim
-    kv_dim = num_kv_heads * head_dim
-    q_dim = attn_dim * (2 if config.get("attn_output_gate") else 1)
+def _map_full_attention(builder: _Builder, config: RuntimeConfig, prefix: str) -> FullAttentionMapping:
+    hidden_size = config.hidden_size
+    full = config.full_attention
     p = prefix + "self_attn."
     return FullAttentionMapping(
-        q_proj=builder.linear(p + "q_proj.weight", shape=(q_dim, hidden_size), fp8=True),
-        k_proj=builder.linear(p + "k_proj.weight", shape=(kv_dim, hidden_size), fp8=True),
-        v_proj=builder.linear(p + "v_proj.weight", shape=(kv_dim, hidden_size), fp8=True),
-        o_proj=builder.linear(p + "o_proj.weight", shape=(hidden_size, attn_dim), fp8=True),
-        q_norm=builder.tensor(p + "q_norm.weight", shape=(head_dim,), dtype="BF16"),
-        k_norm=builder.tensor(p + "k_norm.weight", shape=(head_dim,), dtype="BF16"),
+        q_proj=builder.linear(p + "q_proj.weight", shape=(full.q_dim, hidden_size), fp8=True),
+        k_proj=builder.linear(p + "k_proj.weight", shape=(full.kv_dim, hidden_size), fp8=True),
+        v_proj=builder.linear(p + "v_proj.weight", shape=(full.kv_dim, hidden_size), fp8=True),
+        o_proj=builder.linear(p + "o_proj.weight", shape=(hidden_size, full.attn_dim), fp8=True),
+        q_norm=builder.tensor(p + "q_norm.weight", shape=(full.head_dim,), dtype="BF16"),
+        k_norm=builder.tensor(p + "k_norm.weight", shape=(full.head_dim,), dtype="BF16"),
     )
 
 
-def _map_moe(builder: _Builder, config: dict[str, Any], prefix: str) -> MoEMapping:
-    hidden_size = _required_int(config, "hidden_size")
-    num_experts = _required_int(config, "num_experts")
-    expert_size = _required_int(config, "moe_intermediate_size")
-    shared_size = _required_int(config, "shared_expert_intermediate_size")
+def _map_moe(builder: _Builder, config: RuntimeConfig, prefix: str) -> MoEMapping:
+    hidden_size = config.hidden_size
+    moe = config.moe
     return MoEMapping(
-        gate=builder.tensor(prefix + "gate.weight", shape=(num_experts, hidden_size), dtype="BF16"),
-        experts=tuple(_map_expert(builder, f"{prefix}experts.{i}.", hidden_size, expert_size) for i in range(num_experts)),
-        shared_expert=_map_expert(builder, prefix + "shared_expert.", hidden_size, shared_size),
+        gate=builder.tensor(prefix + "gate.weight", shape=(moe.num_experts, hidden_size), dtype="BF16"),
+        experts=tuple(
+            _map_expert(builder, f"{prefix}experts.{i}.", hidden_size, moe.intermediate_size)
+            for i in range(moe.num_experts)
+        ),
+        shared_expert=_map_expert(builder, prefix + "shared_expert.", hidden_size, moe.shared_intermediate_size),
         shared_expert_gate=builder.tensor(prefix + "shared_expert_gate.weight", shape=(1, hidden_size), dtype="BF16"),
     )
 
@@ -265,33 +255,5 @@ def _map_expert(builder: _Builder, prefix: str, hidden_size: int, intermediate_s
     )
 
 
-def _text_config(config: dict[str, Any]) -> dict[str, Any]:
-    text_config = config.get("text_config")
-    return text_config if isinstance(text_config, dict) else config
-
-
-def _layer_types(config: dict[str, Any], num_layers: int) -> tuple[LayerType, ...]:
-    raw = config.get("layer_types")
-    if not isinstance(raw, list) or len(raw) != num_layers:
-        raise MappingError(f"expected layer_types list with {num_layers} entries")
-    layer_types: list[LayerType] = []
-    for index, value in enumerate(raw):
-        if value not in ("linear_attention", "full_attention"):
-            raise MappingError(f"unsupported layer type at {index}: {value!r}")
-        layer_types.append(value)
-    return tuple(layer_types)
-
-
-def _required_int(config: dict[str, Any], key: str) -> int:
-    value = config.get(key)
-    if not isinstance(value, int):
-        raise MappingError(f"missing integer text_config.{key}")
-    return value
-
-
 def _is_language_tensor(name: str) -> bool:
     return name == "lm_head.weight" or name.startswith("model.language_model.")
-
-
-def _ceil_div(value: int, divisor: int) -> int:
-    return (value + divisor - 1) // divisor
