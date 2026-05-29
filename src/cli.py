@@ -9,6 +9,7 @@ from loader import LoaderError, TensorLoader
 from reference_ops import ReferenceWeights, decoder_layer, embedding, language_model
 from runtime_config import ConfigError, RuntimeConfig, parse_runtime_config
 from tensor_parallel import TensorParallel
+from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 
 
@@ -116,6 +117,46 @@ def _summarize_tp_mapping(manifest: Manifest, world_size: int) -> list[str]:
     lines.append(f"tp_dense_routed_experts: {dense.routed_experts}")
     lines.append(f"tp_partition_complete: {total_local == dense.routed_experts}")
     return lines
+
+
+def _summarize_tp_runtime_smoke(
+    manifest: Manifest,
+    runtime_config: RuntimeConfig,
+    world_size: int,
+    rank: int,
+    local_rank: int,
+    backend: str,
+    init_method: str | None,
+    device: str | None,
+) -> list[str]:
+    launch = TpLaunchConfig.from_env(
+        world_size=world_size,
+        rank=rank,
+        local_rank=local_rank,
+        backend=backend,
+        init_method=init_method,
+        device=device,
+    )
+    tp = TensorParallel(world_size=launch.world_size, rank=launch.rank)
+    mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=tp)
+    with TpRuntime(launch) as runtime:
+        runtime.barrier()
+        first_moe = mapping.layers[0].mlp
+        lines = [
+            f"tp_runtime_backend: {backend}",
+            f"tp_runtime_world_size: {launch.world_size}",
+            f"tp_runtime_rank: {launch.rank}",
+            f"tp_runtime_local_rank: {launch.local_rank}",
+            f"tp_runtime_device: {runtime.device}",
+            f"tp_runtime_layers: {runtime_config.num_hidden_layers}",
+            f"tp_runtime_expert_range: [{first_moe.expert_start},{first_moe.expert_end})",
+            f"tp_runtime_experts_per_layer: {mapping.experts_per_layer}",
+            f"tp_runtime_local_routed_experts: {mapping.routed_experts}",
+            f"tp_runtime_mapped_tensors: {len(mapping.mapped_tensor_names)}",
+            f"tp_runtime_mapped_bytes: {mapped_tensor_bytes(mapping)}",
+        ]
+        runtime.barrier()
+        return lines
 
 
 def _summarize_tensor_load(manifest: Manifest, name: str, device: str | None) -> list[str]:
@@ -265,6 +306,23 @@ def run(args: argparse.Namespace) -> int:
                 print(line)
         except LoaderError as exc:
             raise CliError(str(exc)) from exc
+    if args.tp_runtime_smoke:
+        try:
+            runtime_config = parse_runtime_config(config)
+            print("TP runtime smoke")
+            for line in _summarize_tp_runtime_smoke(
+                manifest,
+                runtime_config,
+                args.tp_world_size,
+                args.tp_rank,
+                args.tp_local_rank,
+                args.tp_backend,
+                args.tp_init_method,
+                args.tp_device,
+            ):
+                print(line)
+        except (ConfigError, MappingError, TpRuntimeError) as exc:
+            raise CliError(str(exc)) from exc
     if args.reference_prefill:
         try:
             runtime_config = parse_runtime_config(config)
@@ -353,6 +411,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optionally copy --inspect-tensor to this torch device, e.g. cpu or cuda:0.",
     )
     parser.add_argument(
+        "--tp-runtime-smoke",
+        action="store_true",
+        help="Initialize the TP runtime and print this rank's expert-parallel mapping summary.",
+    )
+    parser.add_argument("--tp-world-size", type=int, help="TP runtime world size; defaults to WORLD_SIZE or 1.")
+    parser.add_argument("--tp-rank", type=int, help="TP runtime global rank; defaults to RANK or 0.")
+    parser.add_argument("--tp-local-rank", type=int, help="TP runtime local CUDA rank; defaults to LOCAL_RANK or rank.")
+    parser.add_argument("--tp-backend", choices=("nccl", "gloo"), default="nccl", help="torch.distributed backend.")
+    parser.add_argument("--tp-init-method", help="torch.distributed init method, e.g. tcp://127.0.0.1:29500.")
+    parser.add_argument("--tp-device", help="Torch device override for this TP rank, e.g. cuda:0 or cpu.")
+    parser.add_argument(
         "--reference-prefill",
         action="store_true",
         help="Tokenize the prompt and run embedding plus one full-attention reference decoder layer.",
@@ -387,6 +456,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--max-new-tokens must be positive")
     if args.reference_max_tokens <= 0:
         parser.error("--reference-max-tokens must be positive")
+    if args.tp_world_size is not None and args.tp_world_size <= 0:
+        parser.error("--tp-world-size must be positive")
+    if args.tp_rank is not None and args.tp_rank < 0:
+        parser.error("--tp-rank must be non-negative")
+    if args.tp_world_size is not None and args.tp_rank is not None and args.tp_rank >= args.tp_world_size:
+        parser.error("--tp-rank must be in [0, --tp-world-size)")
+    if args.tp_local_rank is not None and args.tp_local_rank < 0:
+        parser.error("--tp-local-rank must be non-negative")
     if args.inspect_tp is not None and args.inspect_tp <= 0:
         parser.error("--inspect-tp must be positive")
     try:

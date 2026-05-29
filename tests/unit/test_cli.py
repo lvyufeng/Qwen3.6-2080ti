@@ -87,6 +87,48 @@ def test_cli_inspects_tp4_mapping(tmp_path: Path, capsys) -> None:
     assert "tp_partition_complete: True" in out
 
 
+def test_cli_tp_runtime_smoke_single_rank(tmp_path: Path, capsys) -> None:
+    config = _runtime_config()
+    text = config["text_config"]
+    text["num_hidden_layers"] = 1
+    text["layer_types"] = ["linear_attention"]
+    text["num_experts"] = 8
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    tensors = {
+        "model.language_model.embed_tokens.weight": ("BF16", (320, 256)),
+        "model.language_model.norm.weight": ("BF16", (256,)),
+        "lm_head.weight": ("BF16", (320, 256)),
+    }
+    add_linear_attention_layer(tensors, 0)
+    add_moe(tensors, 0, num_experts=8)
+    write_safetensors(tmp_path / "model.safetensors", tensors)
+
+    rc = main(
+        [
+            "--model",
+            str(tmp_path),
+            "--prompt",
+            "hello",
+            "--max-new-tokens",
+            "1",
+            "--tp-runtime-smoke",
+            "--tp-world-size",
+            "1",
+            "--tp-backend",
+            "gloo",
+            "--tp-device",
+            "cpu",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "TP runtime smoke" in out
+    assert "tp_runtime_rank: 0" in out
+    assert "tp_runtime_expert_range: [0,8)" in out
+    assert "tp_runtime_experts_per_layer: 8" in out
+
+
 def test_reference_layer_defaults_to_first_full_attention_layer() -> None:
     layer = _reference_layer(_mapping(("linear_attention", "full_attention")), None)
 
