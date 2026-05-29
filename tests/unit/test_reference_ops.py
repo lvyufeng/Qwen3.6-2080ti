@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from checkpoint import TensorInfo
@@ -16,12 +17,13 @@ from reference_ops import (
     rms_norm,
     topk_route,
 )
-from tensor_parallel import TensorParallel
 from runtime_config import parse_runtime_config
+from tensor_parallel import TensorParallel
 from weight_mapping import (
     ExpertMapping,
     FullAttentionMapping,
     LanguageModelMapping,
+    LayerMapping,
     LinearAttentionMapping,
     LinearTensor,
     MoEMapping,
@@ -183,6 +185,62 @@ def test_language_model_runs_layers_final_norm_and_lm_head() -> None:
     torch.testing.assert_close(out, expected_hidden.float() @ loader.tensor("lm_head").t())
 
 
+def test_language_model_logits_match_transformers_tiny_full_attention() -> None:
+    transformers = pytest.importorskip("transformers")
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
+
+    torch.manual_seed(0)
+    hidden_size = 4
+    vocab_size = 8
+    intermediate_size = 4
+    num_experts = 2
+    hf_config = Qwen3_5MoeTextConfig(
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        num_hidden_layers=1,
+        layer_types=["full_attention"],
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=hidden_size,
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+        moe_intermediate_size=intermediate_size,
+        shared_expert_intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        num_experts_per_tok=1,
+        max_position_embeddings=8,
+        tie_word_embeddings=False,
+        use_cache=False,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000,
+            "partial_rotary_factor": 0.5,
+            "mrope_section": [1, 1, 1],
+        },
+    )
+    model = Qwen3_5MoeForCausalLM(hf_config).eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.copy_(torch.randn_like(parameter) * 0.1)
+        model.model.layers[0].mlp.gate.weight.zero_()
+        model.model.layers[0].mlp.gate.weight[0, 0] = 5.0
+        model.model.layers[0].mlp.gate.weight[1, 1] = 5.0
+
+    tensors = _tensors_from_transformers_tiny_full_attention(model)
+    mapping = _tiny_full_attention_mapping(hidden_size, vocab_size, intermediate_size, num_experts)
+    config = parse_runtime_config(_tiny_full_attention_config(hidden_size, vocab_size, intermediate_size, num_experts))
+    input_ids = torch.tensor([[0, 1, 2]])
+
+    with torch.no_grad():
+        hf_logits = model(input_ids, use_cache=False).logits
+        ref_logits = language_model(input_ids, mapping, config, ReferenceWeights(_FakeLoader(tensors)))
+
+    torch.testing.assert_close(ref_logits, hf_logits, atol=0.0, rtol=0.0)
+
+
 def test_reference_weights_moe_matches_manual_top1_expert_path() -> None:
     loader = _FakeLoader(
         {
@@ -269,6 +327,125 @@ def _moe_mapping(local_experts: tuple[int, ...], tp: TensorParallel) -> MoEMappi
         num_experts=2,
         tp=tp,
     )
+
+
+def _tensors_from_transformers_tiny_full_attention(model) -> dict[str, torch.Tensor]:
+    layer = model.model.layers[0]
+    tensors = {
+        "embed": model.model.embed_tokens.weight.detach().clone(),
+        "final_norm": model.model.norm.weight.detach().clone(),
+        "lm_head": model.lm_head.weight.detach().clone(),
+        "q": layer.self_attn.q_proj.weight.detach().clone(),
+        "k": layer.self_attn.k_proj.weight.detach().clone(),
+        "v": layer.self_attn.v_proj.weight.detach().clone(),
+        "o": layer.self_attn.o_proj.weight.detach().clone(),
+        "q_norm": layer.self_attn.q_norm.weight.detach().clone(),
+        "k_norm": layer.self_attn.k_norm.weight.detach().clone(),
+        "input_norm": layer.input_layernorm.weight.detach().clone(),
+        "post_norm": layer.post_attention_layernorm.weight.detach().clone(),
+        "gate": layer.mlp.gate.weight.detach().clone(),
+        "shared_gate": layer.mlp.shared_expert_gate.weight.detach().clone(),
+        "shared_gate_proj": layer.mlp.shared_expert.gate_proj.weight.detach().clone(),
+        "shared_up_proj": layer.mlp.shared_expert.up_proj.weight.detach().clone(),
+        "shared_down_proj": layer.mlp.shared_expert.down_proj.weight.detach().clone(),
+    }
+    for expert in range(layer.mlp.experts.gate_up_proj.shape[0]):
+        packed = layer.mlp.experts.gate_up_proj.detach()[expert]
+        intermediate = packed.shape[0] // 2
+        tensors[f"e{expert}_gate"] = packed[:intermediate].clone()
+        tensors[f"e{expert}_up"] = packed[intermediate:].clone()
+        tensors[f"e{expert}_down"] = layer.mlp.experts.down_proj.detach()[expert].clone()
+    return tensors
+
+
+def _tiny_full_attention_mapping(
+    hidden_size: int,
+    vocab_size: int,
+    intermediate_size: int,
+    num_experts: int,
+) -> LanguageModelMapping:
+    return LanguageModelMapping(
+        model_dir=Path("."),
+        embed_tokens=_info("embed", (vocab_size, hidden_size)),
+        final_norm=_info("final_norm", (hidden_size,)),
+        lm_head=_info("lm_head", (vocab_size, hidden_size)),
+        layers=(
+            LayerMapping(
+                index=0,
+                layer_type="full_attention",
+                input_layernorm=_info("input_norm", (hidden_size,)),
+                attention=FullAttentionMapping(
+                    q_proj=_linear_shape("q", (hidden_size * 2, hidden_size)),
+                    k_proj=_linear_shape("k", (hidden_size, hidden_size)),
+                    v_proj=_linear_shape("v", (hidden_size, hidden_size)),
+                    o_proj=_linear_shape("o", (hidden_size, hidden_size)),
+                    q_norm=_info("q_norm", (hidden_size,)),
+                    k_norm=_info("k_norm", (hidden_size,)),
+                ),
+                post_attention_layernorm=_info("post_norm", (hidden_size,)),
+                mlp=MoEMapping(
+                    gate=_info("gate", (num_experts, hidden_size)),
+                    experts=tuple(
+                        ExpertMapping(
+                            expert,
+                            _linear_shape(f"e{expert}_gate", (intermediate_size, hidden_size)),
+                            _linear_shape(f"e{expert}_up", (intermediate_size, hidden_size)),
+                            _linear_shape(f"e{expert}_down", (hidden_size, intermediate_size)),
+                        )
+                        for expert in range(num_experts)
+                    ),
+                    shared_expert=ExpertMapping(
+                        -1,
+                        _linear_shape("shared_gate_proj", (intermediate_size, hidden_size)),
+                        _linear_shape("shared_up_proj", (intermediate_size, hidden_size)),
+                        _linear_shape("shared_down_proj", (hidden_size, intermediate_size)),
+                    ),
+                    shared_expert_gate=_info("shared_gate", (1, hidden_size)),
+                    expert_start=0,
+                    expert_end=num_experts,
+                    num_experts=num_experts,
+                    tp=TensorParallel(world_size=1, rank=0),
+                ),
+            ),
+        ),
+        mapped_tensor_names=frozenset(),
+        ignored_tensor_names=frozenset(),
+        unmapped_language_tensor_names=(),
+    )
+
+
+def _tiny_full_attention_config(
+    hidden_size: int,
+    vocab_size: int,
+    intermediate_size: int,
+    num_experts: int,
+) -> dict[str, object]:
+    return {
+        "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "hidden_size": hidden_size,
+            "vocab_size": vocab_size,
+            "num_hidden_layers": 1,
+            "layer_types": ["full_attention"],
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 1,
+            "linear_key_head_dim": 2,
+            "linear_value_head_dim": 2,
+            "linear_conv_kernel_dim": 4,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": hidden_size,
+            "attn_output_gate": True,
+            "num_experts": num_experts,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": intermediate_size,
+            "shared_expert_intermediate_size": intermediate_size,
+            "max_position_embeddings": 8,
+            "rms_norm_eps": 1e-6,
+            "partial_rotary_factor": 0.5,
+            "rope_parameters": {"rope_theta": 10000},
+        }
+    }
 
 
 class _FakeLoader:
