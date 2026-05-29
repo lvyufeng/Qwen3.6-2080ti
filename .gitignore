@@ -4,6 +4,7 @@
 /out/
 /dist/
 /*.egg-info/
+/src/*.egg-info/
 /CMakeFiles/
 /CMakeCache.txt
 /cmake_install.cmake

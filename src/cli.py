@@ -5,6 +5,7 @@ from pathlib import Path
 
 from checkpoint import CheckpointError, Manifest, build_manifest
 from fp8_smoke import Fp8SmokeReport, inspect_fp8_checkpoint
+from loader import LoaderError, TensorLoader
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 
 
@@ -77,6 +78,22 @@ def _summarize_mapping(mapping: LanguageModelMapping) -> list[str]:
     ]
 
 
+def _summarize_tensor_load(manifest: Manifest, name: str, device: str | None) -> list[str]:
+    with TensorLoader(manifest) as loader:
+        info = loader.tensor_info(name)
+        tensor = loader.tensor(name, device=device or "cpu")
+        return [
+            f"tensor_name: {info.name}",
+            f"tensor_dtype: {info.dtype}",
+            f"tensor_shape: {info.shape}",
+            f"tensor_shard: {info.shard}",
+            f"tensor_payload_bytes: {info.nbytes}",
+            f"torch_dtype: {tensor.dtype}",
+            f"torch_device: {tensor.device}",
+            f"torch_numel: {tensor.numel()}",
+        ]
+
+
 def run(args: argparse.Namespace) -> int:
     model_dir = args.model.expanduser().resolve()
     if not model_dir.is_dir():
@@ -110,6 +127,13 @@ def run(args: argparse.Namespace) -> int:
         print("Loaded language model mapping")
         for line in _summarize_mapping(mapping):
             print(line)
+    if args.inspect_tensor:
+        try:
+            print("Loaded tensor payload")
+            for line in _summarize_tensor_load(manifest, args.inspect_tensor, args.tensor_device):
+                print(line)
+        except LoaderError as exc:
+            raise CliError(str(exc)) from exc
     print(f"prompt_tokens: pending tokenizer ({len(args.prompt)} prompt chars)")
     print(f"max_new_tokens: {args.max_new_tokens}")
     print("inference: not implemented yet")
@@ -138,6 +162,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--inspect-mapping",
         action="store_true",
         help="Validate and summarize the text MoE tensor mapping.",
+    )
+    parser.add_argument(
+        "--inspect-tensor",
+        help="Read one tensor payload by name and print its location and decoded shape.",
+    )
+    parser.add_argument(
+        "--tensor-device",
+        help="Optionally copy --inspect-tensor to this torch device, e.g. cpu or cuda:0.",
     )
     return parser
 
