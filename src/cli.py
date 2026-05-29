@@ -143,6 +143,47 @@ def _summarize_tp_shards(mapping: LanguageModelMapping) -> list[str]:
     return lines
 
 
+def _cuda_memory_lines(prefix: str, device) -> list[str]:
+    if getattr(device, "type", None) != "cuda":
+        return [f"{prefix}_cuda_memory: unavailable"]
+    import torch
+
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    return [
+        f"{prefix}_cuda_memory_free: {free_bytes}",
+        f"{prefix}_cuda_memory_total: {total_bytes}",
+        f"{prefix}_cuda_max_allocated: {torch.cuda.max_memory_allocated(device)}",
+        f"{prefix}_cuda_max_reserved: {torch.cuda.max_memory_reserved(device)}",
+    ]
+
+
+def _tensor_report_lines(prefix: str, weights: MappedWeights, names: list[str]) -> list[str]:
+    lines: list[str] = []
+    for label, name in enumerate(names):
+        try:
+            tensor = weights.tensor(name)
+        except KeyError:
+            continue
+        lines.append(
+            f"{prefix}_tensor_{label}: name={name} shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device}"
+        )
+    return lines
+
+
+def _representative_tensor_names(mapping: LanguageModelMapping) -> list[str]:
+    first_layer = mapping.layers[0]
+    names = [mapping.embed_tokens.name, mapping.lm_head.name]
+    attention = first_layer.attention
+    if first_layer.layer_type == "full_attention":
+        names.extend([attention.q_proj.weight.name, attention.o_proj.weight.name])
+    else:
+        names.extend([attention.in_proj_qkv.weight.name, attention.out_proj.weight.name])
+    if first_layer.mlp.experts:
+        names.append(first_layer.mlp.experts[0].gate_proj.weight.name)
+    names.append(first_layer.mlp.shared_expert.gate_proj.weight.name)
+    return names
+
+
 def _summarize_tp_mapping(manifest: Manifest, world_size: int) -> list[str]:
     lines = [f"tp_world_size: {world_size}"]
     total_local = 0
@@ -257,6 +298,7 @@ def _summarize_tp_reference_forward(
             f"tp_reference_logits_dtype: {logits.dtype}",
             f"tp_reference_logits_finite: {torch.isfinite(logits.float()).all().item()}",
         ]
+        lines.extend(_cuda_memory_lines("tp_reference", runtime.device))
         if launch.rank == 0:
             lines.extend(
                 [
@@ -297,7 +339,9 @@ def _summarize_tp_load_smoke(
             f"tp_load_mapped_bytes: {mapped_tensor_bytes(mapping)}",
             f"tp_load_loaded_bytes: {stats.bytes}",
         ]
+        lines.extend(_cuda_memory_lines("tp_load", runtime.device))
         lines.extend(f"tp_load_shard_{line.strip()}" for line in _summarize_tp_shards(mapping))
+        lines.extend(_tensor_report_lines("tp_load", weights, _representative_tensor_names(mapping)))
         runtime.barrier()
         return lines
 

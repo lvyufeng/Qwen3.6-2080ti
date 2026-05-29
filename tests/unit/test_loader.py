@@ -64,6 +64,28 @@ def test_tensor_loader_reads_dim_shards(tmp_path: Path) -> None:
     assert cols.tolist() == torch.arange(24, dtype=torch.float32).reshape(4, 6)[:, 2:5].tolist()
 
 
+def test_tensor_loader_reads_packed_scale_segments(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    save_file = pytest.importorskip("safetensors.torch").save_file
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    save_file({"scale": torch.arange(6, dtype=torch.bfloat16).reshape(3, 2)}, tmp_path / "model.safetensors")
+    manifest = build_manifest(tmp_path)
+    shard = ShardedTensor(
+        manifest.tensors["scale"],
+        TensorShard(
+            "packed_qkv_column_parallel",
+            dim=0,
+            local_shape=(3, 2),
+            segments=(PackedSegment(0, 1), PackedSegment(0, 1), PackedSegment(1, 1)),
+        ),
+    )
+
+    with TensorLoader(manifest) as loader:
+        out = loader.tensor_shard(shard)
+
+    assert out.float().tolist() == [[0.0, 1.0], [0.0, 1.0], [2.0, 3.0]]
+
+
 def test_tensor_loader_reads_packed_segments(tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
     save_file = pytest.importorskip("safetensors.torch").save_file

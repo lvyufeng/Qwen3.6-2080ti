@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 import torch
 
-from checkpoint import TensorInfo
-from reference_ops import ReferenceWeights, decoder_layer
+from checkpoint import TensorInfo, build_manifest
+from reference_ops import ReferenceWeights, decoder_layer, language_model
 from runtime_config import parse_runtime_config
 from tensor_parallel import TensorParallel
-from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_decoder_layer
-from weight_mapping import ExpertMapping, FullAttentionMapping, LanguageModelMapping, LayerMapping, LinearTensor, MoEMapping
+from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_decoder_layer, tp_language_model
+from loader import TensorLoader
+from weight_mapping import ExpertMapping, FullAttentionMapping, LanguageModelMapping, LayerMapping, LinearTensor, MoEMapping, build_language_model_mapping
 
 
 def test_tp_launch_config_validates_rank() -> None:
@@ -50,6 +52,37 @@ def test_two_rank_tp_decoder_layer_matches_dense_reference(tmp_path: Path) -> No
         nprocs=2,
         join=True,
     )
+
+
+def test_two_rank_safetensors_tp_language_model_matches_dense(tmp_path: Path) -> None:
+    torch.multiprocessing.spawn(
+        _tp_language_model_worker,
+        args=(tmp_path,),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _tp_language_model_worker(rank: int, tmp_path: Path) -> None:
+    save_file = pytest.importorskip("safetensors.torch").save_file
+    model_dir = tmp_path / "tiny-full"
+    if rank == 0:
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps(_safetensors_config()), encoding="utf-8")
+        save_file(_safetensors_tensors(), model_dir / "model.safetensors")
+    init_method = f"file://{tmp_path / 'safetensors-dist-init'}"
+    with TpRuntime(TpLaunchConfig(world_size=2, rank=rank, local_rank=rank, backend="gloo", init_method=init_method, device="cpu")) as runtime:
+        runtime.barrier()
+        manifest = build_manifest(model_dir)
+        config = parse_runtime_config(manifest.config)
+        dense_mapping = build_language_model_mapping(manifest, strict=True)
+        tp_mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=TensorParallel(world_size=2, rank=rank))
+        input_ids = torch.tensor([[0, 3]])
+        with TensorLoader(manifest) as loader:
+            expected = language_model(input_ids, dense_mapping, config, ReferenceWeights(loader))
+            actual = tp_language_model(input_ids, tp_mapping, config, ReferenceWeights(loader), runtime)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
 
 
 def _tp_decoder_layer_worker(rank: int, tmp_path: Path) -> None:
@@ -178,3 +211,95 @@ def _config() -> dict[str, object]:
         }
     }
 
+
+
+def _safetensors_config() -> dict[str, object]:
+    return {
+        "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "hidden_size": 4,
+            "vocab_size": 4,
+            "num_hidden_layers": 1,
+            "layer_types": ["full_attention"],
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 2,
+            "linear_key_head_dim": 2,
+            "linear_value_head_dim": 2,
+            "linear_conv_kernel_dim": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 2,
+            "attn_output_gate": True,
+            "num_experts": 2,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": 4,
+            "shared_expert_intermediate_size": 4,
+            "max_position_embeddings": 8,
+            "rms_norm_eps": 1e-6,
+            "partial_rotary_factor": 1.0,
+            "rope_parameters": {"rope_theta": 10000},
+        }
+    }
+
+
+def _safetensors_tensors() -> dict[str, torch.Tensor]:
+    p = "model.language_model.layers.0."
+    q_proj = torch.zeros((8, 4), dtype=torch.bfloat16)
+    q_proj[0, 0] = 1.0
+    q_proj[1, 1] = 1.0
+    q_proj[4, 2] = 1.0
+    q_proj[5, 3] = 1.0
+    k_proj = torch.zeros((2, 4), dtype=torch.bfloat16)
+    k_proj[0, 0] = 1.0
+    k_proj[1, 1] = 1.0
+    v_proj = torch.zeros((2, 4), dtype=torch.bfloat16)
+    v_proj[0, 2] = 1.0
+    v_proj[1, 3] = 1.0
+    tensors: dict[str, torch.Tensor] = {
+        "model.language_model.embed_tokens.weight": torch.tensor(
+            [[1.0, 0.0, 0.5, 0.0], [0.0, 1.0, 0.0, 0.5], [1.0, 1.0, 0.0, 0.0], [-1.0, 0.5, 1.0, 0.0]],
+            dtype=torch.bfloat16,
+        ),
+        "model.language_model.norm.weight": torch.zeros(4, dtype=torch.bfloat16),
+        "lm_head.weight": torch.tensor(
+            [[1.0, 0.0, 0.5, 0.0], [0.0, 1.0, 0.0, 0.5], [1.0, 1.0, 0.0, 0.0], [-1.0, 0.5, 1.0, 0.0]],
+            dtype=torch.bfloat16,
+        ),
+        p + "input_layernorm.weight": torch.zeros(4, dtype=torch.bfloat16),
+        p + "post_attention_layernorm.weight": torch.zeros(4, dtype=torch.bfloat16),
+        p + "self_attn.q_proj.weight": q_proj,
+        p + "self_attn.k_proj.weight": k_proj,
+        p + "self_attn.v_proj.weight": v_proj,
+        p + "self_attn.o_proj.weight": torch.eye(4, dtype=torch.bfloat16),
+        p + "self_attn.q_norm.weight": torch.zeros(2, dtype=torch.bfloat16),
+        p + "self_attn.k_norm.weight": torch.zeros(2, dtype=torch.bfloat16),
+        p + "mlp.gate.weight": torch.tensor([[5.0, 0.0, 0.0, 0.0], [0.0, 5.0, 0.0, 0.0]], dtype=torch.bfloat16),
+        p + "mlp.shared_expert_gate.weight": torch.full((1, 4), -100.0, dtype=torch.bfloat16),
+        p + "mlp.shared_expert.gate_proj.weight": torch.zeros((4, 4), dtype=torch.bfloat16),
+        p + "mlp.shared_expert.up_proj.weight": torch.zeros((4, 4), dtype=torch.bfloat16),
+        p + "mlp.shared_expert.down_proj.weight": torch.zeros((4, 4), dtype=torch.bfloat16),
+    }
+    for expert, scale in ((0, 1.0), (1, 2.0)):
+        prefix = p + f"mlp.experts.{expert}."
+        tensors[prefix + "gate_proj.weight"] = torch.eye(4, dtype=torch.bfloat16) * scale
+        tensors[prefix + "up_proj.weight"] = torch.eye(4, dtype=torch.bfloat16)
+        tensors[prefix + "down_proj.weight"] = torch.eye(4, dtype=torch.bfloat16)
+    fp8_names = [
+        p + "self_attn.q_proj.weight",
+        p + "self_attn.k_proj.weight",
+        p + "self_attn.v_proj.weight",
+        p + "self_attn.o_proj.weight",
+        p + "mlp.shared_expert.gate_proj.weight",
+        p + "mlp.shared_expert.up_proj.weight",
+        p + "mlp.shared_expert.down_proj.weight",
+    ]
+    fp8_names.extend(
+        p + f"mlp.experts.{expert}.{suffix}.weight"
+        for expert in (0, 1)
+        for suffix in ("gate_proj", "up_proj", "down_proj")
+    )
+    for name in fp8_names:
+        tensors[name] = tensors[name].to(torch.float8_e4m3fn)
+        rows, cols = tensors[name].shape
+        tensors[name + "_scale_inv"] = torch.ones(((rows + 127) // 128, (cols + 127) // 128), dtype=torch.bfloat16)
+    return tensors
