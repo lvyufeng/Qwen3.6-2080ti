@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
-from cli import main
+import pytest
+
+from cli import CliError, _reference_layer, main
 
 
 def test_cli_summarizes_model_config(tmp_path: Path, capsys) -> None:
@@ -55,6 +58,23 @@ def test_cli_inspects_runtime_config_and_checkpoint(tmp_path: Path, capsys) -> N
     assert "runtime_linear_qkv_dim: 256" in out
     assert "Loaded checkpoint manifest" in out
     assert "tensor_count: 0" in out
+
+
+def test_reference_layer_defaults_to_first_full_attention_layer() -> None:
+    layer = _reference_layer(_mapping(("linear_attention", "full_attention")), None)
+
+    assert layer.index == 1
+
+
+def test_reference_layer_rejects_linear_attention_layer() -> None:
+    with pytest.raises(CliError, match="expected full_attention"):
+        _reference_layer(_mapping(("linear_attention", "full_attention")), 0)
+
+
+def _mapping(layer_types: tuple[str, ...]) -> SimpleNamespace:
+    return SimpleNamespace(
+        layers=tuple(SimpleNamespace(index=index, layer_type=layer_type) for index, layer_type in enumerate(layer_types))
+    )
 
 
 def _runtime_config() -> dict[str, object]:

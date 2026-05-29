@@ -7,7 +7,11 @@ name = "qwen36-2080ti"
 version = "0.1.0"
 description = "Qwen3.6 inference experiments for RTX 2080 Ti"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "safetensors",
+    "torch",
+    "transformers",
+]
 
 [project.optional-dependencies]
 dev = [

@@ -6,6 +6,7 @@ from pathlib import Path
 from checkpoint import CheckpointError, Manifest, build_manifest
 from fp8_smoke import Fp8SmokeReport, inspect_fp8_checkpoint
 from loader import LoaderError, TensorLoader
+from reference_ops import ReferenceWeights, decoder_layer, embedding
 from runtime_config import ConfigError, RuntimeConfig, parse_runtime_config
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 
@@ -95,7 +96,6 @@ def _summarize_mapping(mapping: LanguageModelMapping) -> list[str]:
         f"unmapped_language_tensors: {len(mapping.unmapped_language_tensor_names)}",
     ]
 
-
 def _summarize_tensor_load(manifest: Manifest, name: str, device: str | None) -> list[str]:
     with TensorLoader(manifest) as loader:
         info = loader.tensor_info(name)
@@ -110,6 +110,54 @@ def _summarize_tensor_load(manifest: Manifest, name: str, device: str | None) ->
             f"torch_device: {tensor.device}",
             f"torch_numel: {tensor.numel()}",
         ]
+
+
+def _summarize_reference_prefill(
+    manifest: Manifest,
+    config: RuntimeConfig,
+    mapping: LanguageModelMapping,
+    prompt: str,
+    device: str,
+    layer_index: int | None,
+    max_tokens: int,
+) -> list[str]:
+    import torch
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(manifest.model_dir, local_files_only=True, trust_remote_code=True)
+    encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+    input_ids = encoded["input_ids"][:, :max_tokens].to(device)
+    layer = _reference_layer(mapping, layer_index)
+    with TensorLoader(manifest) as loader:
+        embed_weight = loader.tensor(mapping.embed_tokens.name, device=device)
+        hidden = embedding(input_ids, embed_weight)
+        out = decoder_layer(hidden, layer, config, ReferenceWeights(loader, device=device))
+    return [
+        f"reference_device: {device}",
+        f"reference_prompt_tokens: {input_ids.numel()}",
+        f"reference_max_tokens: {max_tokens}",
+        f"reference_token_id_examples: {','.join(str(x) for x in input_ids.reshape(-1)[:8].tolist())}",
+        f"reference_layer: {layer.index}",
+        f"reference_layer_type: {layer.layer_type}",
+        f"reference_hidden_shape: {tuple(hidden.shape)}",
+        f"reference_output_shape: {tuple(out.shape)}",
+        f"reference_output_dtype: {out.dtype}",
+        f"reference_output_finite: {torch.isfinite(out.float()).all().item()}",
+    ]
+
+
+def _reference_layer(mapping: LanguageModelMapping, layer_index: int | None):
+    if layer_index is None:
+        for layer in mapping.layers:
+            if layer.layer_type == "full_attention":
+                return layer
+        raise CliError("checkpoint has no full_attention layer for reference prefill")
+    if layer_index < 0 or layer_index >= len(mapping.layers):
+        raise CliError(f"reference layer index out of range: {layer_index}")
+    layer = mapping.layers[layer_index]
+    if layer.layer_type != "full_attention":
+        raise CliError(f"reference layer {layer_index} is {layer.layer_type}, expected full_attention")
+    return layer
 
 
 def run(args: argparse.Namespace) -> int:
@@ -160,6 +208,26 @@ def run(args: argparse.Namespace) -> int:
                 print(line)
         except LoaderError as exc:
             raise CliError(str(exc)) from exc
+    if args.reference_prefill:
+        try:
+            runtime_config = parse_runtime_config(config)
+            mapping = build_language_model_mapping(manifest, strict=True)
+            device = args.reference_device or args.tensor_device or "cpu"
+            print("Reference prefill smoke")
+            for line in _summarize_reference_prefill(
+                manifest,
+                runtime_config,
+                mapping,
+                args.prompt,
+                device,
+                args.reference_layer,
+                args.reference_max_tokens,
+            ):
+                print(line)
+        except (ConfigError, MappingError, LoaderError) as exc:
+            raise CliError(str(exc)) from exc
+        except Exception as exc:
+            raise CliError(f"reference prefill failed: {exc}") from exc
     print(f"prompt_tokens: pending tokenizer ({len(args.prompt)} prompt chars)")
     print(f"max_new_tokens: {args.max_new_tokens}")
     print("inference: not implemented yet")
@@ -202,6 +270,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--tensor-device",
         help="Optionally copy --inspect-tensor to this torch device, e.g. cpu or cuda:0.",
     )
+    parser.add_argument(
+        "--reference-prefill",
+        action="store_true",
+        help="Tokenize the prompt and run embedding plus one full-attention reference decoder layer.",
+    )
+    parser.add_argument(
+        "--reference-layer",
+        type=int,
+        help="Full-attention layer index for --reference-prefill; defaults to the first full-attention layer.",
+    )
+    parser.add_argument(
+        "--reference-max-tokens",
+        type=int,
+        default=8,
+        help="Maximum prompt tokens to feed through --reference-prefill.",
+    )
+    parser.add_argument(
+        "--reference-device",
+        help="Torch device for --reference-prefill, e.g. cpu or cuda:0.",
+    )
     return parser
 
 
@@ -210,6 +298,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be positive")
+    if args.reference_max_tokens <= 0:
+        parser.error("--reference-max-tokens must be positive")
     try:
         return run(args)
     except CliError as exc:
