@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from checkpoint import build_manifest
+from tensor_parallel import TensorParallel
 from weight_mapping import build_language_model_mapping
 
 
@@ -24,33 +25,7 @@ def write_safetensors(path: Path, tensors: dict[str, tuple[str, tuple[int, ...]]
 
 
 def test_build_language_model_mapping_for_mixed_layers(tmp_path: Path) -> None:
-    config = {
-        "text_config": {
-            "model_type": "qwen3_5_moe_text",
-            "hidden_size": 256,
-            "vocab_size": 320,
-            "num_hidden_layers": 2,
-            "layer_types": ["linear_attention", "full_attention"],
-            "num_attention_heads": 2,
-            "num_key_value_heads": 1,
-            "head_dim": 64,
-            "attn_output_gate": True,
-            "linear_num_key_heads": 2,
-            "linear_num_value_heads": 4,
-            "linear_key_head_dim": 32,
-            "linear_value_head_dim": 32,
-            "linear_conv_kernel_dim": 4,
-            "num_experts": 2,
-            "num_experts_per_tok": 1,
-            "moe_intermediate_size": 128,
-            "shared_expert_intermediate_size": 128,
-            "max_position_embeddings": 1024,
-            "rms_norm_eps": 1e-6,
-            "partial_rotary_factor": 0.25,
-            "rope_parameters": {"rope_theta": 10000000},
-        }
-    }
-    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (tmp_path / "config.json").write_text(json.dumps(_mapping_config()), encoding="utf-8")
     tensors: dict[str, tuple[str, tuple[int, ...]]] = {
         "model.language_model.embed_tokens.weight": ("BF16", (320, 256)),
         "model.language_model.norm.weight": ("BF16", (256,)),
@@ -70,6 +45,69 @@ def test_build_language_model_mapping_for_mixed_layers(tmp_path: Path) -> None:
     assert mapping.experts_per_layer == 2
     assert mapping.routed_experts == 4
     assert mapping.unmapped_language_tensor_names == ()
+
+
+def test_build_language_model_mapping_shards_routed_experts_tp4(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps(_mapping_config(num_hidden_layers=1, layer_types=("linear_attention",), num_experts=8)),
+        encoding="utf-8",
+    )
+    tensors: dict[str, tuple[str, tuple[int, ...]]] = {
+        "model.language_model.embed_tokens.weight": ("BF16", (320, 256)),
+        "model.language_model.norm.weight": ("BF16", (256,)),
+        "lm_head.weight": ("BF16", (320, 256)),
+    }
+    add_linear_attention_layer(tensors, 0)
+    add_moe(tensors, 0, num_experts=8)
+    write_safetensors(tmp_path / "model.safetensors", tensors)
+    manifest = build_manifest(tmp_path)
+
+    dense_mapping = build_language_model_mapping(manifest)
+    mappings = [
+        build_language_model_mapping(manifest, tensor_parallel=TensorParallel(world_size=4, rank=rank))
+        for rank in range(4)
+    ]
+
+    assert [m.experts_per_layer for m in mappings] == [2, 2, 2, 2]
+    assert [m.layers[0].mlp.expert_start for m in mappings] == [0, 2, 4, 6]
+    assert [m.layers[0].mlp.expert_end for m in mappings] == [2, 4, 6, 8]
+    assert [[expert.index for expert in m.layers[0].mlp.experts] for m in mappings] == [[0, 1], [2, 3], [4, 5], [6, 7]]
+    assert all(m.unmapped_language_tensor_names == () for m in mappings)
+    assert len(mappings[0].mapped_tensor_names) < len(dense_mapping.mapped_tensor_names)
+
+
+def _mapping_config(
+    *,
+    num_hidden_layers: int = 2,
+    layer_types: tuple[str, ...] = ("linear_attention", "full_attention"),
+    num_experts: int = 2,
+) -> dict[str, object]:
+    return {
+        "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "hidden_size": 256,
+            "vocab_size": 320,
+            "num_hidden_layers": num_hidden_layers,
+            "layer_types": list(layer_types),
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 64,
+            "attn_output_gate": True,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 32,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": num_experts,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 128,
+            "max_position_embeddings": 1024,
+            "rms_norm_eps": 1e-6,
+            "partial_rotary_factor": 0.25,
+            "rope_parameters": {"rope_theta": 10000000},
+        }
+    }
 
 
 def add_linear_attention_layer(tensors: dict[str, tuple[str, tuple[int, ...]]], layer: int) -> None:
@@ -99,11 +137,11 @@ def add_full_attention_layer(tensors: dict[str, tuple[str, tuple[int, ...]]], la
     tensors[p + "self_attn.k_norm.weight"] = ("BF16", (64,))
 
 
-def add_moe(tensors: dict[str, tuple[str, tuple[int, ...]]], layer: int) -> None:
+def add_moe(tensors: dict[str, tuple[str, tuple[int, ...]]], layer: int, *, num_experts: int = 2) -> None:
     p = f"model.language_model.layers.{layer}.mlp."
-    tensors[p + "gate.weight"] = ("BF16", (2, 256))
+    tensors[p + "gate.weight"] = ("BF16", (num_experts, 256))
     tensors[p + "shared_expert_gate.weight"] = ("BF16", (1, 256))
-    for expert in range(2):
+    for expert in range(num_experts):
         add_expert(tensors, f"{p}experts.{expert}.")
     add_expert(tensors, p + "shared_expert.")
 

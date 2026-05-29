@@ -5,6 +5,7 @@ from pathlib import Path
 
 from checkpoint import Manifest, TensorInfo
 from runtime_config import ConfigError, LayerType, RuntimeConfig, parse_runtime_config
+from tensor_parallel import TensorParallel
 
 
 class MappingError(RuntimeError):
@@ -19,6 +20,7 @@ class LinearTensor:
 
 @dataclass(frozen=True)
 class ExpertMapping:
+    index: int
     gate_proj: LinearTensor
     up_proj: LinearTensor
     down_proj: LinearTensor
@@ -30,6 +32,10 @@ class MoEMapping:
     experts: tuple[ExpertMapping, ...]
     shared_expert: ExpertMapping
     shared_expert_gate: TensorInfo
+    expert_start: int
+    expert_end: int
+    num_experts: int
+    tp: TensorParallel
 
 
 @dataclass(frozen=True)
@@ -94,10 +100,20 @@ class LanguageModelMapping:
 
 
 class _Builder:
-    def __init__(self, manifest: Manifest, config: RuntimeConfig) -> None:
+    def __init__(self, manifest: Manifest, config: RuntimeConfig, tp: TensorParallel) -> None:
         self.manifest = manifest
         self.config = config
+        self.tp = tp
         self.mapped: set[str] = set()
+        self.remote: set[str] = set()
+
+    def claim_remote(self, name: str) -> None:
+        if name not in self.manifest.tensors:
+            raise MappingError(f"missing tensor: {name}")
+        self.remote.add(name)
+        scale = self.manifest.scale_of.get(name)
+        if scale is not None:
+            self.remote.add(scale)
 
     def tensor(
         self,
@@ -144,15 +160,22 @@ class _Builder:
         return LinearTensor(weight=weight, scale=scale)
 
 
-def build_language_model_mapping(manifest: Manifest, *, strict: bool = True) -> LanguageModelMapping:
+def build_language_model_mapping(
+    manifest: Manifest,
+    *,
+    strict: bool = True,
+    tensor_parallel: TensorParallel | None = None,
+) -> LanguageModelMapping:
     try:
         config = parse_runtime_config(manifest.config)
     except ConfigError as exc:
         raise MappingError(str(exc)) from exc
     hidden_size = config.hidden_size
     vocab_size = config.vocab_size
+    tp = tensor_parallel or TensorParallel(world_size=1, rank=0)
+    tp.local_expert_count(config.moe.num_experts)
 
-    builder = _Builder(manifest, config)
+    builder = _Builder(manifest, config, tp)
     embed_tokens = builder.tensor(
         "model.language_model.embed_tokens.weight",
         shape=(vocab_size, hidden_size),
@@ -162,7 +185,8 @@ def build_language_model_mapping(manifest: Manifest, *, strict: bool = True) -> 
     lm_head = builder.tensor("lm_head.weight", shape=(vocab_size, hidden_size), dtype="BF16")
     layers = tuple(_map_layer(builder, config, index, layer_type) for index, layer_type in enumerate(config.layer_types))
     mapped = frozenset(builder.mapped)
-    unmapped_language = tuple(sorted(name for name in manifest.tensors if _is_language_tensor(name) and name not in mapped))
+    claimed = mapped | frozenset(builder.remote)
+    unmapped_language = tuple(sorted(name for name in manifest.tensors if _is_language_tensor(name) and name not in claimed))
     if strict and unmapped_language:
         examples = ", ".join(unmapped_language[:8])
         raise MappingError(f"unmapped language tensors: {examples}")
@@ -236,23 +260,39 @@ def _map_full_attention(builder: _Builder, config: RuntimeConfig, prefix: str) -
 def _map_moe(builder: _Builder, config: RuntimeConfig, prefix: str) -> MoEMapping:
     hidden_size = config.hidden_size
     moe = config.moe
+    expert_start, expert_end = builder.tp.expert_range(moe.num_experts)
+    experts: list[ExpertMapping] = []
+    for i in range(moe.num_experts):
+        expert_prefix = f"{prefix}experts.{i}."
+        if expert_start <= i < expert_end:
+            experts.append(_map_expert(builder, expert_prefix, i, hidden_size, moe.intermediate_size))
+        else:
+            _claim_remote_expert(builder, expert_prefix)
     return MoEMapping(
         gate=builder.tensor(prefix + "gate.weight", shape=(moe.num_experts, hidden_size), dtype="BF16"),
-        experts=tuple(
-            _map_expert(builder, f"{prefix}experts.{i}.", hidden_size, moe.intermediate_size)
-            for i in range(moe.num_experts)
-        ),
-        shared_expert=_map_expert(builder, prefix + "shared_expert.", hidden_size, moe.shared_intermediate_size),
+        experts=tuple(experts),
+        shared_expert=_map_expert(builder, prefix + "shared_expert.", -1, hidden_size, moe.shared_intermediate_size),
         shared_expert_gate=builder.tensor(prefix + "shared_expert_gate.weight", shape=(1, hidden_size), dtype="BF16"),
+        expert_start=expert_start,
+        expert_end=expert_end,
+        num_experts=moe.num_experts,
+        tp=builder.tp,
     )
 
 
-def _map_expert(builder: _Builder, prefix: str, hidden_size: int, intermediate_size: int) -> ExpertMapping:
+def _map_expert(builder: _Builder, prefix: str, index: int, hidden_size: int, intermediate_size: int) -> ExpertMapping:
     return ExpertMapping(
+        index=index,
         gate_proj=builder.linear(prefix + "gate_proj.weight", shape=(intermediate_size, hidden_size), fp8=True),
         up_proj=builder.linear(prefix + "up_proj.weight", shape=(intermediate_size, hidden_size), fp8=True),
         down_proj=builder.linear(prefix + "down_proj.weight", shape=(hidden_size, intermediate_size), fp8=True),
     )
+
+
+def _claim_remote_expert(builder: _Builder, prefix: str) -> None:
+    builder.claim_remote(prefix + "gate_proj.weight")
+    builder.claim_remote(prefix + "up_proj.weight")
+    builder.claim_remote(prefix + "down_proj.weight")
 
 
 def _is_language_tensor(name: str) -> bool:

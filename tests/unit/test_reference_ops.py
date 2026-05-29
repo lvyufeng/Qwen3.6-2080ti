@@ -16,6 +16,7 @@ from reference_ops import (
     rms_norm,
     topk_route,
 )
+from tensor_parallel import TensorParallel
 from runtime_config import parse_runtime_config
 from weight_mapping import (
     ExpertMapping,
@@ -201,11 +202,15 @@ def test_reference_weights_moe_matches_manual_top1_expert_path() -> None:
     mapping = MoEMapping(
         gate=_info("gate", (2, 2)),
         experts=(
-            ExpertMapping(_linear("e0_gate"), _linear("e0_up"), _linear("e0_down")),
-            ExpertMapping(_linear("e1_gate"), _linear("e1_up"), _linear("e1_down")),
+            ExpertMapping(0, _linear("e0_gate"), _linear("e0_up"), _linear("e0_down")),
+            ExpertMapping(1, _linear("e1_gate"), _linear("e1_up"), _linear("e1_down")),
         ),
-        shared_expert=ExpertMapping(_linear("shared_gate_proj"), _linear("shared_up_proj"), _linear("shared_down_proj")),
+        shared_expert=ExpertMapping(-1, _linear("shared_gate_proj"), _linear("shared_up_proj"), _linear("shared_down_proj")),
         shared_expert_gate=_info("shared_gate", (1, 2)),
+        expert_start=0,
+        expert_end=2,
+        num_experts=2,
+        tp=TensorParallel(world_size=1, rank=0),
     )
     config = parse_runtime_config(_config())
     hidden = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
@@ -219,6 +224,51 @@ def test_reference_weights_moe_matches_manual_top1_expert_path() -> None:
         ]
     ).unsqueeze(0)
     torch.testing.assert_close(out, expected)
+
+def test_reference_weights_moe_tp_outputs_sum_to_dense_moe() -> None:
+    loader = _FakeLoader(
+        {
+            "gate": torch.tensor([[5.0, 0.0], [0.0, 5.0]]),
+            "shared_gate": torch.tensor([[-100.0, -100.0]]),
+            "e0_gate": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            "e0_up": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            "e0_down": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            "e1_gate": torch.tensor([[2.0, 0.0], [0.0, 2.0]]),
+            "e1_up": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            "e1_down": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            "shared_gate_proj": torch.zeros((2, 2)),
+            "shared_up_proj": torch.zeros((2, 2)),
+            "shared_down_proj": torch.zeros((2, 2)),
+        }
+    )
+    dense = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    rank0 = _moe_mapping((0,), TensorParallel(world_size=2, rank=0))
+    rank1 = _moe_mapping((1,), TensorParallel(world_size=2, rank=1))
+    config = parse_runtime_config(_config())
+    hidden = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+
+    dense_out = ReferenceWeights(loader).moe(hidden, dense, config)
+    tp_out = ReferenceWeights(loader).moe(hidden, rank0, config) + ReferenceWeights(loader).moe(hidden, rank1, config)
+
+    torch.testing.assert_close(tp_out, dense_out)
+
+
+def _moe_mapping(local_experts: tuple[int, ...], tp: TensorParallel) -> MoEMapping:
+    names = {0: "e0", 1: "e1"}
+    experts = tuple(
+        ExpertMapping(i, _linear(f"{names[i]}_gate"), _linear(f"{names[i]}_up"), _linear(f"{names[i]}_down"))
+        for i in local_experts
+    )
+    return MoEMapping(
+        gate=_info("gate", (2, 2)),
+        experts=experts,
+        shared_expert=ExpertMapping(-1, _linear("shared_gate_proj"), _linear("shared_up_proj"), _linear("shared_down_proj")),
+        shared_expert_gate=_info("shared_gate", (1, 2)),
+        expert_start=local_experts[0],
+        expert_end=local_experts[-1] + 1,
+        num_experts=2,
+        tp=tp,
+    )
 
 
 class _FakeLoader:

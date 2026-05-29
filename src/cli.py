@@ -8,6 +8,7 @@ from fp8_smoke import Fp8SmokeReport, inspect_fp8_checkpoint
 from loader import LoaderError, TensorLoader
 from reference_ops import ReferenceWeights, decoder_layer, embedding, language_model
 from runtime_config import ConfigError, RuntimeConfig, parse_runtime_config
+from tensor_parallel import TensorParallel
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 
 
@@ -95,6 +96,27 @@ def _summarize_mapping(mapping: LanguageModelMapping) -> list[str]:
         f"ignored_tensors: {len(mapping.ignored_tensor_names)}",
         f"unmapped_language_tensors: {len(mapping.unmapped_language_tensor_names)}",
     ]
+
+def _summarize_tp_mapping(manifest: Manifest, world_size: int) -> list[str]:
+    lines = [f"tp_world_size: {world_size}"]
+    total_local = 0
+    for rank in range(world_size):
+        mapping = build_language_model_mapping(
+            manifest, strict=True, tensor_parallel=TensorParallel(world_size=world_size, rank=rank)
+        )
+        first_moe = mapping.layers[0].mlp
+        total_local += mapping.routed_experts
+        lines.append(
+            f"tp_rank_{rank}: experts_per_layer={mapping.experts_per_layer} "
+            f"expert_range=[{first_moe.expert_start},{first_moe.expert_end}) "
+            f"local_routed_experts={mapping.routed_experts} mapped_tensors={len(mapping.mapped_tensor_names)}"
+        )
+    dense = build_language_model_mapping(manifest, strict=True)
+    lines.append(f"tp_total_local_experts: {total_local}")
+    lines.append(f"tp_dense_routed_experts: {dense.routed_experts}")
+    lines.append(f"tp_partition_complete: {total_local == dense.routed_experts}")
+    return lines
+
 
 def _summarize_tensor_load(manifest: Manifest, name: str, device: str | None) -> list[str]:
     with TensorLoader(manifest) as loader:
@@ -229,6 +251,13 @@ def run(args: argparse.Namespace) -> int:
         print("Loaded language model mapping")
         for line in _summarize_mapping(mapping):
             print(line)
+    if args.inspect_tp:
+        try:
+            print("Tensor-parallel mapping layout")
+            for line in _summarize_tp_mapping(manifest, args.inspect_tp):
+                print(line)
+        except MappingError as exc:
+            raise CliError(str(exc)) from exc
     if args.inspect_tensor:
         try:
             print("Loaded tensor payload")
@@ -310,6 +339,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Validate and summarize the text MoE tensor mapping.",
     )
     parser.add_argument(
+        "--inspect-tp",
+        type=int,
+        metavar="WORLD_SIZE",
+        help="Validate per-rank expert-parallel sharding for the given world size (e.g. 4).",
+    )
+    parser.add_argument(
         "--inspect-tensor",
         help="Read one tensor payload by name and print its location and decoded shape.",
     )
@@ -352,6 +387,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--max-new-tokens must be positive")
     if args.reference_max_tokens <= 0:
         parser.error("--reference-max-tokens must be positive")
+    if args.inspect_tp is not None and args.inspect_tp <= 0:
+        parser.error("--inspect-tp must be positive")
     try:
         return run(args)
     except CliError as exc:

@@ -294,14 +294,15 @@ class ReferenceWeights:
         flat = hidden_states.reshape(-1, original_shape[-1])
         routing = topk_route(flat, self.tensor(mapping.gate.name), config.moe.experts_per_token)
         output = torch.zeros_like(flat.float())
-        for expert_index, expert in enumerate(mapping.experts):
-            token_indices, topk_indices = torch.where(routing.indices == expert_index)
+        for expert in mapping.experts:
+            token_indices, topk_indices = torch.where(routing.indices == expert.index)
             if token_indices.numel() == 0:
                 continue
             token_output = self.expert(flat[token_indices], expert)
             token_output = token_output * routing.scores[token_indices, topk_indices, None]
             output.index_add_(0, token_indices, token_output.float())
-        shared = self.expert(flat, mapping.shared_expert)
-        shared_gate = self.tensor(mapping.shared_expert_gate.name)
-        output = output + torch.sigmoid(flat.float() @ shared_gate.float().t()) * shared.float()
+        if mapping.tp.adds_shared_expert:
+            shared = self.expert(flat, mapping.shared_expert)
+            shared_gate = self.tensor(mapping.shared_expert_gate.name)
+            output = output + torch.sigmoid(flat.float() @ shared_gate.float().t()) * shared.float()
         return output.reshape(original_shape).to(hidden_states.dtype)
