@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from qwen36_2080ti.checkpoint import Manifest, TensorInfo
+from checkpoint import Manifest, TensorInfo
 
 LayerType = Literal["linear_attention", "full_attention"]
 

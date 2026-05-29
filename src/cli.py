@@ -3,9 +3,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from qwen36_2080ti.checkpoint import CheckpointError, Manifest, build_manifest
-from qwen36_2080ti.fp8_smoke import Fp8SmokeReport, inspect_fp8_checkpoint
-from qwen36_2080ti.weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
+from checkpoint import CheckpointError, Manifest, build_manifest
+from fp8_smoke import Fp8SmokeReport, inspect_fp8_checkpoint
+from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 
 
 class CliError(RuntimeError):

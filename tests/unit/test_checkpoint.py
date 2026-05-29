@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from qwen36_2080ti.checkpoint import CheckpointError, build_manifest, read_safetensors_header
+from checkpoint import CheckpointError, build_manifest, read_safetensors_header
 
 
 def write_safetensors(path: Path, tensors: dict[str, dict[str, Any]]) -> None:

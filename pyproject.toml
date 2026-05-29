@@ -15,11 +15,14 @@ dev = [
 ]
 
 [project.scripts]
-qwen36-run = "qwen36_2080ti.cli:main"
+qwen36-run = "cli:main"
 
-[tool.setuptools.packages.find]
-where = ["python"]
+[tool.setuptools]
+py-modules = ["checkpoint", "cli", "fp8_smoke", "weight_mapping"]
+
+[tool.setuptools.package-dir]
+"" = "src"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["python"]
+pythonpath = ["src"]

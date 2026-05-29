@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from qwen36_2080ti.checkpoint import Manifest, TensorInfo
+from checkpoint import Manifest, TensorInfo
 
 
 @dataclass(frozen=True)

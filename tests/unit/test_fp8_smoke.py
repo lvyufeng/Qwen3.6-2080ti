@@ -5,8 +5,8 @@ import struct
 from pathlib import Path
 from typing import Any
 
-from qwen36_2080ti.checkpoint import build_manifest
-from qwen36_2080ti.fp8_smoke import inspect_fp8_checkpoint
+from checkpoint import build_manifest
+from fp8_smoke import inspect_fp8_checkpoint
 
 
 def write_safetensors(path: Path, tensors: dict[str, dict[str, Any]]) -> None:

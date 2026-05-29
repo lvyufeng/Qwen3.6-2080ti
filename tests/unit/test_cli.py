@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from qwen36_2080ti.cli import main
+from cli import main
 
 
 def test_cli_summarizes_model_config(tmp_path: Path, capsys) -> None:

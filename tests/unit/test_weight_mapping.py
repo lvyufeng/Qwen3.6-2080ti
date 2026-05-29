@@ -5,8 +5,8 @@ import struct
 from pathlib import Path
 from typing import Any
 
-from qwen36_2080ti.checkpoint import build_manifest
-from qwen36_2080ti.weight_mapping import build_language_model_mapping
+from checkpoint import build_manifest
+from weight_mapping import build_language_model_mapping
 
 
 def write_safetensors(path: Path, tensors: dict[str, tuple[str, tuple[int, ...]]]) -> None:
