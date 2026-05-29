@@ -76,6 +76,51 @@ def test_build_language_model_mapping_shards_routed_experts_tp4(tmp_path: Path) 
     assert len(mappings[0].mapped_tensor_names) < len(dense_mapping.mapped_tensor_names)
 
 
+def test_build_language_model_mapping_uses_true_tp_rules(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(_mapping_config(num_experts=8)), encoding="utf-8")
+    tensors: dict[str, tuple[str, tuple[int, ...]]] = {
+        "model.language_model.embed_tokens.weight": ("BF16", (320, 256)),
+        "model.language_model.norm.weight": ("BF16", (256,)),
+        "lm_head.weight": ("BF16", (320, 256)),
+    }
+    add_linear_attention_layer(tensors, 0)
+    add_full_attention_layer(tensors, 1)
+    add_moe(tensors, 0, num_experts=8)
+    add_moe(tensors, 1, num_experts=8)
+    write_safetensors(tmp_path / "model.safetensors", tensors)
+
+    mapping = build_language_model_mapping(
+        build_manifest(tmp_path),
+        tensor_parallel=TensorParallel(world_size=4, rank=1),
+    )
+    linear = mapping.layers[0].attention
+    full = mapping.layers[1].attention
+
+    assert mapping.embed_tokens.shard.rule == "parallel_embedding"
+    assert mapping.embed_tokens.shape == (80, 256)
+    assert mapping.lm_head.shard.rule == "parallel_head"
+    assert mapping.lm_head.shape == (80, 256)
+    assert linear.in_proj_qkv.weight.shard.rule == "packed_qkv_column_parallel"
+    assert linear.in_proj_qkv.weight.shape == (64, 256)
+    assert linear.in_proj_qkv.scale is not None
+    assert linear.in_proj_qkv.scale.shape == (3, 2)
+    assert [segment.size for segment in linear.in_proj_qkv.scale.shard.segments] == [1, 1, 1]
+    assert linear.conv1d_weight.shard.rule == "packed_conv1d_channel_parallel"
+    assert linear.conv1d_weight.shape == (64, 1, 4)
+    assert linear.out_proj.weight.shard.rule == "row_parallel"
+    assert linear.out_proj.weight.shape == (256, 32)
+    assert linear.out_proj.scale is not None
+    assert linear.out_proj.scale.shape == (2, 1)
+    assert full.q_proj.weight.shard.rule == "column_parallel"
+    assert full.q_proj.weight.shape == (64, 256)
+    assert full.k_proj.weight.shard.rule == "replicated"
+    assert full.k_proj.weight.shape == (64, 256)
+    assert full.o_proj.weight.shard.rule == "row_parallel"
+    assert full.o_proj.weight.shape == (256, 32)
+    assert [expert.index for expert in mapping.layers[0].mlp.experts] == [2, 3]
+    assert mapping.layers[0].mlp.shared_expert.gate_proj.weight.shard.rule == "replicated"
+
+
 def _mapping_config(
     *,
     num_hidden_layers: int = 2,

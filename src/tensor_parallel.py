@@ -18,14 +18,25 @@ class TensorParallel:
     def is_sharded(self) -> bool:
         return self.world_size > 1
 
+    def shard_range(self, size: int) -> tuple[int, int]:
+        if size % self.world_size != 0:
+            raise ValueError(f"size {size} not divisible by world_size {self.world_size}")
+        shard = size // self.world_size
+        start = self.rank * shard
+        return start, shard
+
+    def dim_shard_shape(self, shape: tuple[int, ...], dim: int) -> tuple[int, ...]:
+        start, shard = self.shard_range(shape[dim])
+        del start
+        out = list(shape)
+        out[dim] = shard
+        return tuple(out)
+
     def local_expert_count(self, num_experts: int) -> int:
-        if num_experts % self.world_size != 0:
-            raise ValueError(f"num_experts {num_experts} not divisible by world_size {self.world_size}")
-        return num_experts // self.world_size
+        return self.shard_range(num_experts)[1]
 
     def expert_range(self, num_experts: int) -> tuple[int, int]:
-        per_rank = self.local_expert_count(num_experts)
-        start = self.rank * per_rank
+        start, per_rank = self.shard_range(num_experts)
         return start, start + per_rank
 
     def owns_expert(self, expert_index: int, num_experts: int) -> bool:
@@ -34,4 +45,4 @@ class TensorParallel:
 
     @property
     def adds_shared_expert(self) -> bool:
-        return self.rank == 0
+        return True

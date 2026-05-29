@@ -54,15 +54,21 @@ def test_two_rank_tp_decoder_layer_matches_dense_reference(tmp_path: Path) -> No
 
 def _tp_decoder_layer_worker(rank: int, tmp_path: Path) -> None:
     hidden = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    q = torch.tensor([[1.0, 0.0], [0.0, 0.0], [0.0, 1.0], [0.0, 0.0]])
+    o = torch.eye(2)
     loader = _FakeLoader(
         {
             "input_norm": torch.zeros(2),
-            "q": torch.cat((torch.eye(2), torch.zeros((2, 2))), dim=0),
-            "k": torch.eye(2),
-            "v": torch.eye(2),
-            "o": torch.eye(2),
-            "q_norm": torch.zeros(2),
-            "k_norm": torch.zeros(2),
+            "q": q,
+            "q_r0": q[:2].contiguous(),
+            "q_r1": q[2:].contiguous(),
+            "k": torch.tensor([[1.0, 0.0]]),
+            "v": torch.tensor([[0.0, 1.0]]),
+            "o": o,
+            "o_r0": o[:, :1].contiguous(),
+            "o_r1": o[:, 1:].contiguous(),
+            "q_norm": torch.zeros(1),
+            "k_norm": torch.zeros(1),
             "post_norm": torch.zeros(2),
             "gate": torch.tensor([[5.0, 0.0], [0.0, 5.0]]),
             "shared_gate": torch.tensor([[-100.0, -100.0]]),
@@ -94,12 +100,12 @@ def _layer_mapping(local_experts: tuple[int, ...], tp: TensorParallel) -> LayerM
         layer_type="full_attention",
         input_layernorm=_info("input_norm", (2,), nbytes=4),
         attention=FullAttentionMapping(
-            q_proj=_linear_shape("q", (4, 2)),
-            k_proj=_linear_shape("k", (2, 2)),
-            v_proj=_linear_shape("v", (2, 2)),
-            o_proj=_linear_shape("o", (2, 2)),
-            q_norm=_info("q_norm", (2,), nbytes=4),
-            k_norm=_info("k_norm", (2,), nbytes=4),
+            q_proj=_linear_shape("q" if tp.world_size == 1 else f"q_r{tp.rank}", (4 // tp.world_size, 2) if tp.world_size > 1 else (4, 2)),
+            k_proj=_linear_shape("k", (1, 2)),
+            v_proj=_linear_shape("v", (1, 2)),
+            o_proj=_linear_shape("o" if tp.world_size == 1 else f"o_r{tp.rank}", (2, 2 // tp.world_size) if tp.world_size > 1 else (2, 2)),
+            q_norm=_info("q_norm", (1,), nbytes=2),
+            k_norm=_info("k_norm", (1,), nbytes=2),
         ),
         post_attention_layernorm=_info("post_norm", (2,), nbytes=4),
         mlp=_moe_mapping(local_experts, tp),
@@ -157,9 +163,9 @@ def _config() -> dict[str, object]:
             "linear_key_head_dim": 1,
             "linear_value_head_dim": 1,
             "linear_conv_kernel_dim": 4,
-            "num_attention_heads": 1,
+            "num_attention_heads": 2,
             "num_key_value_heads": 1,
-            "head_dim": 2,
+            "head_dim": 1,
             "attn_output_gate": True,
             "num_experts": 2,
             "num_experts_per_tok": 1,

@@ -349,7 +349,7 @@ def test_reference_weights_moe_matches_manual_top1_expert_path() -> None:
     ).unsqueeze(0)
     torch.testing.assert_close(out, expected)
 
-def test_reference_weights_moe_tp_outputs_sum_to_dense_moe() -> None:
+def test_reference_weights_moe_rejects_tp_mapping() -> None:
     loader = _FakeLoader(
         {
             "gate": torch.tensor([[5.0, 0.0], [0.0, 5.0]]),
@@ -357,24 +357,17 @@ def test_reference_weights_moe_tp_outputs_sum_to_dense_moe() -> None:
             "e0_gate": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
             "e0_up": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
             "e0_down": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-            "e1_gate": torch.tensor([[2.0, 0.0], [0.0, 2.0]]),
-            "e1_up": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-            "e1_down": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
             "shared_gate_proj": torch.zeros((2, 2)),
             "shared_up_proj": torch.zeros((2, 2)),
             "shared_down_proj": torch.zeros((2, 2)),
         }
     )
-    dense = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
-    rank0 = _moe_mapping((0,), TensorParallel(world_size=2, rank=0))
-    rank1 = _moe_mapping((1,), TensorParallel(world_size=2, rank=1))
+    mapping = _moe_mapping((0,), TensorParallel(world_size=2, rank=0))
     config = parse_runtime_config(_config())
     hidden = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
 
-    dense_out = ReferenceWeights(loader).moe(hidden, dense, config)
-    tp_out = ReferenceWeights(loader).moe(hidden, rank0, config) + ReferenceWeights(loader).moe(hidden, rank1, config)
-
-    torch.testing.assert_close(tp_out, dense_out)
+    with pytest.raises(ValueError, match="dense-only"):
+        ReferenceWeights(loader).moe(hidden, mapping, config)
 
 
 def _moe_mapping(local_experts: tuple[int, ...], tp: TensorParallel) -> MoEMapping:

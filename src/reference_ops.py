@@ -102,7 +102,7 @@ def linear_attention(
     batch, seq_len, _ = hidden_states.shape
     linear_cfg = config.linear_attention
     mixed_qkv = weights.linear(hidden_states, mapping.in_proj_qkv).transpose(1, 2)
-    conv_weight = weights.tensor(mapping.conv1d_weight.name).float()
+    conv_weight = weights.tensor(mapping.conv1d_weight).float()
     mixed_qkv = F.conv1d(
         mixed_qkv.float(),
         conv_weight,
@@ -124,8 +124,8 @@ def linear_attention(
     value = value.reshape(batch, seq_len, linear_cfg.value_heads, linear_cfg.value_head_dim)
     beta = torch.sigmoid(weights.linear(hidden_states, mapping.in_proj_b))
     a = weights.linear(hidden_states, mapping.in_proj_a)
-    a_log = weights.tensor(mapping.a_log.name).float()
-    dt_bias = weights.tensor(mapping.dt_bias.name).float()
+    a_log = weights.tensor(mapping.a_log).float()
+    dt_bias = weights.tensor(mapping.dt_bias).float()
     g = -a_log.exp() * F.softplus(a.float() + dt_bias)
     repeats = linear_cfg.value_heads // linear_cfg.key_heads
     if repeats > 1:
@@ -133,7 +133,7 @@ def linear_attention(
         key = key.repeat_interleave(repeats, dim=2)
     core = recurrent_gated_delta_rule(query, key, value, g, beta).reshape(-1, linear_cfg.value_head_dim)
     z = weights.linear(hidden_states, mapping.in_proj_z).reshape(-1, linear_cfg.value_head_dim)
-    core = gated_rms_norm(core, weights.tensor(mapping.norm.name), z, config.rms_norm_eps)
+    core = gated_rms_norm(core, weights.tensor(mapping.norm), z, config.rms_norm_eps)
     core = core.reshape(batch, seq_len, linear_cfg.value_state_dim)
     return weights.linear(core, mapping.out_proj).to(hidden_states.dtype)
 
@@ -174,8 +174,8 @@ def full_attention(hidden_states: Any, mapping: FullAttentionMapping, config: Ru
     gate = gate.reshape(batch, seq_len, full.attn_dim)
     key = weights.linear(hidden_states, mapping.k_proj).view(batch, seq_len, full.num_key_value_heads, full.head_dim)
     value = weights.linear(hidden_states, mapping.v_proj).view(batch, seq_len, full.num_key_value_heads, full.head_dim)
-    query = rms_norm(query, weights.tensor(mapping.q_norm.name), config.rms_norm_eps).transpose(1, 2)
-    key = rms_norm(key, weights.tensor(mapping.k_norm.name), config.rms_norm_eps).transpose(1, 2)
+    query = rms_norm(query, weights.tensor(mapping.q_norm), config.rms_norm_eps).transpose(1, 2)
+    key = rms_norm(key, weights.tensor(mapping.k_norm), config.rms_norm_eps).transpose(1, 2)
     value = value.transpose(1, 2)
     positions = torch.arange(seq_len, device=hidden_states.device).expand(batch, seq_len)
     cos, sin = rotary_embeddings(positions, config, device=hidden_states.device, dtype=query.dtype)
@@ -193,7 +193,7 @@ def full_attention(hidden_states: Any, mapping: FullAttentionMapping, config: Ru
 
 def decoder_layer(hidden_states: Any, mapping: LayerMapping, config: RuntimeConfig, weights: ReferenceWeights) -> Any:
     residual = hidden_states
-    hidden_states = rms_norm(hidden_states, weights.tensor(mapping.input_layernorm.name), config.rms_norm_eps)
+    hidden_states = rms_norm(hidden_states, weights.tensor(mapping.input_layernorm), config.rms_norm_eps)
     if mapping.layer_type == "full_attention":
         hidden_states = residual + full_attention(hidden_states, mapping.attention, config, weights)
     elif mapping.layer_type == "linear_attention":
@@ -201,15 +201,15 @@ def decoder_layer(hidden_states: Any, mapping: LayerMapping, config: RuntimeConf
     else:
         raise ValueError(f"unsupported reference layer type: {mapping.layer_type}")
     residual = hidden_states
-    hidden_states = rms_norm(hidden_states, weights.tensor(mapping.post_attention_layernorm.name), config.rms_norm_eps)
+    hidden_states = rms_norm(hidden_states, weights.tensor(mapping.post_attention_layernorm), config.rms_norm_eps)
     return residual + weights.moe(hidden_states, mapping.mlp, config)
 
 
 def language_model(input_ids: Any, mapping: LanguageModelMapping, config: RuntimeConfig, weights: ReferenceWeights) -> Any:
-    hidden_states = embedding(input_ids, weights.tensor(mapping.embed_tokens.name))
+    hidden_states = embedding(input_ids, weights.tensor(mapping.embed_tokens))
     for layer in mapping.layers:
         hidden_states = decoder_layer(hidden_states, layer, config, weights)
-    hidden_states = rms_norm(hidden_states, weights.tensor(mapping.final_norm.name), config.rms_norm_eps)
+    hidden_states = rms_norm(hidden_states, weights.tensor(mapping.final_norm), config.rms_norm_eps)
     return weights.linear(hidden_states, LinearTensor(weight=mapping.lm_head, scale=None))
 
 
@@ -270,12 +270,16 @@ class ReferenceWeights:
         self.loader = loader
         self.device = device
 
-    def tensor(self, name: str) -> Any:
+    def tensor(self, name: Any) -> Any:
+        if hasattr(name, "info") and hasattr(name, "shard"):
+            return self.loader.tensor_shard(name, device=self.device)
+        if hasattr(name, "name"):
+            name = name.name
         return self.loader.tensor(name, device=self.device)
 
     def linear_weight(self, tensor: LinearTensor) -> tuple[Any, Any | None]:
-        weight = self.tensor(tensor.weight.name)
-        scale = self.tensor(tensor.scale.name) if tensor.scale is not None else None
+        weight = self.tensor(tensor.weight)
+        scale = self.tensor(tensor.scale) if tensor.scale is not None else None
         return weight, scale
 
     def linear(self, hidden_states: Any, tensor: LinearTensor) -> Any:
@@ -290,9 +294,11 @@ class ReferenceWeights:
     def moe(self, hidden_states: Any, mapping: MoEMapping, config: RuntimeConfig) -> Any:
         import torch
 
+        if mapping.tp.world_size != 1:
+            raise ValueError("ReferenceWeights.moe is dense-only; use tp_moe for tensor-parallel MoE")
         original_shape = hidden_states.shape
         flat = hidden_states.reshape(-1, original_shape[-1])
-        routing = topk_route(flat, self.tensor(mapping.gate.name), config.moe.experts_per_token)
+        routing = topk_route(flat, self.tensor(mapping.gate), config.moe.experts_per_token)
         output = torch.zeros_like(flat.float())
         for expert in mapping.experts:
             token_indices, topk_indices = torch.where(routing.indices == expert.index)
@@ -303,6 +309,6 @@ class ReferenceWeights:
             output.index_add_(0, token_indices, token_output.float())
         if mapping.tp.adds_shared_expert:
             shared = self.expert(flat, mapping.shared_expert)
-            shared_gate = self.tensor(mapping.shared_expert_gate.name)
+            shared_gate = self.tensor(mapping.shared_expert_gate)
             output = output + torch.sigmoid(flat.float() @ shared_gate.float().t()) * shared.float()
         return output.reshape(original_shape).to(hidden_states.dtype)

@@ -10,6 +10,7 @@ from reference_ops import ReferenceWeights, decoder_layer, embedding, language_m
 from runtime_config import ConfigError, RuntimeConfig, parse_runtime_config
 from tensor_parallel import TensorParallel
 from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_language_model
+from tp_weights import MappedWeights
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 
 
@@ -98,6 +99,50 @@ def _summarize_mapping(mapping: LanguageModelMapping) -> list[str]:
         f"unmapped_language_tensors: {len(mapping.unmapped_language_tensor_names)}",
     ]
 
+def _shard_tag(tensor) -> str:
+    shard = tensor.shard
+    parts = [shard.rule, f"shape={tuple(tensor.shape)}"]
+    if shard.dim is not None:
+        parts.append(f"dim={shard.dim}")
+    if shard.start is not None:
+        parts.append(f"start={shard.start}")
+    if shard.size is not None:
+        parts.append(f"size={shard.size}")
+    if shard.segments:
+        segments = ",".join(f"{segment.start}+{segment.size}" for segment in shard.segments)
+        parts.append(f"segments={segments}")
+    return ":".join(parts)
+
+
+def _summarize_tp_shards(mapping: LanguageModelMapping) -> list[str]:
+    first_layer = mapping.layers[0]
+    attention = first_layer.attention
+    lines = [
+        f"  embed_tokens={_shard_tag(mapping.embed_tokens)}",
+        f"  lm_head={_shard_tag(mapping.lm_head)}",
+    ]
+    if first_layer.layer_type == "full_attention":
+        lines.extend(
+            [
+                f"  q_proj={_shard_tag(attention.q_proj.weight)}",
+                f"  k_proj={_shard_tag(attention.k_proj.weight)}",
+                f"  v_proj={_shard_tag(attention.v_proj.weight)}",
+                f"  o_proj={_shard_tag(attention.o_proj.weight)}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"  in_proj_qkv={_shard_tag(attention.in_proj_qkv.weight)}",
+                f"  conv1d={_shard_tag(attention.conv1d_weight)}",
+                f"  out_proj={_shard_tag(attention.out_proj.weight)}",
+            ]
+        )
+    shared = first_layer.mlp.shared_expert
+    lines.append(f"  shared_expert.gate_proj={_shard_tag(shared.gate_proj.weight)}")
+    return lines
+
+
 def _summarize_tp_mapping(manifest: Manifest, world_size: int) -> list[str]:
     lines = [f"tp_world_size: {world_size}"]
     total_local = 0
@@ -110,12 +155,15 @@ def _summarize_tp_mapping(manifest: Manifest, world_size: int) -> list[str]:
         lines.append(
             f"tp_rank_{rank}: experts_per_layer={mapping.experts_per_layer} "
             f"expert_range=[{first_moe.expert_start},{first_moe.expert_end}) "
-            f"local_routed_experts={mapping.routed_experts} mapped_tensors={len(mapping.mapped_tensor_names)}"
+            f"local_routed_experts={mapping.routed_experts} mapped_tensors={len(mapping.mapped_tensor_names)} "
+            f"mapped_bytes={mapped_tensor_bytes(mapping)}"
         )
+        lines.extend(f"tp_rank_{rank}_shard_{line.strip()}" for line in _summarize_tp_shards(mapping))
     dense = build_language_model_mapping(manifest, strict=True)
     lines.append(f"tp_total_local_experts: {total_local}")
     lines.append(f"tp_dense_routed_experts: {dense.routed_experts}")
     lines.append(f"tp_partition_complete: {total_local == dense.routed_experts}")
+    lines.append(f"tp_dense_mapped_bytes: {mapped_tensor_bytes(dense)}")
     return lines
 
 
@@ -148,6 +196,7 @@ def _summarize_tp_runtime_smoke(
             f"tp_runtime_mapped_tensors: {len(mapping.mapped_tensor_names)}",
             f"tp_runtime_mapped_bytes: {mapped_tensor_bytes(mapping)}",
         ]
+        lines.extend(f"tp_runtime_shard_{line.strip()}" for line in _summarize_tp_shards(mapping))
         runtime.barrier()
         return lines
 
@@ -219,6 +268,40 @@ def _summarize_tp_reference_forward(
         return lines
 
 
+def _summarize_tp_load_smoke(
+    manifest: Manifest,
+    world_size: int | None,
+    rank: int | None,
+    local_rank: int | None,
+    backend: str,
+    init_method: str | None,
+    device: str | None,
+) -> list[str]:
+    launch = _tp_launch_from_args(world_size, rank, local_rank, backend, init_method, device)
+    tp = TensorParallel(world_size=launch.world_size, rank=launch.rank)
+    mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=tp)
+    with TpRuntime(launch) as runtime:
+        with TensorLoader(manifest) as loader:
+            weights = MappedWeights(loader, mapping, device=str(runtime.device))
+            stats = weights.preload()
+        first_moe = mapping.layers[0].mlp
+        runtime.barrier()
+        lines = [
+            f"tp_load_backend: {backend}",
+            f"tp_load_world_size: {launch.world_size}",
+            f"tp_load_rank: {launch.rank}",
+            f"tp_load_device: {runtime.device}",
+            f"tp_load_expert_range: [{first_moe.expert_start},{first_moe.expert_end})",
+            f"tp_load_mapped_tensors: {len(mapping.mapped_tensor_names)}",
+            f"tp_load_loaded_tensors: {stats.tensor_count}",
+            f"tp_load_mapped_bytes: {mapped_tensor_bytes(mapping)}",
+            f"tp_load_loaded_bytes: {stats.bytes}",
+        ]
+        lines.extend(f"tp_load_shard_{line.strip()}" for line in _summarize_tp_shards(mapping))
+        runtime.barrier()
+        return lines
+
+
 def _summarize_tensor_load(manifest: Manifest, name: str, device: str | None) -> list[str]:
     with TensorLoader(manifest) as loader:
         info = loader.tensor_info(name)
@@ -252,7 +335,7 @@ def _summarize_reference_prefill(
     input_ids = encoded["input_ids"][:, :max_tokens].to(device)
     layer = _reference_layer(mapping, layer_index)
     with TensorLoader(manifest) as loader:
-        embed_weight = loader.tensor(mapping.embed_tokens.name, device=device)
+        embed_weight = loader.tensor_shard(mapping.embed_tokens, device=device)
         hidden = embedding(input_ids, embed_weight)
         out = decoder_layer(hidden, layer, config, ReferenceWeights(loader, device=device))
     return [
@@ -365,6 +448,21 @@ def run(args: argparse.Namespace) -> int:
             for line in _summarize_tensor_load(manifest, args.inspect_tensor, args.tensor_device):
                 print(line)
         except LoaderError as exc:
+            raise CliError(str(exc)) from exc
+    if args.tp_load_smoke:
+        try:
+            print("TP mapped weight load smoke")
+            for line in _summarize_tp_load_smoke(
+                manifest,
+                args.tp_world_size,
+                args.tp_rank,
+                args.tp_local_rank,
+                args.tp_backend,
+                args.tp_init_method,
+                args.tp_device,
+            ):
+                print(line)
+        except (MappingError, LoaderError, TpRuntimeError) as exc:
             raise CliError(str(exc)) from exc
     if args.tp_runtime_smoke:
         try:
@@ -481,7 +579,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--inspect-tp",
         type=int,
         metavar="WORLD_SIZE",
-        help="Validate per-rank expert-parallel sharding for the given world size (e.g. 4).",
+        help="Validate per-rank tensor-parallel sharding for the given world size (e.g. 4).",
     )
     parser.add_argument(
         "--inspect-tensor",
@@ -492,9 +590,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optionally copy --inspect-tensor to this torch device, e.g. cpu or cuda:0.",
     )
     parser.add_argument(
+        "--tp-load-smoke",
+        action="store_true",
+        help="Load only this TP rank's mapped tensors and report resident weight bytes.",
+    )
+    parser.add_argument(
         "--tp-runtime-smoke",
         action="store_true",
-        help="Initialize the TP runtime and print this rank's expert-parallel mapping summary.",
+        help="Initialize the TP runtime and print this rank's tensor-parallel mapping summary.",
     )
     parser.add_argument(
         "--tp-reference-forward",
