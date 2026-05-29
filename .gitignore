@@ -1,0 +1,86 @@
+# Build outputs
+/build/
+/cmake-build-*/
+/out/
+/dist/
+/*.egg-info/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/compile_commands.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# CUDA/C++ artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.bin
+*.cubin
+*.fatbin
+*.ptx
+*.sass
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Model weights and generated artifacts
+/checkpoints/
+/models/
+/weights/
+/hf_cache/
+/safetensors_cache/
+*.safetensors
+*.gguf
+*.bin.index.json
+*.pt
+*.pth
+*.onnx
+*.engine
+*.plan
+*.npz
+
+# Runtime state
+/logs/
+/tmp/
+/cache/
+/run/
+*.log
+*.pid
+*.sock
+
+# Benchmarks and generated data
+/benchmark_results/
+/profiles/
+/traces/
+/generated/
+*.csv
+*.jsonl
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local environment
+.env
+.env.*
+!.env.example
