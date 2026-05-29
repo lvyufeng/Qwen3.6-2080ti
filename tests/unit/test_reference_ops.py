@@ -3,9 +3,17 @@ from __future__ import annotations
 import torch
 
 from checkpoint import TensorInfo
-from reference_ops import ReferenceWeights, dequantize_fp8_weight, embedding, linear, rms_norm, topk_route
+from reference_ops import (
+    ReferenceWeights,
+    dequantize_fp8_weight,
+    embedding,
+    full_attention,
+    linear,
+    rms_norm,
+    topk_route,
+)
 from runtime_config import parse_runtime_config
-from weight_mapping import ExpertMapping, LinearTensor, MoEMapping
+from weight_mapping import ExpertMapping, FullAttentionMapping, LinearTensor, MoEMapping
 
 
 def test_embedding_matches_torch_indexing() -> None:
@@ -63,6 +71,37 @@ def test_topk_route_matches_qwen_softmax_then_renormalize() -> None:
     torch.testing.assert_close(routing.indices, expected_indices)
 
 
+def test_full_attention_preserves_shape_and_causal_mask() -> None:
+    config = parse_runtime_config(_attention_config())
+    mapping = FullAttentionMapping(
+        q_proj=_linear_shape("q", (8, 4)),
+        k_proj=_linear_shape("k", (4, 4)),
+        v_proj=_linear_shape("v", (4, 4)),
+        o_proj=_linear_shape("o", (4, 4)),
+        q_norm=_info("q_norm", (4,)),
+        k_norm=_info("k_norm", (4,)),
+    )
+    tensors = {
+        "q": torch.cat((torch.eye(4), torch.full((4, 4), 20.0)), dim=0),
+        "k": torch.eye(4),
+        "v": torch.eye(4),
+        "o": torch.eye(4),
+        "q_norm": torch.zeros(4),
+        "k_norm": torch.zeros(4),
+    }
+    weights = ReferenceWeights(_FakeLoader(tensors))
+    hidden = torch.tensor([[[1.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0]]])
+    changed_future = hidden.clone()
+    changed_future[:, 1] = torch.tensor([9.0, 9.0, 9.0, 9.0])
+
+    out = full_attention(hidden, mapping, config, weights)
+    changed_out = full_attention(changed_future, mapping, config, weights)
+
+    assert out.shape == hidden.shape
+    torch.testing.assert_close(out[:, 0], changed_out[:, 0])
+    assert not torch.allclose(out[:, 1], changed_out[:, 1])
+
+
 def test_reference_weights_moe_matches_manual_top1_expert_path() -> None:
     loader = _FakeLoader(
         {
@@ -115,6 +154,10 @@ def _linear(name: str) -> LinearTensor:
     return LinearTensor(weight=_info(name, (2, 2)), scale=None)
 
 
+def _linear_shape(name: str, shape: tuple[int, int]) -> LinearTensor:
+    return LinearTensor(weight=_info(name, shape), scale=None)
+
+
 def _info(name: str, shape: tuple[int, ...]) -> TensorInfo:
     return TensorInfo(name=name, dtype="BF16", shape=shape, shard="model.safetensors", begin=0, end=0, data_start=0)
 
@@ -146,3 +189,15 @@ def _config() -> dict[str, object]:
             "rope_parameters": {"rope_theta": 10000},
         }
     }
+
+
+def _attention_config() -> dict[str, object]:
+    raw = _config()
+    text = raw["text_config"]
+    text["hidden_size"] = 4
+    text["vocab_size"] = 8
+    text["head_dim"] = 4
+    text["partial_rotary_factor"] = 0.5
+    text["moe_intermediate_size"] = 4
+    text["shared_expert_intermediate_size"] = 4
+    return raw
