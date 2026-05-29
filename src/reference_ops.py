@@ -235,9 +235,24 @@ def _cat_last(first: Any, second: Any) -> Any:
     return torch.cat((first, second), dim=-1)
 
 
-def linear(hidden_states: Any, weight: Any, scale_inv: Any | None = None) -> Any:
+def linear(hidden_states: Any, weight: Any, scale_inv: Any | None = None, *, use_cuda_kernel: bool = True) -> Any:
+    import torch
     import torch.nn.functional as F
 
+    if (
+        use_cuda_kernel
+        and scale_inv is not None
+        and getattr(hidden_states, "is_cuda", False)
+        and getattr(weight, "is_cuda", False)
+        and getattr(scale_inv, "is_cuda", False)
+        and weight.dtype == torch.float8_e4m3fn
+        and scale_inv.dtype == torch.bfloat16
+        and hidden_states.shape[-1] % 128 == 0
+        and weight.shape[0] % 128 == 0
+    ):
+        from fp8_cuda import fp8_e4m3_bf16_linear
+
+        return fp8_e4m3_bf16_linear(hidden_states.float(), weight, scale_inv)
     return F.linear(hidden_states.float(), dequantize_fp8_weight(weight, scale_inv))
 
 
