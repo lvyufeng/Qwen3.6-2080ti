@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import cli
 from cli import CliError, _reference_layer, main
 from test_weight_mapping import add_full_attention_layer, add_linear_attention_layer, add_moe, write_safetensors
 
@@ -304,6 +305,50 @@ def test_cli_tp_generate_single_rank(tmp_path: Path, capsys, monkeypatch: pytest
     assert "tp_generate_generated_token_ids:" in out
     assert "tp_generate_text: decoded:" in out
     assert "inference: not implemented yet" not in out
+
+
+def test_cli_tp_worker_runs_protocol_loop_without_human_stdout(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(_runtime_config()), encoding="utf-8")
+    (tmp_path / "model.safetensors").write_bytes(b"\x02\x00\x00\x00\x00\x00\x00\x00{}")
+    calls = []
+
+    def fake_protocol_loop(state, runtime):
+        calls.append((state, runtime))
+        print('{"ok":true}')
+
+    monkeypatch.setattr(cli, "run_worker_protocol_loop", fake_protocol_loop)
+
+    rc = main(
+        [
+            "--model",
+            str(tmp_path),
+            "--prompt",
+            "unused",
+            "--max-new-tokens",
+            "1",
+            "--tp-worker",
+            "--tp-world-size",
+            "1",
+            "--tp-backend",
+            "gloo",
+            "--tp-device",
+            "cpu",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out == '{"ok":true}\n'
+    assert "Loaded model config" not in out
+    assert "inference: not implemented yet" not in out
+    assert len(calls) == 1
+    state, runtime = calls[0]
+    assert isinstance(state, cli.WorkerState)
+    assert str(runtime.device) == "cpu"
 
 
 def test_cli_reference_decode_smoke(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:

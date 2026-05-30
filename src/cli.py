@@ -14,6 +14,7 @@ from tensor_parallel import TensorParallel
 from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_decode_step, tp_language_model
 from tp_weights import MappedWeights
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
+from worker import WorkerState, run_worker_protocol_loop
 
 
 class CliError(RuntimeError):
@@ -535,6 +536,23 @@ def _summarize_reference_forward(
     ]
 
 
+def _run_tp_worker(args: argparse.Namespace) -> int:
+    launch = _tp_launch_from_args(
+        args.tp_world_size,
+        args.tp_rank,
+        args.tp_local_rank,
+        args.tp_backend,
+        args.tp_init_method,
+        args.tp_device,
+    )
+    try:
+        with TpRuntime(launch) as runtime:
+            run_worker_protocol_loop(WorkerState(launch), runtime)
+    except TpRuntimeError as exc:
+        raise CliError(str(exc)) from exc
+    return 0
+
+
 def _reference_layer(mapping: LanguageModelMapping, layer_index: int | None):
     if layer_index is None:
         for layer in mapping.layers:
@@ -558,6 +576,8 @@ def run(args: argparse.Namespace) -> int:
         manifest = build_manifest(model_dir)
     except CheckpointError as exc:
         raise CliError(str(exc)) from exc
+    if args.tp_worker:
+        return _run_tp_worker(args)
     config = manifest.config
     print("Loaded model config")
     print(f"model_dir: {model_dir}")
@@ -804,6 +824,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--tp-generate",
         action="store_true",
         help="Run resident tensor-parallel greedy generation with mapped weights.",
+    )
+    parser.add_argument(
+        "--tp-worker",
+        action="store_true",
+        help="Run a resident tensor-parallel worker that reads JSONL commands on rank 0.",
     )
     parser.add_argument("--tp-world-size", type=int, help="TP runtime world size; defaults to WORLD_SIZE or 1.")
     parser.add_argument("--tp-rank", type=int, help="TP runtime global rank; defaults to RANK or 0.")
