@@ -4,22 +4,14 @@ import argparse
 from pathlib import Path
 
 from checkpoint import CheckpointError, Manifest, build_manifest
+from decode_state import DecodeState
+from engine import EngineError, GenerateResult, TpModelRunner
 from fp8_smoke import Fp8SmokeReport, inspect_fp8_checkpoint
 from loader import LoaderError, TensorLoader
-from decode_state import DecodeState
 from reference_ops import ReferenceWeights, decode_step, decoder_layer, embedding, language_model
 from runtime_config import ConfigError, RuntimeConfig, parse_runtime_config
 from tensor_parallel import TensorParallel
-from tp_runtime import (
-    TpLaunchConfig,
-    TpRuntime,
-    TpRuntimeError,
-    mapped_tensor_bytes,
-    tp_decode_step,
-    tp_decode_step_local_logits,
-    tp_greedy_next_token,
-    tp_language_model,
-)
+from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_decode_step, tp_language_model
 from tp_weights import MappedWeights
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 
@@ -270,26 +262,6 @@ def _tp_launch_from_args(
     )
 
 
-def _sync_next_token(next_token, runtime: TpRuntime):
-    if runtime.config.is_distributed:
-        import torch.distributed as dist
-
-        dist.broadcast(next_token, src=0)
-    return next_token
-
-
-def _sync_device(device) -> None:
-    if getattr(device, "type", None) != "cuda":
-        return
-    import torch
-
-    torch.cuda.synchronize(device)
-
-
-def _elapsed_seconds(start: float, end: float) -> float:
-    return max(0.0, end - start)
-
-
 def _summarize_tp_generate(
     manifest: Manifest,
     runtime_config: RuntimeConfig,
@@ -302,101 +274,68 @@ def _summarize_tp_generate(
     init_method: str | None,
     device: str | None,
 ) -> list[str]:
-    import time
-
-    import torch
-    from transformers import AutoTokenizer
-
     launch = _tp_launch_from_args(world_size, rank, local_rank, backend, init_method, device)
-    tp = TensorParallel(world_size=launch.world_size, rank=launch.rank)
-    mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=tp)
-    with TpRuntime(launch) as runtime:
-        tokenizer = AutoTokenizer.from_pretrained(manifest.model_dir, local_files_only=True, trust_remote_code=True)
-        encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
-        input_ids = encoded["input_ids"].to(runtime.device)
-        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
-            raise CliError("TP generation currently supports exactly one prompt")
-        if input_ids.shape[1] == 0:
-            raise CliError("TP generation requires at least one prompt token")
-        _sync_device(runtime.device)
-        total_start = time.perf_counter()
-        with TensorLoader(manifest) as loader:
-            weights = MappedWeights(loader, mapping, device=str(runtime.device))
-            load_start = time.perf_counter()
-            load_stats = weights.preload()
-            _sync_device(runtime.device)
-            load_end = time.perf_counter()
-            state = DecodeState.empty(mapping, runtime_config)
-            prefill_start = time.perf_counter()
-            logits = tp_decode_step_local_logits(input_ids, mapping, runtime_config, weights, runtime, state)
-            _sync_device(runtime.device)
-            prefill_end = time.perf_counter()
-            generated: list[int] = []
-            step_finite: list[bool] = []
-            decode_start = time.perf_counter()
-            for step in range(max_new_tokens):
-                last_logits = logits[:, -1].float()
-                step_finite.append(bool(torch.isfinite(last_logits).all().item()))
-                next_token = tp_greedy_next_token(logits, mapping.lm_head, runtime)
-                next_token = _sync_next_token(next_token, runtime)
-                generated.append(int(next_token.item()))
-                if step + 1 < max_new_tokens:
-                    logits = tp_decode_step_local_logits(next_token[:, None], mapping, runtime_config, weights, runtime, state)
-            _sync_device(runtime.device)
-            decode_end = time.perf_counter()
-            dispatch = weights.dispatch_stats
-        total_end = time.perf_counter()
-        load_seconds = _elapsed_seconds(load_start, load_end)
-        prefill_seconds = _elapsed_seconds(prefill_start, prefill_end)
-        decode_seconds = _elapsed_seconds(decode_start, decode_end)
-        total_seconds = _elapsed_seconds(total_start, total_end)
-        decode_tokens_per_second = max_new_tokens / decode_seconds if decode_seconds > 0 else float("inf")
-        total_tokens_per_second = max_new_tokens / total_seconds if total_seconds > 0 else float("inf")
-        lines = [
-            f"tp_generate_backend: {backend}",
-            f"tp_generate_world_size: {launch.world_size}",
-            f"tp_generate_rank: {launch.rank}",
-            f"tp_generate_local_rank: {launch.local_rank}",
-            f"tp_generate_device: {runtime.device}",
-            f"tp_generate_prompt_tokens: {input_ids.numel()}",
-            f"tp_generate_max_new_tokens: {max_new_tokens}",
-            f"tp_generate_layers: {len(mapping.layers)}",
-            f"tp_generate_mapped_tensors: {len(mapping.mapped_tensor_names)}",
-            f"tp_generate_mapped_bytes: {mapped_tensor_bytes(mapping)}",
-            f"tp_generate_loaded_tensors: {load_stats.tensor_count}",
-            f"tp_generate_loaded_bytes: {load_stats.bytes}",
-            f"tp_generate_load_seconds: {load_seconds:.6f}",
-            f"tp_generate_prefill_seconds: {prefill_seconds:.6f}",
-            f"tp_generate_decode_seconds: {decode_seconds:.6f}",
-            f"tp_generate_total_seconds: {total_seconds:.6f}",
-            f"tp_generate_decode_tokens_per_second: {decode_tokens_per_second:.6f}",
-            f"tp_generate_total_tokens_per_second: {total_tokens_per_second:.6f}",
-            f"tp_generate_dispatch_calls: {dispatch.calls}",
-            f"tp_generate_dispatch_fp8_weight_calls: {dispatch.fp8_weight_calls}",
-            f"tp_generate_dispatch_eligible_cuda_calls: {dispatch.eligible_cuda_calls}",
-            f"tp_generate_dispatch_cuda_kernel_hits: {dispatch.cuda_kernel_hits}",
-            f"tp_generate_dispatch_fallback_calls: {dispatch.fallback_calls}",
-            f"tp_generate_dispatch_fallback_disabled_cuda_kernel: {dispatch.fallback_disabled_cuda_kernel}",
-            f"tp_generate_dispatch_fallback_missing_scale: {dispatch.fallback_missing_scale}",
-            f"tp_generate_dispatch_fallback_hidden_not_cuda: {dispatch.fallback_hidden_not_cuda}",
-            f"tp_generate_dispatch_fallback_weight_not_cuda: {dispatch.fallback_weight_not_cuda}",
-            f"tp_generate_dispatch_fallback_scale_not_cuda: {dispatch.fallback_scale_not_cuda}",
-            f"tp_generate_dispatch_fallback_weight_dtype: {dispatch.fallback_weight_dtype}",
-            f"tp_generate_dispatch_fallback_scale_dtype: {dispatch.fallback_scale_dtype}",
-            f"tp_generate_dispatch_fallback_hidden_alignment: {dispatch.fallback_hidden_alignment}",
-            f"tp_generate_dispatch_fallback_weight_alignment: {dispatch.fallback_weight_alignment}",
-            f"tp_generate_all_finite: {all(step_finite)}",
-        ]
-        lines.extend(_cuda_memory_lines("tp_generate", runtime.device))
-        if launch.rank == 0:
-            lines.extend(
-                [
-                    f"tp_generate_generated_token_ids: {','.join(str(token) for token in generated)}",
-                    f"tp_generate_text: {tokenizer.decode(generated, skip_special_tokens=False)}",
-                ]
-            )
-        runtime.barrier()
-        return lines
+    runner = TpModelRunner(manifest, runtime_config, launch)
+    return _format_tp_generate_result(runner.generate(prompt, max_new_tokens))
+
+
+def _format_tp_generate_result(result: GenerateResult) -> list[str]:
+    dispatch = result.dispatch_stats
+    lines = [
+        f"tp_generate_backend: {result.backend}",
+        f"tp_generate_world_size: {result.world_size}",
+        f"tp_generate_rank: {result.rank}",
+        f"tp_generate_local_rank: {result.local_rank}",
+        f"tp_generate_device: {result.device}",
+        f"tp_generate_prompt_tokens: {result.prompt_tokens}",
+        f"tp_generate_max_new_tokens: {result.max_new_tokens}",
+        f"tp_generate_layers: {result.layers}",
+        f"tp_generate_mapped_tensors: {result.mapped_tensors}",
+        f"tp_generate_mapped_bytes: {result.mapped_bytes}",
+        f"tp_generate_loaded_tensors: {result.load_stats.tensor_count}",
+        f"tp_generate_loaded_bytes: {result.load_stats.bytes}",
+        f"tp_generate_load_seconds: {result.load_seconds:.6f}",
+        f"tp_generate_prefill_seconds: {result.prefill_seconds:.6f}",
+        f"tp_generate_decode_seconds: {result.decode_seconds:.6f}",
+        f"tp_generate_total_seconds: {result.total_seconds:.6f}",
+        f"tp_generate_decode_tokens_per_second: {result.decode_tokens_per_second:.6f}",
+        f"tp_generate_total_tokens_per_second: {result.total_tokens_per_second:.6f}",
+        f"tp_generate_dispatch_calls: {dispatch.calls}",
+        f"tp_generate_dispatch_fp8_weight_calls: {dispatch.fp8_weight_calls}",
+        f"tp_generate_dispatch_eligible_cuda_calls: {dispatch.eligible_cuda_calls}",
+        f"tp_generate_dispatch_cuda_kernel_hits: {dispatch.cuda_kernel_hits}",
+        f"tp_generate_dispatch_fallback_calls: {dispatch.fallback_calls}",
+        f"tp_generate_dispatch_fallback_disabled_cuda_kernel: {dispatch.fallback_disabled_cuda_kernel}",
+        f"tp_generate_dispatch_fallback_missing_scale: {dispatch.fallback_missing_scale}",
+        f"tp_generate_dispatch_fallback_hidden_not_cuda: {dispatch.fallback_hidden_not_cuda}",
+        f"tp_generate_dispatch_fallback_weight_not_cuda: {dispatch.fallback_weight_not_cuda}",
+        f"tp_generate_dispatch_fallback_scale_not_cuda: {dispatch.fallback_scale_not_cuda}",
+        f"tp_generate_dispatch_fallback_weight_dtype: {dispatch.fallback_weight_dtype}",
+        f"tp_generate_dispatch_fallback_scale_dtype: {dispatch.fallback_scale_dtype}",
+        f"tp_generate_dispatch_fallback_hidden_alignment: {dispatch.fallback_hidden_alignment}",
+        f"tp_generate_dispatch_fallback_weight_alignment: {dispatch.fallback_weight_alignment}",
+        f"tp_generate_all_finite: {result.all_finite}",
+    ]
+    memory = result.cuda_memory
+    if memory.available:
+        lines.extend(
+            [
+                f"tp_generate_cuda_memory_free: {memory.free_bytes}",
+                f"tp_generate_cuda_memory_total: {memory.total_bytes}",
+                f"tp_generate_cuda_max_allocated: {memory.max_allocated}",
+                f"tp_generate_cuda_max_reserved: {memory.max_reserved}",
+            ]
+        )
+    else:
+        lines.append("tp_generate_cuda_memory: unavailable")
+    if result.rank == 0:
+        lines.extend(
+            [
+                f"tp_generate_generated_token_ids: {','.join(str(token) for token in result.generated_token_ids)}",
+                f"tp_generate_text: {result.text}",
+            ]
+        )
+    return lines
 
 
 def _summarize_tp_reference_forward(
@@ -735,7 +674,7 @@ def run(args: argparse.Namespace) -> int:
                 args.tp_device,
             ):
                 print(line)
-        except (ConfigError, MappingError, LoaderError, TpRuntimeError, CliError) as exc:
+        except (ConfigError, EngineError, MappingError, LoaderError, TpRuntimeError, CliError) as exc:
             raise CliError(str(exc)) from exc
         except Exception as exc:
             raise CliError(f"TP resident generation failed: {exc}") from exc
