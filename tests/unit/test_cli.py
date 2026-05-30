@@ -293,6 +293,12 @@ def test_cli_tp_generate_single_rank(tmp_path: Path, capsys, monkeypatch: pytest
     assert "tp_generate_device: cpu" in out
     assert "tp_generate_loaded_tensors:" in out
     assert "tp_generate_loaded_bytes:" in out
+    assert "tp_generate_load_seconds:" in out
+    assert "tp_generate_prefill_seconds:" in out
+    assert "tp_generate_decode_seconds:" in out
+    assert "tp_generate_total_seconds:" in out
+    assert "tp_generate_decode_tokens_per_second:" in out
+    assert "tp_generate_total_tokens_per_second:" in out
     assert "tp_generate_dispatch_calls:" in out
     assert "tp_generate_all_finite: True" in out
     assert "tp_generate_generated_token_ids:" in out

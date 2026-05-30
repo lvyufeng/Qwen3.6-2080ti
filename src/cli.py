@@ -269,6 +269,18 @@ def _sync_next_token(next_token, runtime: TpRuntime):
     return next_token
 
 
+def _sync_device(device) -> None:
+    if getattr(device, "type", None) != "cuda":
+        return
+    import torch
+
+    torch.cuda.synchronize(device)
+
+
+def _elapsed_seconds(start: float, end: float) -> float:
+    return max(0.0, end - start)
+
+
 def _summarize_tp_generate(
     manifest: Manifest,
     runtime_config: RuntimeConfig,
@@ -281,6 +293,8 @@ def _summarize_tp_generate(
     init_method: str | None,
     device: str | None,
 ) -> list[str]:
+    import time
+
     import torch
     from transformers import AutoTokenizer
 
@@ -295,13 +309,22 @@ def _summarize_tp_generate(
             raise CliError("TP generation currently supports exactly one prompt")
         if input_ids.shape[1] == 0:
             raise CliError("TP generation requires at least one prompt token")
+        _sync_device(runtime.device)
+        total_start = time.perf_counter()
         with TensorLoader(manifest) as loader:
             weights = MappedWeights(loader, mapping, device=str(runtime.device))
+            load_start = time.perf_counter()
             load_stats = weights.preload()
+            _sync_device(runtime.device)
+            load_end = time.perf_counter()
             state = DecodeState.empty(mapping, runtime_config)
+            prefill_start = time.perf_counter()
             logits = tp_decode_step(input_ids, mapping, runtime_config, weights, runtime, state)
+            _sync_device(runtime.device)
+            prefill_end = time.perf_counter()
             generated: list[int] = []
             step_finite: list[bool] = []
+            decode_start = time.perf_counter()
             for step in range(max_new_tokens):
                 last_logits = logits[:, -1].float()
                 step_finite.append(bool(torch.isfinite(last_logits).all().item()))
@@ -310,7 +333,16 @@ def _summarize_tp_generate(
                 generated.append(int(next_token.item()))
                 if step + 1 < max_new_tokens:
                     logits = tp_decode_step(next_token[:, None], mapping, runtime_config, weights, runtime, state)
+            _sync_device(runtime.device)
+            decode_end = time.perf_counter()
             dispatch = weights.dispatch_stats
+        total_end = time.perf_counter()
+        load_seconds = _elapsed_seconds(load_start, load_end)
+        prefill_seconds = _elapsed_seconds(prefill_start, prefill_end)
+        decode_seconds = _elapsed_seconds(decode_start, decode_end)
+        total_seconds = _elapsed_seconds(total_start, total_end)
+        decode_tokens_per_second = max_new_tokens / decode_seconds if decode_seconds > 0 else float("inf")
+        total_tokens_per_second = max_new_tokens / total_seconds if total_seconds > 0 else float("inf")
         lines = [
             f"tp_generate_backend: {backend}",
             f"tp_generate_world_size: {launch.world_size}",
@@ -324,6 +356,12 @@ def _summarize_tp_generate(
             f"tp_generate_mapped_bytes: {mapped_tensor_bytes(mapping)}",
             f"tp_generate_loaded_tensors: {load_stats.tensor_count}",
             f"tp_generate_loaded_bytes: {load_stats.bytes}",
+            f"tp_generate_load_seconds: {load_seconds:.6f}",
+            f"tp_generate_prefill_seconds: {prefill_seconds:.6f}",
+            f"tp_generate_decode_seconds: {decode_seconds:.6f}",
+            f"tp_generate_total_seconds: {total_seconds:.6f}",
+            f"tp_generate_decode_tokens_per_second: {decode_tokens_per_second:.6f}",
+            f"tp_generate_total_tokens_per_second: {total_tokens_per_second:.6f}",
             f"tp_generate_dispatch_calls: {dispatch.calls}",
             f"tp_generate_dispatch_fp8_weight_calls: {dispatch.fp8_weight_calls}",
             f"tp_generate_dispatch_eligible_cuda_calls: {dispatch.eligible_cuda_calls}",
