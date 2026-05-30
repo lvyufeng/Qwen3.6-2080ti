@@ -17,7 +17,7 @@ from reference_ops import (
 )
 from decode_state import DecodeState, FullAttentionCache, LinearAttentionCache
 from runtime_config import RuntimeConfig
-from weight_mapping import LanguageModelMapping, LayerMapping, LinearTensor, MoEMapping
+from weight_mapping import LanguageModelMapping, LayerMapping, LinearTensor, MoEMapping, ShardedTensor
 
 
 class TpRuntimeError(RuntimeError):
@@ -181,15 +181,37 @@ def tp_language_model(
     weights: ReferenceWeights,
     runtime: TpRuntime,
 ) -> Any:
+    local_logits = tp_language_model_local_logits(input_ids, mapping, config, weights, runtime)
+    return runtime.all_gather_cat(local_logits, dim=-1)
+
+
+def tp_language_model_local_logits(
+    input_ids: Any,
+    mapping: LanguageModelMapping,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+) -> Any:
     hidden_states = tp_embedding(input_ids, mapping, weights, runtime)
     for layer in mapping.layers:
         hidden_states = tp_decoder_layer(hidden_states, layer, config, weights, runtime)
     hidden_states = rms_norm(hidden_states, weights.tensor(mapping.final_norm), config.rms_norm_eps)
-    logits = weights.linear(hidden_states, LinearTensor(weight=mapping.lm_head, scale=None))
-    return runtime.all_gather_cat(logits, dim=-1)
+    return weights.linear(hidden_states, LinearTensor(weight=mapping.lm_head, scale=None))
 
 
 def tp_decode_step(
+    input_ids: Any,
+    mapping: LanguageModelMapping,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    state: DecodeState,
+) -> Any:
+    local_logits = tp_decode_step_local_logits(input_ids, mapping, config, weights, runtime, state)
+    return runtime.all_gather_cat(local_logits, dim=-1)
+
+
+def tp_decode_step_local_logits(
     input_ids: Any,
     mapping: LanguageModelMapping,
     config: RuntimeConfig,
@@ -204,7 +226,29 @@ def tp_decode_step(
     hidden_states = rms_norm(hidden_states, weights.tensor(mapping.final_norm), config.rms_norm_eps)
     logits = weights.linear(hidden_states, LinearTensor(weight=mapping.lm_head, scale=None))
     state.advance(input_ids.shape[1])
-    return runtime.all_gather_cat(logits, dim=-1)
+    return logits
+
+
+def tp_local_argmax(logits: Any, lm_head: ShardedTensor) -> tuple[Any, Any]:
+    import torch
+
+    local_values, local_indices = torch.max(logits.float(), dim=-1)
+    shard = getattr(lm_head, "shard", None)
+    start = getattr(shard, "start", 0) or 0
+    return local_values, local_indices.to(torch.long) + start
+
+
+def tp_greedy_next_token(logits: Any, lm_head: ShardedTensor, runtime: TpRuntime) -> Any:
+    import torch
+
+    local_values, local_tokens = tp_local_argmax(logits[:, -1], lm_head)
+    if not runtime.config.is_distributed:
+        return local_tokens
+    packed = torch.stack((local_values.float(), local_tokens.float()), dim=-1)
+    gathered = runtime.all_gather_cat(packed.unsqueeze(0), dim=0)
+    best_rank = torch.argmax(gathered[..., 0], dim=0)
+    batch_indices = torch.arange(gathered.shape[1], device=gathered.device)
+    return gathered[best_rank, batch_indices, 1].to(torch.long)
 
 
 def tp_embedding(input_ids: Any, mapping: LanguageModelMapping, weights: ReferenceWeights, runtime: TpRuntime) -> Any:

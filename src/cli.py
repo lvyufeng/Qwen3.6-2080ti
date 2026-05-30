@@ -10,7 +10,16 @@ from decode_state import DecodeState
 from reference_ops import ReferenceWeights, decode_step, decoder_layer, embedding, language_model
 from runtime_config import ConfigError, RuntimeConfig, parse_runtime_config
 from tensor_parallel import TensorParallel
-from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_decode_step, tp_language_model
+from tp_runtime import (
+    TpLaunchConfig,
+    TpRuntime,
+    TpRuntimeError,
+    mapped_tensor_bytes,
+    tp_decode_step,
+    tp_decode_step_local_logits,
+    tp_greedy_next_token,
+    tp_language_model,
+)
 from tp_weights import MappedWeights
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 
@@ -319,7 +328,7 @@ def _summarize_tp_generate(
             load_end = time.perf_counter()
             state = DecodeState.empty(mapping, runtime_config)
             prefill_start = time.perf_counter()
-            logits = tp_decode_step(input_ids, mapping, runtime_config, weights, runtime, state)
+            logits = tp_decode_step_local_logits(input_ids, mapping, runtime_config, weights, runtime, state)
             _sync_device(runtime.device)
             prefill_end = time.perf_counter()
             generated: list[int] = []
@@ -328,11 +337,11 @@ def _summarize_tp_generate(
             for step in range(max_new_tokens):
                 last_logits = logits[:, -1].float()
                 step_finite.append(bool(torch.isfinite(last_logits).all().item()))
-                next_token = torch.argmax(last_logits, dim=-1)
+                next_token = tp_greedy_next_token(logits, mapping.lm_head, runtime)
                 next_token = _sync_next_token(next_token, runtime)
                 generated.append(int(next_token.item()))
                 if step + 1 < max_new_tokens:
-                    logits = tp_decode_step(next_token[:, None], mapping, runtime_config, weights, runtime, state)
+                    logits = tp_decode_step_local_logits(next_token[:, None], mapping, runtime_config, weights, runtime, state)
             _sync_device(runtime.device)
             decode_end = time.perf_counter()
             dispatch = weights.dispatch_stats

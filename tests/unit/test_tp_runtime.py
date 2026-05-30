@@ -11,9 +11,28 @@ from reference_ops import ReferenceWeights, decoder_layer, language_model
 from runtime_config import parse_runtime_config
 from tensor_parallel import TensorParallel
 from decode_state import DecodeState
-from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_decode_step, tp_decoder_layer, tp_language_model
+from tp_runtime import (
+    TpLaunchConfig,
+    TpRuntime,
+    TpRuntimeError,
+    mapped_tensor_bytes,
+    tp_decode_step,
+    tp_decoder_layer,
+    tp_greedy_next_token,
+    tp_language_model,
+)
 from loader import TensorLoader
-from weight_mapping import ExpertMapping, FullAttentionMapping, LanguageModelMapping, LayerMapping, LinearTensor, MoEMapping, build_language_model_mapping
+from weight_mapping import (
+    ExpertMapping,
+    FullAttentionMapping,
+    LanguageModelMapping,
+    LayerMapping,
+    LinearTensor,
+    MoEMapping,
+    ShardedTensor,
+    TensorShard,
+    build_language_model_mapping,
+)
 
 
 def test_tp_launch_config_validates_rank() -> None:
@@ -72,6 +91,41 @@ def test_two_rank_safetensors_tp_decode_matches_prefill(tmp_path: Path) -> None:
         nprocs=2,
         join=True,
     )
+
+
+def test_two_rank_tp_greedy_next_token_matches_full_gather_argmax(tmp_path: Path) -> None:
+    torch.multiprocessing.spawn(
+        _tp_greedy_next_token_worker,
+        args=(tmp_path,),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _tp_greedy_next_token_worker(rank: int, tmp_path: Path) -> None:
+    init_method = f"file://{tmp_path / 'tp-greedy-dist-init'}"
+    with TpRuntime(TpLaunchConfig(world_size=2, rank=rank, local_rank=rank, backend="gloo", init_method=init_method, device="cpu")) as runtime:
+        tp = TensorParallel(world_size=2, rank=rank)
+        lm_head = ShardedTensor(_info("head", (4, 2), nbytes=16), TensorShard.dim_shard("parallel_head", (4, 2), dim=0, tp=tp))
+        tp_mapping = LanguageModelMapping(
+            model_dir=Path("."),
+            embed_tokens=_info("embed", (4, 2), nbytes=16),
+            final_norm=_info("norm", (2,), nbytes=4),
+            lm_head=lm_head,
+            layers=(),
+            mapped_tensor_names=frozenset(),
+            ignored_tensor_names=frozenset(),
+            unmapped_language_tensor_names=(),
+        )
+        local_logits = (
+            torch.tensor([[[1.0, 4.0], [0.0, 3.0]]])
+            if rank == 0
+            else torch.tensor([[[2.0, 3.0], [5.0, 1.0]]])
+        )
+        full_logits = runtime.all_gather_cat(local_logits, dim=-1)
+        expected = torch.argmax(full_logits[:, -1], dim=-1)
+        actual = tp_greedy_next_token(local_logits, tp_mapping.lm_head, runtime)
+        torch.testing.assert_close(actual, expected)
 
 
 def _tp_decode_worker(rank: int, tmp_path: Path) -> None:
