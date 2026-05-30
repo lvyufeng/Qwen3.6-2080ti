@@ -14,7 +14,9 @@ from tp_runtime import TpLaunchConfig, TpRuntime
 from worker import (
     GENERATE,
     LOAD,
+    POLL,
     STATUS,
+    SUBMIT,
     SHUTDOWN,
     WorkerCommand,
     WorkerError,
@@ -217,6 +219,185 @@ def test_worker_load_clears_scheduler_state(tmp_path: Path, monkeypatch: pytest.
     assert after_reload.ok is True
     assert after_reload.data["loaded"] is True
     assert after_reload.data["scheduler"] == _empty_scheduler_data()
+
+
+def test_worker_submit_requires_loaded_model() -> None:
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    result = execute_command(state, WorkerCommand(SUBMIT, {"prompt": "hello", "max_new_tokens": 1}))
+
+    assert result.ok is False
+    assert "not loaded" in (result.error or "")
+
+
+def test_worker_submit_enqueues_without_generating(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    submit_result = execute_command(state, WorkerCommand(SUBMIT, {"prompt": "hello", "max_new_tokens": 1}))
+    status_result = execute_command(state, WorkerCommand(STATUS, {}))
+
+    assert submit_result.ok is True
+    assert submit_result.kind == SUBMIT
+    assert submit_result.data["request_id"] == "gen-1"
+    assert submit_result.data["status"] == "PENDING"
+    assert submit_result.data["pending"] == 1
+    assert status_result.data["scheduler"]["pending"] == 1
+    assert status_result.data["scheduler"]["completed"] == 0
+    assert status_result.data["scheduler"]["total_submitted"] == 1
+
+
+def test_worker_submit_accepts_explicit_request_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    submit_result = execute_command(
+        state, WorkerCommand(SUBMIT, {"prompt": "hello", "max_new_tokens": 1, "request_id": "job-1"})
+    )
+
+    assert submit_result.ok is True
+    assert submit_result.data["request_id"] == "job-1"
+
+
+def test_worker_poll_unknown_request_id_reports_not_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    poll_result = execute_command(state, WorkerCommand(POLL, {"request_id": "missing"}))
+
+    assert poll_result.ok is True
+    assert poll_result.kind == POLL
+    assert poll_result.data["request_id"] == "missing"
+    assert poll_result.data["found"] is False
+    assert poll_result.data["status"] is None
+    assert poll_result.data["result"] is None
+
+
+def test_worker_poll_drains_pending_request_to_completion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    submit_result = execute_command(
+        state, WorkerCommand(SUBMIT, {"prompt": "hello", "max_new_tokens": 2, "request_id": "job-1"})
+    )
+    poll_result = execute_command(state, WorkerCommand(POLL, {"request_id": "job-1"}))
+    status_result = execute_command(state, WorkerCommand(STATUS, {}))
+
+    assert submit_result.ok is True
+    assert poll_result.ok is True
+    assert poll_result.data["found"] is True
+    assert poll_result.data["status"] == "COMPLETED"
+    assert poll_result.data["error"] is None
+    assert poll_result.data["queued_seconds"] >= 0
+    assert poll_result.data["run_seconds"] >= 0
+    result = poll_result.data["result"]
+    assert result["text"].startswith("decoded:")
+    assert len(result["generated_token_ids"]) == 2
+    assert result["world_size"] == 1
+    assert status_result.data["scheduler"]["completed"] == 1
+    assert status_result.data["scheduler"]["pending"] == 0
+
+
+def test_worker_poll_reports_failed_job_without_command_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+
+    def boom(_prompt: str, _max_new_tokens: int):
+        raise RuntimeError("generate kaboom")
+
+    monkeypatch.setattr(state.session, "generate", boom)
+    submit_result = execute_command(
+        state, WorkerCommand(SUBMIT, {"prompt": "hello", "max_new_tokens": 1, "request_id": "job-1"})
+    )
+    poll_result = execute_command(state, WorkerCommand(POLL, {"request_id": "job-1"}))
+    status_result = execute_command(state, WorkerCommand(STATUS, {}))
+
+    assert submit_result.ok is True
+    assert poll_result.ok is True
+    assert poll_result.data["found"] is True
+    assert poll_result.data["status"] == "FAILED"
+    assert "generate kaboom" in poll_result.data["error"]
+    assert poll_result.data["result"] is None
+    assert status_result.data["scheduler"]["failed"] == 1
+    assert status_result.data["scheduler"]["total_failed"] == 1
+
+
+def test_worker_poll_drains_one_request_per_call_in_fifo_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    execute_command(state, WorkerCommand(SUBMIT, {"prompt": "first", "max_new_tokens": 1, "request_id": "a"}))
+    execute_command(state, WorkerCommand(SUBMIT, {"prompt": "second", "max_new_tokens": 1, "request_id": "b"}))
+
+    first_poll = execute_command(state, WorkerCommand(POLL, {"request_id": "b"}))
+    second_poll = execute_command(state, WorkerCommand(POLL, {"request_id": "b"}))
+
+    assert first_poll.ok is True
+    assert first_poll.data["found"] is True
+    assert first_poll.data["status"] == "PENDING"
+    assert first_poll.data["result"] is None
+    assert second_poll.ok is True
+    assert second_poll.data["status"] == "COMPLETED"
+    assert second_poll.data["result"]["text"].startswith("decoded:")
+    assert execute_command(state, WorkerCommand(POLL, {"request_id": "a"})).data["status"] == "COMPLETED"
+
+
+def test_worker_protocol_loop_submit_poll_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+    input_stream = _jsonl_stream(
+        [
+            {"id": "load", "kind": LOAD, "payload": {"model_dir": str(tmp_path)}},
+            {"id": "submit", "kind": SUBMIT, "payload": {"prompt": "hello", "max_new_tokens": 2, "request_id": "job-1"}},
+            {"id": "status-before", "kind": STATUS, "payload": {}},
+            {"id": "poll", "kind": POLL, "payload": {"request_id": "job-1"}},
+            {"id": "status-after", "kind": STATUS, "payload": {}},
+            {"id": "stop", "kind": SHUTDOWN, "payload": {}},
+        ]
+    )
+    output_stream = io.StringIO()
+
+    with TpRuntime(state.launch) as runtime:
+        run_worker_protocol_loop(state, runtime, input_stream, output_stream)
+
+    responses = _read_jsonl(output_stream)
+    assert [response["id"] for response in responses] == [
+        "load",
+        "submit",
+        "status-before",
+        "poll",
+        "status-after",
+        "stop",
+    ]
+    assert [response["kind"] for response in responses] == [LOAD, SUBMIT, STATUS, POLL, STATUS, SHUTDOWN]
+    assert all(response["ok"] for response in responses)
+    submit = responses[1]
+    assert submit["data"]["request_id"] == "job-1"
+    assert submit["data"]["status"] == "PENDING"
+    assert responses[2]["data"]["scheduler"]["pending"] == 1
+    assert responses[2]["data"]["scheduler"]["completed"] == 0
+    poll = responses[3]
+    assert poll["data"]["request_id"] == "job-1"
+    assert poll["data"]["status"] == "COMPLETED"
+    assert poll["data"]["result"]["text"].startswith("decoded:")
+    assert responses[4]["data"]["scheduler"]["completed"] == 1
+    assert responses[4]["data"]["scheduler"]["pending"] == 0
+    assert responses[5]["data"]["shutdown"] is True
+    assert state.should_shutdown is True
 
 
 def test_worker_protocol_loop_single_rank_load_generate_shutdown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -485,6 +666,72 @@ def _worker_protocol_e2e_worker(rank: int, tmp_path: Path, model_dir: Path) -> N
         assert len(generate["data"]["generated_token_ids"]) == 2
         assert generate["data"]["text"].startswith("decoded:")
 
+    assert responses[3]["data"]["shutdown"] is True
+    assert all(result["data"]["shutdown"] for result in responses[3]["rank_results"])
+
+
+def test_two_rank_worker_protocol_loop_submit_poll_shutdown(tmp_path: Path) -> None:
+    model_dir = tmp_path / "tiny-worker-submit-poll-model"
+    model_dir.mkdir()
+    _write_tiny_model(model_dir)
+    torch.multiprocessing.spawn(
+        _worker_protocol_submit_poll_worker,
+        args=(tmp_path, model_dir),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _worker_protocol_submit_poll_worker(rank: int, tmp_path: Path, model_dir: Path) -> None:
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+        launch = _two_rank_launch(rank, tmp_path, "worker-protocol-submit-poll-dist-init")
+        state = WorkerState(launch)
+        input_stream = (
+            _jsonl_stream(
+                [
+                    {"id": "load", "kind": LOAD, "payload": {"model_dir": str(model_dir)}},
+                    {
+                        "id": "submit-envelope",
+                        "kind": SUBMIT,
+                        "payload": {"prompt": "hello", "max_new_tokens": 2, "request_id": "job-1"},
+                    },
+                    {"id": "poll-envelope", "kind": POLL, "payload": {"request_id": "job-1"}},
+                    {"id": "stop", "kind": SHUTDOWN, "payload": {}},
+                ]
+            )
+            if rank == 0
+            else io.StringIO()
+        )
+        output_stream = io.StringIO()
+
+        with TpRuntime(launch) as runtime:
+            run_worker_protocol_loop(state, runtime, input_stream, output_stream)
+
+    assert state.should_shutdown is True
+    assert state.session is None
+    if rank != 0:
+        assert output_stream.getvalue() == ""
+        return
+
+    responses = _read_jsonl(output_stream)
+    assert [response["id"] for response in responses] == ["load", "submit-envelope", "poll-envelope", "stop"]
+    assert [response["kind"] for response in responses] == [LOAD, SUBMIT, POLL, SHUTDOWN]
+    for response, kind in zip(responses, [LOAD, SUBMIT, POLL, SHUTDOWN], strict=True):
+        _assert_two_rank_response(response, kind)
+
+    submit = responses[1]
+    assert submit["data"]["request_id"] == "job-1"
+    assert submit["data"]["status"] == "PENDING"
+    assert submit["data"]["scheduler"]["pending"] == 1
+
+    poll = responses[2]
+    assert poll["data"]["request_id"] == "job-1"
+    assert poll["data"]["status"] == "COMPLETED"
+    assert poll["data"]["result"]["world_size"] == 2
+    assert poll["data"]["result"]["rank"] == 0
+    assert poll["data"]["result"]["text"].startswith("decoded:")
+    assert poll["data"]["scheduler"]["completed"] == 1
     assert responses[3]["data"]["shutdown"] is True
     assert all(result["data"]["shutdown"] for result in responses[3]["rank_results"])
 

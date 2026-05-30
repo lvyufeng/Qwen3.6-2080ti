@@ -4,16 +4,18 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, TextIO
+from typing import Any, Iterable, TextIO, cast
 
 from checkpoint import Manifest, build_manifest
 from engine import GenerateResult, TpModelSession
 from runtime_config import RuntimeConfig, parse_runtime_config
-from scheduler import RequestScheduler, ScheduledResult, SchedulerSnapshot
+from scheduler import RequestScheduler, RequestStatus, ScheduledResult, SchedulerSnapshot
 from tp_runtime import TpLaunchConfig, TpRuntime
 
 LOAD = "LOAD"
 GENERATE = "GENERATE"
+SUBMIT = "SUBMIT"
+POLL = "POLL"
 STATUS = "STATUS"
 SHUTDOWN = "SHUTDOWN"
 
@@ -68,7 +70,11 @@ def execute_command(state: WorkerState, command: WorkerCommand, runtime: TpRunti
         if command.kind == LOAD:
             return _execute_load(state, command)
         if command.kind == GENERATE:
-            return _execute_generate(state, command)
+            return _execute_generate(state, command, runtime)
+        if command.kind == SUBMIT:
+            return _execute_submit(state, command, runtime)
+        if command.kind == POLL:
+            return _execute_poll(state, command, runtime)
         if command.kind == STATUS:
             return _execute_status(state)
         if command.kind == SHUTDOWN:
@@ -248,12 +254,10 @@ def _execute_load(state: WorkerState, command: WorkerCommand) -> WorkerResult:
     )
 
 
-def _execute_generate(state: WorkerState, command: WorkerCommand) -> WorkerResult:
-    if state.session is None:
-        raise WorkerError("worker has not loaded a model")
+def _execute_generate(state: WorkerState, command: WorkerCommand, runtime: TpRuntime | None = None) -> WorkerResult:
+    session = _require_loaded_session(state, runtime)
     prompt = _payload_str(command, "prompt")
     max_new_tokens = _payload_positive_int(command, "max_new_tokens")
-    session = state.session
     scheduled = state.scheduler.run_blocking_generate(
         prompt,
         max_new_tokens,
@@ -263,6 +267,43 @@ def _execute_generate(state: WorkerState, command: WorkerCommand) -> WorkerResul
     data = _generate_result_data(scheduled.result)
     data["scheduler"] = _scheduled_result_data(scheduled)
     return WorkerResult(GENERATE, state.launch.rank, True, data)
+
+
+def _execute_submit(state: WorkerState, command: WorkerCommand, runtime: TpRuntime | None = None) -> WorkerResult:
+    _require_loaded_session(state, runtime)
+    prompt = _payload_str(command, "prompt")
+    max_new_tokens = _payload_positive_int(command, "max_new_tokens")
+    request_id = _payload_optional_str(command, "request_id")
+    request = state.scheduler.submit_generate(prompt, max_new_tokens, request_id=request_id)
+    snapshot = state.scheduler.snapshot()
+    return WorkerResult(
+        SUBMIT,
+        state.launch.rank,
+        True,
+        {
+            "request_id": request.request_id,
+            "status": RequestStatus.PENDING.value,
+            "pending": snapshot.pending,
+            "scheduler": _scheduler_snapshot_data(snapshot),
+        },
+    )
+
+
+def _execute_poll(state: WorkerState, command: WorkerCommand, runtime: TpRuntime | None = None) -> WorkerResult:
+    session = _require_loaded_session(state, runtime)
+    request_id = _payload_str(command, "request_id")
+    scheduled = state.scheduler.result_for(request_id)
+    if scheduled is None and state.scheduler.is_pending(request_id):
+        state.scheduler.run_next(lambda request: session.generate(request.prompt, request.max_new_tokens), reraise=False)
+        scheduled = state.scheduler.result_for(request_id)
+    if scheduled is not None:
+        data = _poll_terminal_data(request_id, scheduled)
+    elif state.scheduler.is_pending(request_id):
+        data = _poll_pending_data(request_id)
+    else:
+        data = _poll_unknown_data(request_id)
+    data["scheduler"] = _scheduler_snapshot_data(state.scheduler.snapshot())
+    return WorkerResult(POLL, state.launch.rank, True, data)
 
 
 def _execute_status(state: WorkerState) -> WorkerResult:
@@ -301,6 +342,46 @@ def _scheduled_result_data(result: ScheduledResult[GenerateResult]) -> dict[str,
     }
 
 
+def _poll_terminal_data(request_id: str, scheduled: ScheduledResult[object]) -> dict[str, Any]:
+    result_data = None
+    if scheduled.status is RequestStatus.COMPLETED:
+        assert scheduled.result is not None
+        result_data = _generate_result_data(cast(GenerateResult, scheduled.result))
+    return {
+        "request_id": request_id,
+        "found": True,
+        "status": scheduled.status.value,
+        "result": result_data,
+        "error": scheduled.error,
+        "queued_seconds": scheduled.queued_seconds,
+        "run_seconds": scheduled.run_seconds,
+    }
+
+
+def _poll_pending_data(request_id: str) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "found": True,
+        "status": RequestStatus.PENDING.value,
+        "result": None,
+        "error": None,
+        "queued_seconds": None,
+        "run_seconds": None,
+    }
+
+
+def _poll_unknown_data(request_id: str) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "found": False,
+        "status": None,
+        "result": None,
+        "error": None,
+        "queued_seconds": None,
+        "run_seconds": None,
+    }
+
+
 def _scheduler_snapshot_data(snapshot: SchedulerSnapshot) -> dict[str, Any]:
     return {
         "pending": snapshot.pending,
@@ -323,10 +404,33 @@ def _close_worker_state(state: WorkerState) -> None:
     state.scheduler.clear()
 
 
+def _require_loaded_session(state: WorkerState, runtime: TpRuntime | None = None) -> TpModelSession:
+    session = state.session
+    if runtime is not None and runtime.config.is_distributed:
+        import torch.distributed as dist
+
+        loaded_by_rank: list[Any] = [None] * runtime.config.world_size
+        dist.all_gather_object(loaded_by_rank, session is not None)
+        if not all(loaded_by_rank):
+            raise WorkerError("worker has not loaded a model")
+    if session is None:
+        raise WorkerError("worker has not loaded a model")
+    return session
+
+
 def _payload_str(command: WorkerCommand, key: str) -> str:
     value = command.payload.get(key)
     if not isinstance(value, str) or not value:
         raise WorkerError(f"{command.kind} requires string payload field: {key}")
+    return value
+
+
+def _payload_optional_str(command: WorkerCommand, key: str) -> str | None:
+    value = command.payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise WorkerError(f"{command.kind} requires optional string payload field: {key}")
     return value
 
 
