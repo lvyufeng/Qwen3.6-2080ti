@@ -10,7 +10,8 @@ from checkpoint import TensorInfo, build_manifest
 from reference_ops import ReferenceWeights, decoder_layer, language_model
 from runtime_config import parse_runtime_config
 from tensor_parallel import TensorParallel
-from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_decoder_layer, tp_language_model
+from decode_state import DecodeState
+from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_decode_step, tp_decoder_layer, tp_language_model
 from loader import TensorLoader
 from weight_mapping import ExpertMapping, FullAttentionMapping, LanguageModelMapping, LayerMapping, LinearTensor, MoEMapping, build_language_model_mapping
 
@@ -61,6 +62,42 @@ def test_two_rank_safetensors_tp_language_model_matches_dense(tmp_path: Path) ->
         nprocs=2,
         join=True,
     )
+
+
+
+def test_two_rank_safetensors_tp_decode_matches_prefill(tmp_path: Path) -> None:
+    torch.multiprocessing.spawn(
+        _tp_decode_worker,
+        args=(tmp_path,),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _tp_decode_worker(rank: int, tmp_path: Path) -> None:
+    save_file = pytest.importorskip("safetensors.torch").save_file
+    model_dir = tmp_path / "tiny-decode"
+    if rank == 0:
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps(_safetensors_config()), encoding="utf-8")
+        save_file(_safetensors_tensors(), model_dir / "model.safetensors")
+    init_method = f"file://{tmp_path / 'tp-decode-dist-init'}"
+    with TpRuntime(TpLaunchConfig(world_size=2, rank=rank, local_rank=rank, backend="gloo", init_method=init_method, device="cpu")) as runtime:
+        runtime.barrier()
+        manifest = build_manifest(model_dir)
+        config = parse_runtime_config(manifest.config)
+        tp_mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=TensorParallel(world_size=2, rank=rank))
+        input_ids = torch.tensor([[0, 1, 2, 3]])
+        with TensorLoader(manifest) as loader:
+            weights = ReferenceWeights(loader)
+            prefill = tp_language_model(input_ids, tp_mapping, config, weights, runtime)
+            state = DecodeState.empty(tp_mapping, config)
+            step_logits = [
+                tp_decode_step(input_ids[:, :3], tp_mapping, config, weights, runtime, state),
+                tp_decode_step(input_ids[:, 3:4], tp_mapping, config, weights, runtime, state),
+            ]
+            decoded = torch.cat(step_logits, dim=1)
+        torch.testing.assert_close(decoded, prefill, atol=1e-5, rtol=1e-5)
 
 
 def _tp_language_model_worker(rank: int, tmp_path: Path) -> None:

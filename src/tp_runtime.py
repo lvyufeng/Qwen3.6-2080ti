@@ -15,6 +15,7 @@ from reference_ops import (
     silu_mul,
     topk_route,
 )
+from decode_state import DecodeState, FullAttentionCache, LinearAttentionCache
 from runtime_config import RuntimeConfig
 from weight_mapping import LanguageModelMapping, LayerMapping, LinearTensor, MoEMapping
 
@@ -156,13 +157,16 @@ def tp_decoder_layer(
     config: RuntimeConfig,
     weights: ReferenceWeights,
     runtime: TpRuntime,
+    *,
+    cache: FullAttentionCache | LinearAttentionCache | None = None,
+    position_offset: int = 0,
 ) -> Any:
     residual = hidden_states
     hidden_states = rms_norm(hidden_states, weights.tensor(mapping.input_layernorm), config.rms_norm_eps)
     if mapping.layer_type == "full_attention":
-        hidden_states = residual + tp_full_attention(hidden_states, mapping.attention, config, weights, runtime)
+        hidden_states = residual + tp_full_attention(hidden_states, mapping.attention, config, weights, runtime, cache=cache, position_offset=position_offset)
     elif mapping.layer_type == "linear_attention":
-        hidden_states = residual + tp_linear_attention(hidden_states, mapping.attention, config, weights, runtime)
+        hidden_states = residual + tp_linear_attention(hidden_states, mapping.attention, config, weights, runtime, cache=cache)
     else:
         raise ValueError(f"unsupported TP layer type: {mapping.layer_type}")
     residual = hidden_states
@@ -185,6 +189,24 @@ def tp_language_model(
     return runtime.all_gather_cat(logits, dim=-1)
 
 
+def tp_decode_step(
+    input_ids: Any,
+    mapping: LanguageModelMapping,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    state: DecodeState,
+) -> Any:
+    hidden_states = tp_embedding(input_ids, mapping, weights, runtime)
+    position_offset = state.position_offset
+    for layer, layer_cache in zip(mapping.layers, state.layers, strict=True):
+        hidden_states = tp_decoder_layer(hidden_states, layer, config, weights, runtime, cache=layer_cache, position_offset=position_offset)
+    hidden_states = rms_norm(hidden_states, weights.tensor(mapping.final_norm), config.rms_norm_eps)
+    logits = weights.linear(hidden_states, LinearTensor(weight=mapping.lm_head, scale=None))
+    state.advance(input_ids.shape[1])
+    return runtime.all_gather_cat(logits, dim=-1)
+
+
 def tp_embedding(input_ids: Any, mapping: LanguageModelMapping, weights: ReferenceWeights, runtime: TpRuntime) -> Any:
     import torch
     import torch.nn.functional as F
@@ -201,7 +223,7 @@ def tp_embedding(input_ids: Any, mapping: LanguageModelMapping, weights: Referen
     return runtime.all_reduce_sum(out)
 
 
-def tp_full_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig, weights: ReferenceWeights, runtime: TpRuntime) -> Any:
+def tp_full_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig, weights: ReferenceWeights, runtime: TpRuntime, *, cache: FullAttentionCache | None = None, position_offset: int = 0) -> Any:
     import torch
 
     batch, seq_len, _ = hidden_states.shape
@@ -215,7 +237,7 @@ def tp_full_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig, w
     query = rms_norm(query, weights.tensor(mapping.q_norm), config.rms_norm_eps).transpose(1, 2)
     key = rms_norm(key, weights.tensor(mapping.k_norm), config.rms_norm_eps).transpose(1, 2)
     value = value.transpose(1, 2)
-    positions = torch.arange(seq_len, device=hidden_states.device).expand(batch, seq_len)
+    positions = torch.arange(position_offset, position_offset + seq_len, device=hidden_states.device).expand(batch, seq_len)
     cos, sin = rotary_embeddings(positions, config, device=hidden_states.device, dtype=query.dtype)
     query, key = apply_rotary_pos_emb(query, key, cos, sin)
     key = _repeat_kv(key, full.num_heads // full.num_key_value_heads)
@@ -223,8 +245,12 @@ def tp_full_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig, w
     head_start = runtime.config.rank * local_heads
     key = key[:, head_start : head_start + local_heads]
     value = value[:, head_start : head_start + local_heads]
+    if cache is not None:
+        key, value = cache.append(key, value)
     scores = torch.matmul(query.float(), key.float().transpose(2, 3)) * (full.head_dim**-0.5)
-    mask = torch.triu(torch.ones(seq_len, seq_len, device=hidden_states.device, dtype=torch.bool), diagonal=1)
+    key_positions = torch.arange(key.shape[2], device=hidden_states.device)
+    query_positions = torch.arange(position_offset, position_offset + seq_len, device=hidden_states.device)
+    mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
     scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
     probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
     out = torch.matmul(probs, value).transpose(1, 2).reshape(batch, seq_len, local_heads * full.head_dim)
@@ -233,7 +259,7 @@ def tp_full_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig, w
     return runtime.all_reduce_sum(partial)
 
 
-def tp_linear_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig, weights: ReferenceWeights, runtime: TpRuntime) -> Any:
+def tp_linear_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig, weights: ReferenceWeights, runtime: TpRuntime, *, cache: LinearAttentionCache | None = None) -> Any:
     import torch
     import torch.nn.functional as F
 
@@ -247,12 +273,16 @@ def tp_linear_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig,
     local_qkv_dim = local_key_dim * 2 + local_value_dim
     mixed_qkv = weights.linear(hidden_states, mapping.in_proj_qkv).transpose(1, 2)
     conv_weight = weights.tensor(mapping.conv1d_weight).float()
-    mixed_qkv = F.conv1d(
-        mixed_qkv.float(),
-        conv_weight,
-        padding=linear_cfg.conv_kernel_dim - 1,
-        groups=local_qkv_dim,
-    )[:, :, :seq_len]
+    kernel = linear_cfg.conv_kernel_dim
+    conv_input = mixed_qkv.float()
+    if cache is None:
+        mixed_qkv = F.conv1d(conv_input, conv_weight, padding=kernel - 1, groups=local_qkv_dim)[:, :, :seq_len]
+    else:
+        if cache.conv_tail is None:
+            cache.conv_tail = torch.zeros(batch, local_qkv_dim, kernel - 1, device=conv_input.device, dtype=torch.float32)
+        padded = torch.cat((cache.conv_tail, conv_input), dim=2)
+        cache.conv_tail = padded[:, :, -(kernel - 1):] if kernel > 1 else cache.conv_tail
+        mixed_qkv = F.conv1d(padded, conv_weight, padding=0, groups=local_qkv_dim)
     mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)
     query, key, value = torch.split(mixed_qkv, [local_key_dim, local_key_dim, local_value_dim], dim=-1)
     query = query.reshape(batch, seq_len, local_key_heads, linear_cfg.key_head_dim)
@@ -267,7 +297,11 @@ def tp_linear_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig,
     if repeats > 1:
         query = query.repeat_interleave(repeats, dim=2)
         key = key.repeat_interleave(repeats, dim=2)
-    core = _recurrent_gated_delta_rule(query, key, value, g, beta).reshape(-1, linear_cfg.value_head_dim)
+    initial_state = None if cache is None else cache.state
+    core = _recurrent_gated_delta_rule(query, key, value, g, beta, initial_state=initial_state, return_state=cache is not None)
+    if cache is not None:
+        core, cache.state = core
+    core = core.reshape(-1, linear_cfg.value_head_dim)
     z = weights.linear(hidden_states, mapping.in_proj_z).reshape(-1, linear_cfg.value_head_dim)
     core = gated_rms_norm(core, weights.tensor(mapping.norm), z, config.rms_norm_eps)
     core = core.reshape(batch, seq_len, local_value_dim)
@@ -329,7 +363,7 @@ def _repeat_kv(hidden_states: Any, repeats: int) -> Any:
     return hidden_states.reshape(batch, num_key_value_heads * repeats, seq_len, head_dim)
 
 
-def _recurrent_gated_delta_rule(query: Any, key: Any, value: Any, g: Any, beta: Any) -> Any:
+def _recurrent_gated_delta_rule(query: Any, key: Any, value: Any, g: Any, beta: Any, *, initial_state: Any = None, return_state: bool = False) -> Any:
     import torch
 
     initial_dtype = query.dtype
@@ -341,7 +375,10 @@ def _recurrent_gated_delta_rule(query: Any, key: Any, value: Any, g: Any, beta: 
     batch, heads, seq_len, key_dim = key.shape
     value_dim = value.shape[-1]
     query = query * (key_dim**-0.5)
-    state = torch.zeros(batch, heads, key_dim, value_dim, device=query.device, dtype=torch.float32)
+    if initial_state is None:
+        state = torch.zeros(batch, heads, key_dim, value_dim, device=query.device, dtype=torch.float32)
+    else:
+        state = initial_state.to(device=query.device, dtype=torch.float32)
     output = torch.zeros(batch, heads, seq_len, value_dim, device=query.device, dtype=torch.float32)
     for index in range(seq_len):
         q_t = query[:, :, index]
@@ -352,4 +389,7 @@ def _recurrent_gated_delta_rule(query: Any, key: Any, value: Any, g: Any, beta: 
         delta = (v_t - kv_mem) * beta[:, :, index].unsqueeze(-1)
         state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
         output[:, :, index] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
-    return output.transpose(1, 2).contiguous().to(initial_dtype)
+    out = output.transpose(1, 2).contiguous().to(initial_dtype)
+    if return_state:
+        return out, state
+    return out
