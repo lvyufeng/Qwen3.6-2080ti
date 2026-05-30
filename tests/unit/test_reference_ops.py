@@ -364,6 +364,62 @@ def test_decoder_layer_matches_transformers_tiny_linear_attention() -> None:
     torch.testing.assert_close(ref_out, hf_out, atol=0.0, rtol=0.0)
 
 
+def test_mixed_prefill_then_decode_matches_full_prefill() -> None:
+    transformers = pytest.importorskip("transformers")
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
+
+    torch.manual_seed(4)
+    hidden_size = 4
+    vocab_size = 8
+    intermediate_size = 4
+    num_experts = 2
+    hf_config = Qwen3_5MoeTextConfig(
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        num_hidden_layers=1,
+        layer_types=["full_attention"],
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=hidden_size,
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+        moe_intermediate_size=intermediate_size,
+        shared_expert_intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        num_experts_per_tok=1,
+        max_position_embeddings=8,
+        tie_word_embeddings=False,
+        use_cache=False,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000, "partial_rotary_factor": 0.5, "mrope_section": [1, 1, 1]},
+    )
+    model = Qwen3_5MoeForCausalLM(hf_config).eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.copy_(torch.randn_like(parameter) * 0.1)
+        model.model.layers[0].mlp.gate.weight.zero_()
+        model.model.layers[0].mlp.gate.weight[0, 0] = 5.0
+        model.model.layers[0].mlp.gate.weight[1, 1] = 5.0
+
+    tensors = _tensors_from_transformers_tiny_full_attention(model)
+    mapping = _tiny_full_attention_mapping(hidden_size, vocab_size, intermediate_size, num_experts)
+    config = parse_runtime_config(_tiny_full_attention_config(hidden_size, vocab_size, intermediate_size, num_experts))
+    input_ids = torch.tensor([[0, 1, 2, 3]])
+
+    prefill_logits = language_model(input_ids, mapping, config, ReferenceWeights(_FakeLoader(tensors)))
+    state = DecodeState.empty(mapping, config)
+    weights = ReferenceWeights(_FakeLoader(tensors))
+    # Multi-token prefill (first 3 tokens)
+    step_logits = [decode_step(input_ids[:, :3], mapping, config, weights, state)]
+    # Single-token decode (last token)
+    step_logits.append(decode_step(input_ids[:, 3:4], mapping, config, weights, state))
+    decoded_logits = torch.cat(step_logits, dim=1)
+
+    torch.testing.assert_close(decoded_logits, prefill_logits, atol=1e-5, rtol=1e-5)
+
+
 def test_linear_attention_decode_steps_match_prefill_logits() -> None:
     transformers = pytest.importorskip("transformers")
     from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig

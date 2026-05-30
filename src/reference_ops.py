@@ -97,6 +97,7 @@ def linear_attention(
     mapping: LinearAttentionMapping,
     config: RuntimeConfig,
     weights: ReferenceWeights,
+    *,
     cache: Any = None,
 ) -> Any:
     import torch
