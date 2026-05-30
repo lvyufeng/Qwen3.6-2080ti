@@ -22,7 +22,7 @@ dev = [
 qwen36-run = "cli:main"
 
 [tool.setuptools]
-py-modules = ["checkpoint", "cli", "cuda_loader", "decode_state", "engine", "fp8_cuda", "fp8_smoke", "loader", "reference_ops", "runtime_config", "tensor_parallel", "tp_runtime", "tp_weights", "weight_mapping", "worker"]
+py-modules = ["checkpoint", "cli", "cuda_loader", "decode_state", "engine", "fp8_cuda", "fp8_smoke", "loader", "reference_ops", "runtime_config", "scheduler", "tensor_parallel", "tp_runtime", "tp_weights", "weight_mapping", "worker"]
 
 [tool.setuptools.package-dir]
 "" = "src"

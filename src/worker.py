@@ -9,10 +9,12 @@ from typing import Any, Iterable, TextIO
 from checkpoint import Manifest, build_manifest
 from engine import GenerateResult, TpModelSession
 from runtime_config import RuntimeConfig, parse_runtime_config
+from scheduler import RequestScheduler, ScheduledResult, SchedulerSnapshot
 from tp_runtime import TpLaunchConfig, TpRuntime
 
 LOAD = "LOAD"
 GENERATE = "GENERATE"
+STATUS = "STATUS"
 SHUTDOWN = "SHUTDOWN"
 
 
@@ -43,6 +45,7 @@ class WorkerState:
     session: TpModelSession | None = None
     loaded_model_dir: str | None = None
     should_shutdown: bool = False
+    scheduler: RequestScheduler = field(default_factory=RequestScheduler)
 
 
 def broadcast_command(command: WorkerCommand | None, runtime: TpRuntime, *, src: int = 0) -> WorkerCommand:
@@ -66,6 +69,8 @@ def execute_command(state: WorkerState, command: WorkerCommand, runtime: TpRunti
             return _execute_load(state, command)
         if command.kind == GENERATE:
             return _execute_generate(state, command)
+        if command.kind == STATUS:
+            return _execute_status(state)
         if command.kind == SHUTDOWN:
             _close_worker_state(state)
             state.should_shutdown = True
@@ -248,7 +253,30 @@ def _execute_generate(state: WorkerState, command: WorkerCommand) -> WorkerResul
         raise WorkerError("worker has not loaded a model")
     prompt = _payload_str(command, "prompt")
     max_new_tokens = _payload_positive_int(command, "max_new_tokens")
-    return WorkerResult(GENERATE, state.launch.rank, True, _generate_result_data(state.session.generate(prompt, max_new_tokens)))
+    session = state.session
+    scheduled = state.scheduler.run_blocking_generate(
+        prompt,
+        max_new_tokens,
+        lambda request: session.generate(request.prompt, request.max_new_tokens),
+    )
+    assert scheduled.result is not None
+    data = _generate_result_data(scheduled.result)
+    data["scheduler"] = _scheduled_result_data(scheduled)
+    return WorkerResult(GENERATE, state.launch.rank, True, data)
+
+
+def _execute_status(state: WorkerState) -> WorkerResult:
+    return WorkerResult(
+        STATUS,
+        state.launch.rank,
+        True,
+        {
+            "loaded": state.session is not None,
+            "loaded_model_dir": state.loaded_model_dir,
+            "should_shutdown": state.should_shutdown,
+            "scheduler": _scheduler_snapshot_data(state.scheduler.snapshot()),
+        },
+    )
 
 
 def _generate_result_data(result: GenerateResult) -> dict[str, Any]:
@@ -264,6 +292,27 @@ def _generate_result_data(result: GenerateResult) -> dict[str, Any]:
     }
 
 
+def _scheduled_result_data(result: ScheduledResult[GenerateResult]) -> dict[str, Any]:
+    return {
+        "request_id": result.request_id,
+        "status": result.status.value,
+        "queued_seconds": result.queued_seconds,
+        "run_seconds": result.run_seconds,
+    }
+
+
+def _scheduler_snapshot_data(snapshot: SchedulerSnapshot) -> dict[str, Any]:
+    return {
+        "pending": snapshot.pending,
+        "running": snapshot.running,
+        "completed": snapshot.completed,
+        "failed": snapshot.failed,
+        "total_submitted": snapshot.total_submitted,
+        "total_completed": snapshot.total_completed,
+        "total_failed": snapshot.total_failed,
+    }
+
+
 def _close_worker_state(state: WorkerState) -> None:
     if state.session is not None:
         state.session.close()
@@ -271,6 +320,7 @@ def _close_worker_state(state: WorkerState) -> None:
     state.manifest = None
     state.runtime_config = None
     state.loaded_model_dir = None
+    state.scheduler.clear()
 
 
 def _payload_str(command: WorkerCommand, key: str) -> str:

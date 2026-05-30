@@ -1,0 +1,177 @@
+from __future__ import annotations
+
+import time
+from collections import deque
+from dataclasses import dataclass
+from enum import Enum
+from typing import Callable, Generic, TypeVar
+
+
+class SchedulerError(RuntimeError):
+    pass
+
+
+class RequestStatus(str, Enum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class GenerateRequest:
+    request_id: str
+    prompt: str
+    max_new_tokens: int
+    created_at: float
+
+
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class ScheduledResult(Generic[T]):
+    request_id: str
+    status: RequestStatus
+    result: T | None
+    error: str | None
+    queued_seconds: float
+    run_seconds: float
+
+
+@dataclass(frozen=True)
+class SchedulerSnapshot:
+    pending: int
+    running: str | None
+    completed: int
+    failed: int
+    total_submitted: int
+    total_completed: int
+    total_failed: int
+
+
+class RequestScheduler:
+    def __init__(self, *, max_history: int = 128, clock: Callable[[], float] | None = None) -> None:
+        if max_history < 0:
+            raise SchedulerError(f"max_history must be non-negative, got {max_history}")
+        self.max_history = max_history
+        self.clock = time.perf_counter if clock is None else clock
+        self._pending: deque[GenerateRequest] = deque()
+        self._running: GenerateRequest | None = None
+        self._completed: deque[ScheduledResult[object]] = deque()
+        self._failed: deque[ScheduledResult[object]] = deque()
+        self._total_submitted = 0
+        self._total_completed = 0
+        self._total_failed = 0
+        self._next_id = 1
+
+    def submit_generate(self, prompt: str, max_new_tokens: int, *, request_id: str | None = None) -> GenerateRequest:
+        request_id = self._next_request_id() if request_id is None else request_id
+        if not isinstance(request_id, str) or not request_id:
+            raise SchedulerError("request_id must be a non-empty string")
+        if max_new_tokens <= 0:
+            raise SchedulerError(f"max_new_tokens must be positive, got {max_new_tokens}")
+        if self._has_active_request(request_id):
+            raise SchedulerError(f"duplicate active request id: {request_id}")
+        request = GenerateRequest(
+            request_id=request_id,
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            created_at=self.clock(),
+        )
+        self._pending.append(request)
+        self._total_submitted += 1
+        return request
+
+    def run_next(self, executor: Callable[[GenerateRequest], T]) -> ScheduledResult[T]:
+        if self._running is not None:
+            raise SchedulerError(f"request is already running: {self._running.request_id}")
+        try:
+            request = self._pending.popleft()
+        except IndexError as exc:
+            raise SchedulerError("no pending request to run") from exc
+        start = self.clock()
+        self._running = request
+        try:
+            value = executor(request)
+        except Exception as exc:
+            end = self.clock()
+            scheduled = ScheduledResult[T](
+                request_id=request.request_id,
+                status=RequestStatus.FAILED,
+                result=None,
+                error=str(exc),
+                queued_seconds=_elapsed_seconds(request.created_at, start),
+                run_seconds=_elapsed_seconds(start, end),
+            )
+            self._failed.append(scheduled)  # type: ignore[arg-type]
+            self._trim_history(self._failed)
+            self._total_failed += 1
+            self._running = None
+            raise
+        end = self.clock()
+        scheduled = ScheduledResult(
+            request_id=request.request_id,
+            status=RequestStatus.COMPLETED,
+            result=value,
+            error=None,
+            queued_seconds=_elapsed_seconds(request.created_at, start),
+            run_seconds=_elapsed_seconds(start, end),
+        )
+        self._completed.append(scheduled)  # type: ignore[arg-type]
+        self._trim_history(self._completed)
+        self._total_completed += 1
+        self._running = None
+        return scheduled
+
+    def run_blocking_generate(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        executor: Callable[[GenerateRequest], T],
+        *,
+        request_id: str | None = None,
+    ) -> ScheduledResult[T]:
+        self.submit_generate(prompt, max_new_tokens, request_id=request_id)
+        return self.run_next(executor)
+
+    def snapshot(self) -> SchedulerSnapshot:
+        return SchedulerSnapshot(
+            pending=len(self._pending),
+            running=self._running.request_id if self._running is not None else None,
+            completed=len(self._completed),
+            failed=len(self._failed),
+            total_submitted=self._total_submitted,
+            total_completed=self._total_completed,
+            total_failed=self._total_failed,
+        )
+
+    def clear(self) -> None:
+        self._pending.clear()
+        self._running = None
+        self._completed.clear()
+        self._failed.clear()
+        self._total_submitted = 0
+        self._total_completed = 0
+        self._total_failed = 0
+        self._next_id = 1
+
+    def _next_request_id(self) -> str:
+        while True:
+            request_id = f"gen-{self._next_id}"
+            self._next_id += 1
+            if not self._has_active_request(request_id):
+                return request_id
+
+    def _has_active_request(self, request_id: str) -> bool:
+        return any(request.request_id == request_id for request in self._pending) or (
+            self._running is not None and self._running.request_id == request_id
+        )
+
+    def _trim_history(self, history: deque[ScheduledResult[object]]) -> None:
+        while len(history) > self.max_history:
+            history.popleft()
+
+
+def _elapsed_seconds(start: float, end: float) -> float:
+    return max(0.0, end - start)

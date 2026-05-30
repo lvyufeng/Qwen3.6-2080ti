@@ -14,6 +14,7 @@ from tp_runtime import TpLaunchConfig, TpRuntime
 from worker import (
     GENERATE,
     LOAD,
+    STATUS,
     SHUTDOWN,
     WorkerCommand,
     WorkerError,
@@ -107,6 +108,19 @@ def test_gather_worker_results_single_rank() -> None:
     assert gathered == [result]
 
 
+def test_worker_status_reports_unloaded_scheduler_state() -> None:
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    result = execute_command(state, WorkerCommand(STATUS, {}))
+
+    assert result.ok is True
+    assert result.kind == STATUS
+    assert result.data["loaded"] is False
+    assert result.data["loaded_model_dir"] is None
+    assert result.data["should_shutdown"] is False
+    assert result.data["scheduler"] == _empty_scheduler_data()
+
+
 def test_worker_load_initializes_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_tiny_model(tmp_path)
     _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
@@ -158,6 +172,51 @@ def test_worker_load_then_generate_single_rank(tmp_path: Path, monkeypatch: pyte
     assert generate_result.data["all_finite"] is True
     assert len(generate_result.data["generated_token_ids"]) == 2
     assert generate_result.data["text"].startswith("decoded:")
+    assert generate_result.data["scheduler"]["request_id"] == "gen-1"
+    assert generate_result.data["scheduler"]["status"] == "COMPLETED"
+    assert generate_result.data["scheduler"]["queued_seconds"] >= 0
+    assert generate_result.data["scheduler"]["run_seconds"] >= 0
+
+
+def test_worker_generate_routes_through_scheduler(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    load_result = execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)}))
+    generate_result = execute_command(state, WorkerCommand(GENERATE, {"prompt": "hello", "max_new_tokens": 1}))
+    status_result = execute_command(state, WorkerCommand(STATUS, {}))
+
+    assert load_result.ok is True
+    assert generate_result.ok is True
+    assert generate_result.data["scheduler"]["status"] == "COMPLETED"
+    assert status_result.ok is True
+    assert status_result.data["loaded"] is True
+    assert status_result.data["scheduler"]["pending"] == 0
+    assert status_result.data["scheduler"]["running"] is None
+    assert status_result.data["scheduler"]["completed"] == 1
+    assert status_result.data["scheduler"]["failed"] == 0
+    assert status_result.data["scheduler"]["total_submitted"] == 1
+    assert status_result.data["scheduler"]["total_completed"] == 1
+
+
+def test_worker_load_clears_scheduler_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    assert execute_command(state, WorkerCommand(GENERATE, {"prompt": "hello", "max_new_tokens": 1})).ok is True
+    before_reload = execute_command(state, WorkerCommand(STATUS, {}))
+    assert before_reload.data["scheduler"]["completed"] == 1
+
+    reload_result = execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)}))
+    after_reload = execute_command(state, WorkerCommand(STATUS, {}))
+
+    assert reload_result.ok is True
+    assert after_reload.ok is True
+    assert after_reload.data["loaded"] is True
+    assert after_reload.data["scheduler"] == _empty_scheduler_data()
 
 
 def test_worker_protocol_loop_single_rank_load_generate_shutdown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -200,6 +259,38 @@ def test_worker_protocol_loop_single_rank_load_generate_shutdown(tmp_path: Path,
     assert responses[1]["rank_results"][0]["rank"] == 0
     assert responses[3]["data"]["shutdown"] is True
     assert preload_calls == 1
+    assert state.should_shutdown is True
+
+
+def test_worker_protocol_loop_status_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+    input_stream = _jsonl_stream(
+        [
+            {"id": "status-before", "kind": STATUS, "payload": {}},
+            {"id": "load", "kind": LOAD, "payload": {"model_dir": str(tmp_path)}},
+            {"id": "gen", "kind": GENERATE, "payload": {"prompt": "hello", "max_new_tokens": 1}},
+            {"id": "status-after", "kind": STATUS, "payload": {}},
+            {"id": "stop", "kind": SHUTDOWN, "payload": {}},
+        ]
+    )
+    output_stream = io.StringIO()
+
+    with TpRuntime(state.launch) as runtime:
+        run_worker_protocol_loop(state, runtime, input_stream, output_stream)
+
+    responses = _read_jsonl(output_stream)
+    assert [response["id"] for response in responses] == ["status-before", "load", "gen", "status-after", "stop"]
+    assert [response["kind"] for response in responses] == [STATUS, LOAD, GENERATE, STATUS, SHUTDOWN]
+    assert all(response["ok"] for response in responses)
+    assert responses[0]["data"]["loaded"] is False
+    assert responses[0]["data"]["scheduler"] == _empty_scheduler_data()
+    assert responses[2]["data"]["scheduler"]["status"] == "COMPLETED"
+    assert responses[3]["data"]["loaded"] is True
+    assert responses[3]["data"]["scheduler"]["completed"] == 1
+    assert responses[3]["data"]["scheduler"]["total_completed"] == 1
+    assert responses[4]["data"]["shutdown"] is True
     assert state.should_shutdown is True
 
 
@@ -524,3 +615,15 @@ def _assert_two_rank_response(response: dict[str, object], kind: str, *, ok: boo
     assert [result["rank"] for result in rank_results] == [0, 1]
     assert all(result["kind"] == kind for result in rank_results)
     assert all(result["ok"] is ok for result in rank_results)
+
+
+def _empty_scheduler_data() -> dict[str, object]:
+    return {
+        "pending": 0,
+        "running": None,
+        "completed": 0,
+        "failed": 0,
+        "total_submitted": 0,
+        "total_completed": 0,
+        "total_failed": 0,
+    }
