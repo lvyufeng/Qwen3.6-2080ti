@@ -109,19 +109,20 @@ def linear_attention(
     conv_weight = weights.tensor(mapping.conv1d_weight).float()
     kernel = linear_cfg.conv_kernel_dim
     conv_input = mixed_qkv.float()
+    channels = conv_input.shape[1]
     if cache is None:
         mixed_qkv = F.conv1d(
             conv_input,
             conv_weight,
             padding=kernel - 1,
-            groups=linear_cfg.qkv_dim,
+            groups=channels,
         )[:, :, :seq_len]
     else:
         if cache.conv_tail is None:
-            cache.conv_tail = torch.zeros(batch, linear_cfg.qkv_dim, kernel - 1, device=conv_input.device, dtype=torch.float32)
+            cache.conv_tail = torch.zeros(batch, channels, kernel - 1, device=conv_input.device, dtype=torch.float32)
         padded = torch.cat((cache.conv_tail, conv_input), dim=2)
         cache.conv_tail = padded[:, :, -(kernel - 1):] if kernel > 1 else cache.conv_tail
-        mixed_qkv = F.conv1d(padded, conv_weight, padding=0, groups=linear_cfg.qkv_dim)
+        mixed_qkv = F.conv1d(padded, conv_weight, padding=0, groups=channels)
     mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)
     query, key, value = torch.split(
         mixed_qkv,
