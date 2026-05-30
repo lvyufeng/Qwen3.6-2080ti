@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from checkpoint import Manifest
@@ -53,6 +53,35 @@ class GenerateResult:
     text: str | None
 
 
+@dataclass(frozen=True)
+class GenerationStep:
+    index: int
+    token_id: int
+    all_finite: bool
+    prefill_seconds: float
+    decode_seconds: float
+    total_seconds: float
+    is_complete: bool
+
+
+@dataclass
+class GenerationRequestState:
+    prompt: str
+    max_new_tokens: int
+    input_ids: Any
+    decode_state: DecodeState
+    logits: Any
+    prompt_tokens: int
+    total_start: float
+    prefill_seconds: float
+    generated_token_ids: list[int] = field(default_factory=list)
+    step_all_finite: list[bool] = field(default_factory=list)
+    decode_seconds: float = 0.0
+    decode_start: float | None = None
+    completed: bool = False
+    result_built: bool = False
+
+
 class TpModelSession:
     def __init__(self, manifest: Manifest, runtime_config: RuntimeConfig, launch: TpLaunchConfig) -> None:
         self.manifest = manifest
@@ -102,20 +131,15 @@ class TpModelSession:
         return self
 
     def generate(self, prompt: str, max_new_tokens: int) -> GenerateResult:
+        state = self.start_generation(prompt, max_new_tokens)
+        while not state.completed:
+            self.step_generation(state)
+        return self.finish_generation(state)
+
+    def start_generation(self, prompt: str, max_new_tokens: int) -> GenerationRequestState:
         import time
 
-        import torch
-
-        if self._closed:
-            raise EngineError("TP model session is closed")
-        if not self._loaded:
-            raise EngineError("TP model session is not loaded")
-        runtime = self.runtime
-        weights = self.weights
-        load_stats = self.load_stats
-        assert runtime is not None
-        assert weights is not None
-        assert load_stats is not None
+        runtime, weights, _load_stats = self._require_loaded_components()
         encoded = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
         input_ids = encoded["input_ids"].to(runtime.device)
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -123,53 +147,97 @@ class TpModelSession:
         if input_ids.shape[1] == 0:
             raise EngineError("TP generation requires at least one prompt token")
         weights.dispatch_stats = LinearDispatchStats()
-        state = DecodeState.empty(self.mapping, self.runtime_config)
+        decode_state = DecodeState.empty(self.mapping, self.runtime_config)
         _sync_device(runtime.device)
         total_start = time.perf_counter()
         prefill_start = time.perf_counter()
-        logits = tp_decode_step_local_logits(input_ids, self.mapping, self.runtime_config, weights, runtime, state)
+        logits = tp_decode_step_local_logits(input_ids, self.mapping, self.runtime_config, weights, runtime, decode_state)
         _sync_device(runtime.device)
         prefill_end = time.perf_counter()
-        generated: list[int] = []
-        step_finite: list[bool] = []
-        decode_start = time.perf_counter()
-        for step in range(max_new_tokens):
-            last_logits = logits[:, -1].float()
-            step_finite.append(bool(torch.isfinite(last_logits).all().item()))
-            next_token = tp_greedy_next_token(logits, self.mapping.lm_head, runtime)
-            next_token = _sync_next_token(next_token, runtime)
-            generated.append(int(next_token.item()))
-            if step + 1 < max_new_tokens:
-                logits = tp_decode_step_local_logits(next_token[:, None], self.mapping, self.runtime_config, weights, runtime, state)
+        return GenerationRequestState(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            input_ids=input_ids,
+            decode_state=decode_state,
+            logits=logits,
+            prompt_tokens=input_ids.numel(),
+            total_start=total_start,
+            prefill_seconds=_elapsed_seconds(prefill_start, prefill_end),
+            completed=max_new_tokens == 0,
+        )
+
+    def step_generation(self, state: GenerationRequestState) -> GenerationStep:
+        import time
+
+        import torch
+
+        runtime, weights, _load_stats = self._require_loaded_components()
+        if state.completed:
+            raise EngineError("TP generation request is already complete")
+        if state.decode_start is None:
+            state.decode_start = time.perf_counter()
+        last_logits = state.logits[:, -1].float()
+        step_finite = bool(torch.isfinite(last_logits).all().item())
+        next_token = tp_greedy_next_token(state.logits, self.mapping.lm_head, runtime)
+        next_token = _sync_next_token(next_token, runtime)
+        token_id = int(next_token.item())
+        state.generated_token_ids.append(token_id)
+        state.step_all_finite.append(step_finite)
+        step_index = len(state.generated_token_ids) - 1
+        if len(state.generated_token_ids) < state.max_new_tokens:
+            state.logits = tp_decode_step_local_logits(
+                next_token[:, None], self.mapping, self.runtime_config, weights, runtime, state.decode_state
+            )
+        else:
+            state.completed = True
         _sync_device(runtime.device)
         decode_end = time.perf_counter()
+        state.decode_seconds = _elapsed_seconds(state.decode_start, decode_end)
+        return GenerationStep(
+            index=step_index,
+            token_id=token_id,
+            all_finite=step_finite,
+            prefill_seconds=state.prefill_seconds,
+            decode_seconds=state.decode_seconds,
+            total_seconds=_elapsed_seconds(state.total_start, decode_end),
+            is_complete=state.completed,
+        )
+
+    def finish_generation(self, state: GenerationRequestState) -> GenerateResult:
+        import time
+
+        runtime, weights, load_stats = self._require_loaded_components()
+        if not state.completed:
+            raise EngineError("TP generation request is not complete")
+        if state.result_built:
+            raise EngineError("TP generation result is already finalized")
+        _sync_device(runtime.device)
         total_end = time.perf_counter()
-        prefill_seconds = _elapsed_seconds(prefill_start, prefill_end)
-        decode_seconds = _elapsed_seconds(decode_start, decode_end)
-        total_seconds = _elapsed_seconds(total_start, total_end)
+        total_seconds = _elapsed_seconds(state.total_start, total_end)
+        state.result_built = True
         result = GenerateResult(
             backend=self.launch.backend,
             world_size=self.launch.world_size,
             rank=self.launch.rank,
             local_rank=self.launch.local_rank,
             device=runtime.device,
-            prompt_tokens=input_ids.numel(),
-            max_new_tokens=max_new_tokens,
+            prompt_tokens=state.prompt_tokens,
+            max_new_tokens=state.max_new_tokens,
             layers=len(self.mapping.layers),
             mapped_tensors=len(self.mapping.mapped_tensor_names),
             mapped_bytes=mapped_tensor_bytes(self.mapping),
             load_stats=load_stats,
             load_seconds=self.load_seconds,
-            prefill_seconds=prefill_seconds,
-            decode_seconds=decode_seconds,
+            prefill_seconds=state.prefill_seconds,
+            decode_seconds=state.decode_seconds,
             total_seconds=total_seconds,
-            decode_tokens_per_second=max_new_tokens / decode_seconds if decode_seconds > 0 else float("inf"),
-            total_tokens_per_second=max_new_tokens / total_seconds if total_seconds > 0 else float("inf"),
+            decode_tokens_per_second=state.max_new_tokens / state.decode_seconds if state.decode_seconds > 0 else float("inf"),
+            total_tokens_per_second=state.max_new_tokens / total_seconds if total_seconds > 0 else float("inf"),
             dispatch_stats=weights.dispatch_stats,
-            all_finite=all(step_finite),
+            all_finite=all(state.step_all_finite),
             cuda_memory=_cuda_memory_stats(runtime.device),
-            generated_token_ids=generated if self.launch.rank == 0 else [],
-            text=self.tokenizer.decode(generated, skip_special_tokens=False) if self.launch.rank == 0 else None,
+            generated_token_ids=state.generated_token_ids if self.launch.rank == 0 else [],
+            text=self.tokenizer.decode(state.generated_token_ids, skip_special_tokens=False) if self.launch.rank == 0 else None,
         )
         runtime.barrier()
         return result
@@ -196,6 +264,19 @@ class TpModelSession:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+    def _require_loaded_components(self) -> tuple[TpRuntime, MappedWeights, MappedWeightStats]:
+        if self._closed:
+            raise EngineError("TP model session is closed")
+        if not self._loaded:
+            raise EngineError("TP model session is not loaded")
+        runtime = self.runtime
+        weights = self.weights
+        load_stats = self.load_stats
+        assert runtime is not None
+        assert weights is not None
+        assert load_stats is not None
+        return runtime, weights, load_stats
 
 
 class TpModelRunner:
