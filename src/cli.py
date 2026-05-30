@@ -6,7 +6,8 @@ from pathlib import Path
 from checkpoint import CheckpointError, Manifest, build_manifest
 from fp8_smoke import Fp8SmokeReport, inspect_fp8_checkpoint
 from loader import LoaderError, TensorLoader
-from reference_ops import ReferenceWeights, decoder_layer, embedding, language_model
+from decode_state import DecodeState
+from reference_ops import ReferenceWeights, decode_step, decoder_layer, embedding, language_model
 from runtime_config import ConfigError, RuntimeConfig, parse_runtime_config
 from tensor_parallel import TensorParallel
 from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_language_model
@@ -346,6 +347,39 @@ def _summarize_tp_load_smoke(
         return lines
 
 
+def _summarize_reference_decode(
+    manifest: Manifest,
+    config: RuntimeConfig,
+    mapping: LanguageModelMapping,
+    prompt: str,
+    device: str,
+    max_tokens: int,
+) -> list[str]:
+    import torch
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(manifest.model_dir, local_files_only=True, trust_remote_code=True)
+    encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+    input_ids = encoded["input_ids"][:, :max_tokens].to(device)
+    with TensorLoader(manifest) as loader:
+        weights = ReferenceWeights(loader, device=device)
+        state = DecodeState.empty(mapping, config)
+        step_tokens: list[int] = []
+        step_finite: list[bool] = []
+        for i in range(input_ids.shape[1]):
+            logits = decode_step(input_ids[:, i : i + 1], mapping, config, weights, state)
+            last = logits[:, -1].float()
+            step_tokens.append(int(torch.argmax(last, dim=-1).item()))
+            step_finite.append(bool(torch.isfinite(last).all().item()))
+    return [
+        f"reference_decode_device: {device}",
+        f"reference_decode_prompt_tokens: {input_ids.numel()}",
+        f"reference_decode_steps: {len(step_tokens)}",
+        f"reference_decode_all_finite: {all(step_finite)}",
+        f"reference_decode_next_tokens: {','.join(str(t) for t in step_tokens)}",
+    ]
+
+
 def _summarize_tensor_load(manifest: Manifest, name: str, device: str | None) -> list[str]:
     with TensorLoader(manifest) as loader:
         info = loader.tensor_info(name)
@@ -585,6 +619,25 @@ def run(args: argparse.Namespace) -> int:
             raise CliError(str(exc)) from exc
         except Exception as exc:
             raise CliError(f"reference forward failed: {exc}") from exc
+    if args.reference_decode_smoke:
+        try:
+            runtime_config = parse_runtime_config(config)
+            mapping = build_language_model_mapping(manifest, strict=True)
+            device = args.reference_device or args.tensor_device or "cpu"
+            print("Reference decode smoke")
+            for line in _summarize_reference_decode(
+                manifest,
+                runtime_config,
+                mapping,
+                args.prompt,
+                device,
+                args.reference_max_tokens,
+            ):
+                print(line)
+        except (ConfigError, MappingError, LoaderError) as exc:
+            raise CliError(str(exc)) from exc
+        except Exception as exc:
+            raise CliError(f"reference decode failed: {exc}") from exc
     print(f"prompt_tokens: pending tokenizer ({len(args.prompt)} prompt chars)")
     print(f"max_new_tokens: {args.max_new_tokens}")
     print("inference: not implemented yet")
@@ -663,6 +716,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--reference-forward",
         action="store_true",
         help="Tokenize the prompt and run the full reference language model to logits.",
+    )
+    parser.add_argument(
+        "--reference-decode-smoke",
+        action="store_true",
+        help="Run multi-step stateful decode on the dense reference path and report per-step tokens.",
     )
     parser.add_argument(
         "--reference-layer",
