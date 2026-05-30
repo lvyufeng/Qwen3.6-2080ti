@@ -237,6 +237,52 @@ def test_cli_tp_reference_forward_single_rank(tmp_path: Path, capsys, monkeypatc
     assert "tp_reference_next_token:" in out
 
 
+def test_cli_reference_decode_smoke(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _runtime_config()
+    text = config["text_config"]
+    text["hidden_size"] = 256
+    text["vocab_size"] = 320
+    text["num_hidden_layers"] = 1
+    text["layer_types"] = ["full_attention"]
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    tensors = {
+        "model.language_model.embed_tokens.weight": ("BF16", (320, 256)),
+        "model.language_model.norm.weight": ("BF16", (256,)),
+        "lm_head.weight": ("BF16", (320, 256)),
+    }
+    add_full_attention_layer(tensors, 0)
+    add_moe(tensors, 0)
+    write_safetensors(tmp_path / "model.safetensors", tensors)
+
+    class FakeTokenizer:
+        def __call__(self, prompt: str, *, return_tensors: str, add_special_tokens: bool):
+            return {"input_ids": torch.tensor([[1, 2, 3]])}
+
+    transformers = pytest.importorskip("transformers")
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *_, **__: FakeTokenizer())
+
+    rc = main(
+        [
+            "--model",
+            str(tmp_path),
+            "--prompt",
+            "hi",
+            "--max-new-tokens",
+            "1",
+            "--reference-decode-smoke",
+            "--reference-max-tokens",
+            "3",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Reference decode smoke" in out
+    assert "reference_decode_steps: 3" in out
+    assert "reference_decode_all_finite: True" in out
+    assert "reference_decode_next_tokens:" in out
+
+
 def test_reference_layer_defaults_to_first_full_attention_layer() -> None:
     layer = _reference_layer(_mapping(("linear_attention", "full_attention")), None)
 
