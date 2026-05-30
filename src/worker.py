@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from checkpoint import Manifest, build_manifest
-from engine import GenerateResult, TpModelRunner
+from engine import GenerateResult, TpModelSession
 from runtime_config import RuntimeConfig, parse_runtime_config
 from tp_runtime import TpLaunchConfig, TpRuntime
 
@@ -38,7 +38,7 @@ class WorkerState:
     launch: TpLaunchConfig
     manifest: Manifest | None = None
     runtime_config: RuntimeConfig | None = None
-    runner: TpModelRunner | None = None
+    session: TpModelSession | None = None
     loaded_model_dir: str | None = None
     should_shutdown: bool = False
 
@@ -57,7 +57,7 @@ def broadcast_command(command: WorkerCommand | None, runtime: TpRuntime, *, src:
     return _validate_command(objects[0])
 
 
-def execute_command(state: WorkerState, command: WorkerCommand) -> WorkerResult:
+def execute_command(state: WorkerState, command: WorkerCommand, runtime: TpRuntime | None = None) -> WorkerResult:
     try:
         command = _validate_command(command)
         if command.kind == LOAD:
@@ -65,6 +65,7 @@ def execute_command(state: WorkerState, command: WorkerCommand) -> WorkerResult:
         if command.kind == GENERATE:
             return _execute_generate(state, command)
         if command.kind == SHUTDOWN:
+            _close_worker_state(state)
             state.should_shutdown = True
             return WorkerResult(SHUTDOWN, state.launch.rank, True, {"shutdown": True})
         raise WorkerError(f"unknown worker command: {command.kind}")
@@ -88,7 +89,7 @@ def run_worker_loop(
         else:
             command = None
         command = broadcast_command(command, runtime)
-        result = execute_command(state, command)
+        result = execute_command(state, command, runtime)
         results.append(result)
         if state.should_shutdown:
             break
@@ -97,12 +98,14 @@ def run_worker_loop(
 
 def _execute_load(state: WorkerState, command: WorkerCommand) -> WorkerResult:
     model_dir = _payload_str(command, "model_dir")
+    _close_worker_state(state)
     manifest = build_manifest(Path(model_dir))
     runtime_config = parse_runtime_config(manifest.config)
-    runner = TpModelRunner(manifest, runtime_config, state.launch)
+    session = TpModelSession(manifest, runtime_config, state.launch)
+    session.load()
     state.manifest = manifest
     state.runtime_config = runtime_config
-    state.runner = runner
+    state.session = session
     state.loaded_model_dir = model_dir
     return WorkerResult(
         LOAD,
@@ -112,18 +115,20 @@ def _execute_load(state: WorkerState, command: WorkerCommand) -> WorkerResult:
             "model_dir": model_dir,
             "world_size": state.launch.world_size,
             "rank": state.launch.rank,
-            "layers": len(runner.mapping.layers),
-            "mapped_tensors": len(runner.mapping.mapped_tensor_names),
+            "layers": len(session.mapping.layers),
+            "mapped_tensors": len(session.mapping.mapped_tensor_names),
+            "loaded_tensors": session.load_stats.tensor_count if session.load_stats else 0,
+            "loaded_bytes": session.load_stats.bytes if session.load_stats else 0,
         },
     )
 
 
 def _execute_generate(state: WorkerState, command: WorkerCommand) -> WorkerResult:
-    if state.runner is None:
+    if state.session is None:
         raise WorkerError("worker has not loaded a model")
     prompt = _payload_str(command, "prompt")
     max_new_tokens = _payload_positive_int(command, "max_new_tokens")
-    return WorkerResult(GENERATE, state.launch.rank, True, _generate_result_data(state.runner.generate(prompt, max_new_tokens)))
+    return WorkerResult(GENERATE, state.launch.rank, True, _generate_result_data(state.session.generate(prompt, max_new_tokens)))
 
 
 def _generate_result_data(result: GenerateResult) -> dict[str, Any]:
@@ -137,6 +142,15 @@ def _generate_result_data(result: GenerateResult) -> dict[str, Any]:
         "generated_token_ids": list(result.generated_token_ids),
         "text": result.text,
     }
+
+
+def _close_worker_state(state: WorkerState) -> None:
+    if state.session is not None:
+        state.session.close()
+    state.session = None
+    state.manifest = None
+    state.runtime_config = None
+    state.loaded_model_dir = None
 
 
 def _payload_str(command: WorkerCommand, key: str) -> str:

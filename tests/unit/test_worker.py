@@ -32,8 +32,9 @@ def test_worker_single_rank_broadcast_and_shutdown() -> None:
     assert state.should_shutdown is True
 
 
-def test_worker_load_initializes_state(tmp_path: Path) -> None:
+def test_worker_load_initializes_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
     launch = TpLaunchConfig(backend="gloo", device="cpu")
     state = WorkerState(launch)
 
@@ -46,9 +47,11 @@ def test_worker_load_initializes_state(tmp_path: Path) -> None:
     assert result.data["rank"] == 0
     assert result.data["layers"] == 1
     assert result.data["mapped_tensors"] > 0
+    assert result.data["loaded_tensors"] > 0
+    assert result.data["loaded_bytes"] > 0
     assert state.manifest is not None
     assert state.runtime_config is not None
-    assert state.runner is not None
+    assert state.session is not None
     assert state.loaded_model_dir == str(tmp_path)
 
 
@@ -80,6 +83,43 @@ def test_worker_load_then_generate_single_rank(tmp_path: Path, monkeypatch: pyte
     assert generate_result.data["all_finite"] is True
     assert len(generate_result.data["generated_token_ids"]) == 2
     assert generate_result.data["text"].startswith("decoded:")
+
+
+def test_worker_shutdown_closes_loaded_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    load_result = execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)}))
+    session = state.session
+    shutdown_result = execute_command(state, WorkerCommand(SHUTDOWN, {}))
+
+    assert load_result.ok is True
+    assert shutdown_result.ok is True
+    assert session is not None
+    assert session._closed is True
+    assert state.session is None
+    assert state.manifest is None
+    assert state.runtime_config is None
+    assert state.loaded_model_dir is None
+    assert state.should_shutdown is True
+
+
+def test_worker_reload_closes_previous_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    first_result = execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)}))
+    first_session = state.session
+    second_result = execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)}))
+
+    assert first_result.ok is True
+    assert second_result.ok is True
+    assert first_session is not None
+    assert first_session._closed is True
+    assert state.session is not None
+    assert state.session is not first_session
 
 
 def test_two_rank_worker_loop_receives_shutdown(tmp_path: Path) -> None:

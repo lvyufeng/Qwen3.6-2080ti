@@ -53,6 +53,151 @@ class GenerateResult:
     text: str | None
 
 
+class TpModelSession:
+    def __init__(self, manifest: Manifest, runtime_config: RuntimeConfig, launch: TpLaunchConfig) -> None:
+        self.manifest = manifest
+        self.runtime_config = runtime_config
+        self.launch = launch
+        self.tp = TensorParallel(world_size=launch.world_size, rank=launch.rank)
+        self.mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=self.tp)
+        self.runtime: TpRuntime | None = None
+        self.tokenizer: Any = None
+        self.loader: TensorLoader | None = None
+        self.weights: MappedWeights | None = None
+        self.load_stats: MappedWeightStats | None = None
+        self.load_seconds: float = 0.0
+        self._loaded = False
+        self._closed = False
+
+    def load(self) -> TpModelSession:
+        import time
+
+        from transformers import AutoTokenizer
+
+        if self._closed:
+            raise EngineError("TP model session is closed")
+        if self._loaded:
+            return self
+        try:
+            runtime = TpRuntime(self.launch)
+            runtime.__enter__()
+            self.runtime = runtime
+            self.tokenizer = AutoTokenizer.from_pretrained(self.manifest.model_dir, local_files_only=True, trust_remote_code=True)
+            loader = TensorLoader(self.manifest)
+            loader.__enter__()
+            self.loader = loader
+            weights = MappedWeights(loader, self.mapping, device=str(runtime.device))
+            _sync_device(runtime.device)
+            load_start = time.perf_counter()
+            self.load_stats = weights.preload()
+            _sync_device(runtime.device)
+            load_end = time.perf_counter()
+            self.weights = weights
+            self.load_seconds = _elapsed_seconds(load_start, load_end)
+            runtime.barrier()
+            self._loaded = True
+        except Exception:
+            self.close()
+            raise
+        return self
+
+    def generate(self, prompt: str, max_new_tokens: int) -> GenerateResult:
+        import time
+
+        import torch
+
+        if self._closed:
+            raise EngineError("TP model session is closed")
+        if not self._loaded:
+            raise EngineError("TP model session is not loaded")
+        runtime = self.runtime
+        weights = self.weights
+        load_stats = self.load_stats
+        assert runtime is not None
+        assert weights is not None
+        assert load_stats is not None
+        encoded = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+        input_ids = encoded["input_ids"].to(runtime.device)
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise EngineError("TP generation currently supports exactly one prompt")
+        if input_ids.shape[1] == 0:
+            raise EngineError("TP generation requires at least one prompt token")
+        weights.dispatch_stats = LinearDispatchStats()
+        state = DecodeState.empty(self.mapping, self.runtime_config)
+        _sync_device(runtime.device)
+        total_start = time.perf_counter()
+        prefill_start = time.perf_counter()
+        logits = tp_decode_step_local_logits(input_ids, self.mapping, self.runtime_config, weights, runtime, state)
+        _sync_device(runtime.device)
+        prefill_end = time.perf_counter()
+        generated: list[int] = []
+        step_finite: list[bool] = []
+        decode_start = time.perf_counter()
+        for step in range(max_new_tokens):
+            last_logits = logits[:, -1].float()
+            step_finite.append(bool(torch.isfinite(last_logits).all().item()))
+            next_token = tp_greedy_next_token(logits, self.mapping.lm_head, runtime)
+            next_token = _sync_next_token(next_token, runtime)
+            generated.append(int(next_token.item()))
+            if step + 1 < max_new_tokens:
+                logits = tp_decode_step_local_logits(next_token[:, None], self.mapping, self.runtime_config, weights, runtime, state)
+        _sync_device(runtime.device)
+        decode_end = time.perf_counter()
+        total_end = time.perf_counter()
+        prefill_seconds = _elapsed_seconds(prefill_start, prefill_end)
+        decode_seconds = _elapsed_seconds(decode_start, decode_end)
+        total_seconds = _elapsed_seconds(total_start, total_end)
+        result = GenerateResult(
+            backend=self.launch.backend,
+            world_size=self.launch.world_size,
+            rank=self.launch.rank,
+            local_rank=self.launch.local_rank,
+            device=runtime.device,
+            prompt_tokens=input_ids.numel(),
+            max_new_tokens=max_new_tokens,
+            layers=len(self.mapping.layers),
+            mapped_tensors=len(self.mapping.mapped_tensor_names),
+            mapped_bytes=mapped_tensor_bytes(self.mapping),
+            load_stats=load_stats,
+            load_seconds=self.load_seconds,
+            prefill_seconds=prefill_seconds,
+            decode_seconds=decode_seconds,
+            total_seconds=total_seconds,
+            decode_tokens_per_second=max_new_tokens / decode_seconds if decode_seconds > 0 else float("inf"),
+            total_tokens_per_second=max_new_tokens / total_seconds if total_seconds > 0 else float("inf"),
+            dispatch_stats=weights.dispatch_stats,
+            all_finite=all(step_finite),
+            cuda_memory=_cuda_memory_stats(runtime.device),
+            generated_token_ids=generated if self.launch.rank == 0 else [],
+            text=self.tokenizer.decode(generated, skip_special_tokens=False) if self.launch.rank == 0 else None,
+        )
+        runtime.barrier()
+        return result
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.loader is not None:
+            self.loader.close()
+            self.loader = None
+        if self.runtime is not None:
+            self.runtime.close()
+            self.runtime = None
+        self.weights = None
+        self.tokenizer = None
+        self.load_stats = None
+        self.load_seconds = 0.0
+        self._loaded = False
+
+    def __enter__(self) -> TpModelSession:
+        self.load()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
 class TpModelRunner:
     def __init__(self, manifest: Manifest, runtime_config: RuntimeConfig, launch: TpLaunchConfig) -> None:
         self.manifest = manifest
@@ -62,77 +207,8 @@ class TpModelRunner:
         self.mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=self.tp)
 
     def generate(self, prompt: str, max_new_tokens: int) -> GenerateResult:
-        import time
-
-        import torch
-        from transformers import AutoTokenizer
-
-        with TpRuntime(self.launch) as runtime:
-            tokenizer = AutoTokenizer.from_pretrained(self.manifest.model_dir, local_files_only=True, trust_remote_code=True)
-            encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
-            input_ids = encoded["input_ids"].to(runtime.device)
-            if input_ids.ndim != 2 or input_ids.shape[0] != 1:
-                raise EngineError("TP generation currently supports exactly one prompt")
-            if input_ids.shape[1] == 0:
-                raise EngineError("TP generation requires at least one prompt token")
-            _sync_device(runtime.device)
-            total_start = time.perf_counter()
-            with TensorLoader(self.manifest) as loader:
-                weights = MappedWeights(loader, self.mapping, device=str(runtime.device))
-                load_start = time.perf_counter()
-                load_stats = weights.preload()
-                _sync_device(runtime.device)
-                load_end = time.perf_counter()
-                state = DecodeState.empty(self.mapping, self.runtime_config)
-                prefill_start = time.perf_counter()
-                logits = tp_decode_step_local_logits(input_ids, self.mapping, self.runtime_config, weights, runtime, state)
-                _sync_device(runtime.device)
-                prefill_end = time.perf_counter()
-                generated: list[int] = []
-                step_finite: list[bool] = []
-                decode_start = time.perf_counter()
-                for step in range(max_new_tokens):
-                    last_logits = logits[:, -1].float()
-                    step_finite.append(bool(torch.isfinite(last_logits).all().item()))
-                    next_token = tp_greedy_next_token(logits, self.mapping.lm_head, runtime)
-                    next_token = _sync_next_token(next_token, runtime)
-                    generated.append(int(next_token.item()))
-                    if step + 1 < max_new_tokens:
-                        logits = tp_decode_step_local_logits(next_token[:, None], self.mapping, self.runtime_config, weights, runtime, state)
-                _sync_device(runtime.device)
-                decode_end = time.perf_counter()
-                dispatch = weights.dispatch_stats
-            total_end = time.perf_counter()
-            load_seconds = _elapsed_seconds(load_start, load_end)
-            prefill_seconds = _elapsed_seconds(prefill_start, prefill_end)
-            decode_seconds = _elapsed_seconds(decode_start, decode_end)
-            total_seconds = _elapsed_seconds(total_start, total_end)
-            result = GenerateResult(
-                backend=self.launch.backend,
-                world_size=self.launch.world_size,
-                rank=self.launch.rank,
-                local_rank=self.launch.local_rank,
-                device=runtime.device,
-                prompt_tokens=input_ids.numel(),
-                max_new_tokens=max_new_tokens,
-                layers=len(self.mapping.layers),
-                mapped_tensors=len(self.mapping.mapped_tensor_names),
-                mapped_bytes=mapped_tensor_bytes(self.mapping),
-                load_stats=load_stats,
-                load_seconds=load_seconds,
-                prefill_seconds=prefill_seconds,
-                decode_seconds=decode_seconds,
-                total_seconds=total_seconds,
-                decode_tokens_per_second=max_new_tokens / decode_seconds if decode_seconds > 0 else float("inf"),
-                total_tokens_per_second=max_new_tokens / total_seconds if total_seconds > 0 else float("inf"),
-                dispatch_stats=dispatch,
-                all_finite=all(step_finite),
-                cuda_memory=_cuda_memory_stats(runtime.device),
-                generated_token_ids=generated if self.launch.rank == 0 else [],
-                text=tokenizer.decode(generated, skip_special_tokens=False) if self.launch.rank == 0 else None,
-            )
-            runtime.barrier()
-            return result
+        with TpModelSession(self.manifest, self.runtime_config, self.launch) as session:
+            return session.generate(prompt, max_new_tokens)
 
 
 def _sync_next_token(next_token: Any, runtime: TpRuntime) -> Any:

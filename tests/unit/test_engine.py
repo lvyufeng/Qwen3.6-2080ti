@@ -7,7 +7,8 @@ import pytest
 import torch
 
 from checkpoint import build_manifest
-from engine import EngineError, TpModelRunner
+from engine import EngineError, TpModelRunner, TpModelSession
+import engine
 from runtime_config import parse_runtime_config
 from tp_runtime import TpLaunchConfig
 from test_cli import _runtime_config
@@ -44,6 +45,31 @@ def test_tp_model_runner_generate_single_rank_cpu_gloo(tmp_path: Path, monkeypat
     assert len(result.generated_token_ids) == 2
     assert result.text == "decoded:" + ",".join(str(token) for token in result.generated_token_ids)
     assert result.cuda_memory.available is False
+
+
+def test_tp_model_session_reuses_loaded_weights(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    manifest = build_manifest(tmp_path)
+    preload_calls = 0
+    original_preload = engine.MappedWeights.preload
+
+    def counted_preload(self):
+        nonlocal preload_calls
+        preload_calls += 1
+        return original_preload(self)
+
+    monkeypatch.setattr(engine.MappedWeights, "preload", counted_preload)
+
+    with TpModelSession(manifest, parse_runtime_config(manifest.config), TpLaunchConfig(backend="gloo", device="cpu")) as session:
+        first = session.generate("hello", max_new_tokens=1)
+        second = session.generate("hello again", max_new_tokens=1)
+
+    assert preload_calls == 1
+    assert first.load_stats.tensor_count == second.load_stats.tensor_count
+    assert first.load_seconds == second.load_seconds
+    assert first.dispatch_stats.calls > 0
+    assert second.dispatch_stats.calls > 0
 
 
 @pytest.mark.parametrize(
