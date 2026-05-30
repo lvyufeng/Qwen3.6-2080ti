@@ -10,7 +10,7 @@ from decode_state import DecodeState
 from reference_ops import ReferenceWeights, decode_step, decoder_layer, embedding, language_model
 from runtime_config import ConfigError, RuntimeConfig, parse_runtime_config
 from tensor_parallel import TensorParallel
-from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_language_model
+from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_decode_step, tp_language_model
 from tp_weights import MappedWeights
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 
@@ -259,6 +259,97 @@ def _tp_launch_from_args(
         init_method=init_method,
         device=device,
     )
+
+
+def _sync_next_token(next_token, runtime: TpRuntime):
+    if runtime.config.is_distributed:
+        import torch.distributed as dist
+
+        dist.broadcast(next_token, src=0)
+    return next_token
+
+
+def _summarize_tp_generate(
+    manifest: Manifest,
+    runtime_config: RuntimeConfig,
+    prompt: str,
+    max_new_tokens: int,
+    world_size: int | None,
+    rank: int | None,
+    local_rank: int | None,
+    backend: str,
+    init_method: str | None,
+    device: str | None,
+) -> list[str]:
+    import torch
+    from transformers import AutoTokenizer
+
+    launch = _tp_launch_from_args(world_size, rank, local_rank, backend, init_method, device)
+    tp = TensorParallel(world_size=launch.world_size, rank=launch.rank)
+    mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=tp)
+    with TpRuntime(launch) as runtime:
+        tokenizer = AutoTokenizer.from_pretrained(manifest.model_dir, local_files_only=True, trust_remote_code=True)
+        encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+        input_ids = encoded["input_ids"].to(runtime.device)
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise CliError("TP generation currently supports exactly one prompt")
+        if input_ids.shape[1] == 0:
+            raise CliError("TP generation requires at least one prompt token")
+        with TensorLoader(manifest) as loader:
+            weights = MappedWeights(loader, mapping, device=str(runtime.device))
+            load_stats = weights.preload()
+            state = DecodeState.empty(mapping, runtime_config)
+            logits = tp_decode_step(input_ids, mapping, runtime_config, weights, runtime, state)
+            generated: list[int] = []
+            step_finite: list[bool] = []
+            for step in range(max_new_tokens):
+                last_logits = logits[:, -1].float()
+                step_finite.append(bool(torch.isfinite(last_logits).all().item()))
+                next_token = torch.argmax(last_logits, dim=-1)
+                next_token = _sync_next_token(next_token, runtime)
+                generated.append(int(next_token.item()))
+                if step + 1 < max_new_tokens:
+                    logits = tp_decode_step(next_token[:, None], mapping, runtime_config, weights, runtime, state)
+            dispatch = weights.dispatch_stats
+        lines = [
+            f"tp_generate_backend: {backend}",
+            f"tp_generate_world_size: {launch.world_size}",
+            f"tp_generate_rank: {launch.rank}",
+            f"tp_generate_local_rank: {launch.local_rank}",
+            f"tp_generate_device: {runtime.device}",
+            f"tp_generate_prompt_tokens: {input_ids.numel()}",
+            f"tp_generate_max_new_tokens: {max_new_tokens}",
+            f"tp_generate_layers: {len(mapping.layers)}",
+            f"tp_generate_mapped_tensors: {len(mapping.mapped_tensor_names)}",
+            f"tp_generate_mapped_bytes: {mapped_tensor_bytes(mapping)}",
+            f"tp_generate_loaded_tensors: {load_stats.tensor_count}",
+            f"tp_generate_loaded_bytes: {load_stats.bytes}",
+            f"tp_generate_dispatch_calls: {dispatch.calls}",
+            f"tp_generate_dispatch_fp8_weight_calls: {dispatch.fp8_weight_calls}",
+            f"tp_generate_dispatch_eligible_cuda_calls: {dispatch.eligible_cuda_calls}",
+            f"tp_generate_dispatch_cuda_kernel_hits: {dispatch.cuda_kernel_hits}",
+            f"tp_generate_dispatch_fallback_calls: {dispatch.fallback_calls}",
+            f"tp_generate_dispatch_fallback_disabled_cuda_kernel: {dispatch.fallback_disabled_cuda_kernel}",
+            f"tp_generate_dispatch_fallback_missing_scale: {dispatch.fallback_missing_scale}",
+            f"tp_generate_dispatch_fallback_hidden_not_cuda: {dispatch.fallback_hidden_not_cuda}",
+            f"tp_generate_dispatch_fallback_weight_not_cuda: {dispatch.fallback_weight_not_cuda}",
+            f"tp_generate_dispatch_fallback_scale_not_cuda: {dispatch.fallback_scale_not_cuda}",
+            f"tp_generate_dispatch_fallback_weight_dtype: {dispatch.fallback_weight_dtype}",
+            f"tp_generate_dispatch_fallback_scale_dtype: {dispatch.fallback_scale_dtype}",
+            f"tp_generate_dispatch_fallback_hidden_alignment: {dispatch.fallback_hidden_alignment}",
+            f"tp_generate_dispatch_fallback_weight_alignment: {dispatch.fallback_weight_alignment}",
+            f"tp_generate_all_finite: {all(step_finite)}",
+        ]
+        lines.extend(_cuda_memory_lines("tp_generate", runtime.device))
+        if launch.rank == 0:
+            lines.extend(
+                [
+                    f"tp_generate_generated_token_ids: {','.join(str(token) for token in generated)}",
+                    f"tp_generate_text: {tokenizer.decode(generated, skip_special_tokens=False)}",
+                ]
+            )
+        runtime.barrier()
+        return lines
 
 
 def _summarize_tp_reference_forward(
@@ -580,6 +671,28 @@ def run(args: argparse.Namespace) -> int:
             raise CliError(str(exc)) from exc
         except Exception as exc:
             raise CliError(f"TP reference forward failed: {exc}") from exc
+    if args.tp_generate:
+        try:
+            runtime_config = parse_runtime_config(config)
+            print("TP resident greedy generation")
+            for line in _summarize_tp_generate(
+                manifest,
+                runtime_config,
+                args.prompt,
+                args.max_new_tokens,
+                args.tp_world_size,
+                args.tp_rank,
+                args.tp_local_rank,
+                args.tp_backend,
+                args.tp_init_method,
+                args.tp_device,
+            ):
+                print(line)
+        except (ConfigError, MappingError, LoaderError, TpRuntimeError, CliError) as exc:
+            raise CliError(str(exc)) from exc
+        except Exception as exc:
+            raise CliError(f"TP resident generation failed: {exc}") from exc
+        return 0
     if args.reference_prefill:
         try:
             runtime_config = parse_runtime_config(config)
@@ -700,6 +813,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--tp-reference-forward",
         action="store_true",
         help="Run the prompt through the TP reference language model and report logits metadata.",
+    )
+    parser.add_argument(
+        "--tp-generate",
+        action="store_true",
+        help="Run resident tensor-parallel greedy generation with mapped weights.",
     )
     parser.add_argument("--tp-world-size", type=int, help="TP runtime world size; defaults to WORLD_SIZE or 1.")
     parser.add_argument("--tp-rank", type=int, help="TP runtime global rank; defaults to RANK or 0.")
