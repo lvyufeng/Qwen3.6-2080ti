@@ -339,6 +339,11 @@ def _format_tp_generate_result(result: GenerateResult) -> list[str]:
     return lines
 
 
+def _format_tp_benchmark_result(result: GenerateResult) -> list[str]:
+    return ["tp_benchmark_iterations: 1", *_format_tp_generate_result(result)]
+
+
+
 def _summarize_tp_reference_forward(
     manifest: Manifest,
     runtime_config: RuntimeConfig,
@@ -699,6 +704,26 @@ def run(args: argparse.Namespace) -> int:
         except Exception as exc:
             raise CliError(f"TP resident generation failed: {exc}") from exc
         return 0
+    if args.tp_benchmark:
+        try:
+            runtime_config = parse_runtime_config(config)
+            print("TP resident generation benchmark")
+            launch = _tp_launch_from_args(
+                args.tp_world_size,
+                args.tp_rank,
+                args.tp_local_rank,
+                args.tp_backend,
+                args.tp_init_method,
+                args.tp_device,
+            )
+            runner = TpModelRunner(manifest, runtime_config, launch)
+            for line in _format_tp_benchmark_result(runner.generate(args.prompt, args.max_new_tokens)):
+                print(line)
+        except (ConfigError, EngineError, MappingError, LoaderError, TpRuntimeError, CliError) as exc:
+            raise CliError(str(exc)) from exc
+        except Exception as exc:
+            raise CliError(f"TP benchmark failed: {exc}") from exc
+        return 0
     if args.reference_prefill:
         try:
             runtime_config = parse_runtime_config(config)
@@ -824,6 +849,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--tp-generate",
         action="store_true",
         help="Run resident tensor-parallel greedy generation with mapped weights.",
+    )
+    parser.add_argument(
+        "--tp-benchmark",
+        action="store_true",
+        help="Run resident tensor-parallel generation and print baseline timing/throughput metrics.",
     )
     parser.add_argument(
         "--tp-worker",

@@ -178,6 +178,24 @@ def test_worker_load_then_generate_single_rank(tmp_path: Path, monkeypatch: pyte
     assert generate_result.data["scheduler"]["status"] == "COMPLETED"
     assert generate_result.data["scheduler"]["queued_seconds"] >= 0
     assert generate_result.data["scheduler"]["run_seconds"] >= 0
+    assert generate_result.data["runtime"]["backend"] == "gloo"
+    assert generate_result.data["runtime"]["world_size"] == 1
+    assert generate_result.data["runtime"]["rank"] == 0
+    assert generate_result.data["runtime"]["local_rank"] == 0
+    assert generate_result.data["runtime"]["device"] == "cpu"
+    assert generate_result.data["model"]["layers"] == 1
+    assert generate_result.data["model"]["mapped_tensors"] > 0
+    assert generate_result.data["model"]["mapped_bytes"] > 0
+    assert generate_result.data["load"]["loaded_tensors"] > 0
+    assert generate_result.data["load"]["loaded_bytes"] > 0
+    assert generate_result.data["load"]["load_seconds"] >= 0
+    assert generate_result.data["timings"]["prefill_seconds"] >= 0
+    assert generate_result.data["timings"]["decode_seconds"] >= 0
+    assert generate_result.data["timings"]["total_seconds"] >= 0
+    assert generate_result.data["throughput"]["decode_tokens_per_second"] > 0
+    assert generate_result.data["throughput"]["total_tokens_per_second"] > 0
+    assert generate_result.data["dispatch"]["calls"] >= 0
+    assert generate_result.data["memory"]["available"] is False
 
 
 def test_worker_generate_routes_through_scheduler(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -302,6 +320,11 @@ def test_worker_poll_drains_pending_request_to_completion(tmp_path: Path, monkey
     assert result["text"].startswith("decoded:")
     assert len(result["generated_token_ids"]) == 2
     assert result["world_size"] == 1
+    assert result["runtime"]["backend"] == "gloo"
+    assert result["runtime"]["rank"] == 0
+    assert result["runtime"]["local_rank"] == 0
+    assert result["timings"]["total_seconds"] >= 0
+    assert result["throughput"]["total_tokens_per_second"] > 0
     assert status_result.data["scheduler"]["completed"] == 1
     assert status_result.data["scheduler"]["pending"] == 0
 
@@ -730,6 +753,8 @@ def _worker_protocol_submit_poll_worker(rank: int, tmp_path: Path, model_dir: Pa
     assert poll["data"]["status"] == "COMPLETED"
     assert poll["data"]["result"]["world_size"] == 2
     assert poll["data"]["result"]["rank"] == 0
+    assert poll["data"]["result"]["runtime"]["rank"] == 0
+    assert poll["data"]["result"]["timings"]["total_seconds"] >= 0
     assert poll["data"]["result"]["text"].startswith("decoded:")
     assert poll["data"]["scheduler"]["completed"] == 1
     assert responses[3]["data"]["shutdown"] is True

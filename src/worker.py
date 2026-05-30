@@ -327,9 +327,95 @@ def _generate_result_data(result: GenerateResult) -> dict[str, Any]:
         "device": str(result.device),
         "prompt_tokens": result.prompt_tokens,
         "max_new_tokens": result.max_new_tokens,
+        "load_seconds": result.load_seconds,
+        "prefill_seconds": result.prefill_seconds,
+        "decode_seconds": result.decode_seconds,
+        "total_seconds": result.total_seconds,
+        "decode_tokens_per_second": result.decode_tokens_per_second,
+        "total_tokens_per_second": result.total_tokens_per_second,
         "all_finite": result.all_finite,
         "generated_token_ids": list(result.generated_token_ids),
         "text": result.text,
+        "runtime": _runtime_data(result),
+        "model": _model_data(result),
+        "load": _load_data(result),
+        "timings": _timings_data(result),
+        "throughput": _throughput_data(result),
+        "dispatch": _dispatch_stats_data(result),
+        "memory": _cuda_memory_data(result),
+    }
+
+
+def _runtime_data(result: GenerateResult) -> dict[str, Any]:
+    return {
+        "backend": result.backend,
+        "world_size": result.world_size,
+        "rank": result.rank,
+        "local_rank": result.local_rank,
+        "device": str(result.device),
+    }
+
+
+def _model_data(result: GenerateResult) -> dict[str, Any]:
+    return {
+        "layers": result.layers,
+        "mapped_tensors": result.mapped_tensors,
+        "mapped_bytes": result.mapped_bytes,
+    }
+
+
+def _load_data(result: GenerateResult) -> dict[str, Any]:
+    return {
+        "loaded_tensors": result.load_stats.tensor_count,
+        "loaded_bytes": result.load_stats.bytes,
+        "load_seconds": result.load_seconds,
+    }
+
+
+def _timings_data(result: GenerateResult) -> dict[str, Any]:
+    return {
+        "load_seconds": result.load_seconds,
+        "prefill_seconds": result.prefill_seconds,
+        "decode_seconds": result.decode_seconds,
+        "total_seconds": result.total_seconds,
+    }
+
+
+def _throughput_data(result: GenerateResult) -> dict[str, Any]:
+    return {
+        "decode_tokens_per_second": result.decode_tokens_per_second,
+        "total_tokens_per_second": result.total_tokens_per_second,
+    }
+
+
+def _dispatch_stats_data(result: GenerateResult) -> dict[str, Any]:
+    dispatch = result.dispatch_stats
+    return {
+        "calls": dispatch.calls,
+        "fp8_weight_calls": dispatch.fp8_weight_calls,
+        "eligible_cuda_calls": dispatch.eligible_cuda_calls,
+        "cuda_kernel_hits": dispatch.cuda_kernel_hits,
+        "fallback_calls": dispatch.fallback_calls,
+        "fallback_disabled_cuda_kernel": dispatch.fallback_disabled_cuda_kernel,
+        "fallback_missing_scale": dispatch.fallback_missing_scale,
+        "fallback_hidden_not_cuda": dispatch.fallback_hidden_not_cuda,
+        "fallback_weight_not_cuda": dispatch.fallback_weight_not_cuda,
+        "fallback_scale_not_cuda": dispatch.fallback_scale_not_cuda,
+        "fallback_weight_dtype": dispatch.fallback_weight_dtype,
+        "fallback_scale_dtype": dispatch.fallback_scale_dtype,
+        "fallback_hidden_alignment": dispatch.fallback_hidden_alignment,
+        "fallback_weight_alignment": dispatch.fallback_weight_alignment,
+    }
+
+
+def _cuda_memory_data(result: GenerateResult) -> dict[str, Any]:
+    memory = result.cuda_memory
+    return {
+        "available": memory.available,
+        "free_bytes": memory.free_bytes,
+        "total_bytes": memory.total_bytes,
+        "max_allocated": memory.max_allocated,
+        "max_reserved": memory.max_reserved,
     }
 
 
