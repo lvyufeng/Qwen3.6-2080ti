@@ -222,6 +222,75 @@ def test_worker_protocol_loop_reports_invalid_json_without_stopping() -> None:
     assert state.should_shutdown is True
 
 
+def test_worker_protocol_loop_reports_invalid_envelope_without_stopping() -> None:
+    launch = TpLaunchConfig(backend="gloo", device="cpu")
+    state = WorkerState(launch)
+    input_stream = _jsonl_stream(
+        [
+            {"id": "bad", "kind": SHUTDOWN, "payload": []},
+            {"id": "stop", "kind": SHUTDOWN, "payload": {}},
+        ]
+    )
+    output_stream = io.StringIO()
+
+    with TpRuntime(launch) as runtime:
+        run_worker_protocol_loop(state, runtime, input_stream, output_stream)
+
+    responses = _read_jsonl(output_stream)
+    assert len(responses) == 2
+    assert responses[0]["id"] == "bad"
+    assert responses[0]["ok"] is False
+    assert responses[0]["kind"] == "UNKNOWN"
+    assert "payload must be a dict" in responses[0]["error"]
+    assert responses[1]["ok"] is True
+    assert responses[1]["kind"] == SHUTDOWN
+    assert state.should_shutdown is True
+
+
+def test_worker_protocol_loop_reports_unknown_command_without_stopping() -> None:
+    launch = TpLaunchConfig(backend="gloo", device="cpu")
+    state = WorkerState(launch)
+    input_stream = _jsonl_stream(
+        [
+            {"id": "bogus", "kind": "BOGUS", "payload": {}},
+            {"id": "stop", "kind": SHUTDOWN, "payload": {}},
+        ]
+    )
+    output_stream = io.StringIO()
+
+    with TpRuntime(launch) as runtime:
+        run_worker_protocol_loop(state, runtime, input_stream, output_stream)
+
+    responses = _read_jsonl(output_stream)
+    assert len(responses) == 2
+    assert responses[0]["id"] == "bogus"
+    assert responses[0]["kind"] == "BOGUS"
+    assert responses[0]["ok"] is False
+    assert responses[0]["rank_results"][0]["rank"] == 0
+    assert "unknown worker command" in responses[0]["rank_results"][0]["error"]
+    assert responses[1]["ok"] is True
+    assert responses[1]["kind"] == SHUTDOWN
+    assert state.should_shutdown is True
+
+
+def test_worker_protocol_loop_shutdown_on_eof() -> None:
+    launch = TpLaunchConfig(backend="gloo", device="cpu")
+    state = WorkerState(launch)
+    input_stream = io.StringIO("\n\n")
+    output_stream = io.StringIO()
+
+    with TpRuntime(launch) as runtime:
+        run_worker_protocol_loop(state, runtime, input_stream, output_stream)
+
+    responses = _read_jsonl(output_stream)
+    assert len(responses) == 1
+    assert responses[0]["id"] is None
+    assert responses[0]["kind"] == SHUTDOWN
+    assert responses[0]["ok"] is True
+    assert responses[0]["data"]["shutdown"] is True
+    assert state.should_shutdown is True
+
+
 def test_worker_shutdown_closes_loaded_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_tiny_model(tmp_path)
     _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
@@ -257,6 +326,122 @@ def test_worker_reload_closes_previous_session(tmp_path: Path, monkeypatch: pyte
     assert first_session._closed is True
     assert state.session is not None
     assert state.session is not first_session
+
+
+def test_two_rank_worker_protocol_loop_load_generate_generate_shutdown(tmp_path: Path) -> None:
+    model_dir = tmp_path / "tiny-worker-protocol-model"
+    model_dir.mkdir()
+    _write_tiny_model(model_dir)
+    torch.multiprocessing.spawn(
+        _worker_protocol_e2e_worker,
+        args=(tmp_path, model_dir),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _worker_protocol_e2e_worker(rank: int, tmp_path: Path, model_dir: Path) -> None:
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+        launch = _two_rank_launch(rank, tmp_path, "worker-protocol-e2e-dist-init")
+        state = WorkerState(launch)
+        input_stream = (
+            _jsonl_stream(
+                [
+                    {"id": "load", "kind": LOAD, "payload": {"model_dir": str(model_dir)}},
+                    {"id": "gen-1", "kind": GENERATE, "payload": {"prompt": "hello", "max_new_tokens": 2}},
+                    {"id": "gen-2", "kind": GENERATE, "payload": {"prompt": "again", "max_new_tokens": 2}},
+                    {"id": "stop", "kind": SHUTDOWN, "payload": {}},
+                ]
+            )
+            if rank == 0
+            else io.StringIO()
+        )
+        output_stream = io.StringIO()
+
+        with TpRuntime(launch) as runtime:
+            run_worker_protocol_loop(state, runtime, input_stream, output_stream)
+
+    assert state.should_shutdown is True
+    assert state.session is None
+    assert state.manifest is None
+    assert state.runtime_config is None
+    assert state.loaded_model_dir is None
+    if rank != 0:
+        assert output_stream.getvalue() == ""
+        return
+
+    responses = _read_jsonl(output_stream)
+    assert [response["id"] for response in responses] == ["load", "gen-1", "gen-2", "stop"]
+    assert [response["kind"] for response in responses] == [LOAD, GENERATE, GENERATE, SHUTDOWN]
+    for response, kind in zip(responses, [LOAD, GENERATE, GENERATE, SHUTDOWN], strict=True):
+        _assert_two_rank_response(response, kind)
+
+    load = responses[0]
+    assert load["data"]["world_size"] == 2
+    assert load["data"]["rank"] == 0
+    assert load["data"]["layers"] == 1
+    assert load["data"]["loaded_tensors"] > 0
+    assert load["data"]["loaded_bytes"] > 0
+
+    for generate in responses[1:3]:
+        assert generate["data"]["world_size"] == 2
+        assert generate["data"]["rank"] == 0
+        assert generate["data"]["device"] == "cpu"
+        assert generate["data"]["prompt_tokens"] == 2
+        assert generate["data"]["max_new_tokens"] == 2
+        assert generate["data"]["all_finite"] is True
+        assert len(generate["data"]["generated_token_ids"]) == 2
+        assert generate["data"]["text"].startswith("decoded:")
+
+    assert responses[3]["data"]["shutdown"] is True
+    assert all(result["data"]["shutdown"] for result in responses[3]["rank_results"])
+
+
+def test_two_rank_worker_protocol_loop_aggregates_generate_before_load_error(tmp_path: Path) -> None:
+    torch.multiprocessing.spawn(
+        _worker_protocol_error_worker,
+        args=(tmp_path,),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _worker_protocol_error_worker(rank: int, tmp_path: Path) -> None:
+    launch = _two_rank_launch(rank, tmp_path, "worker-protocol-error-dist-init")
+    state = WorkerState(launch)
+    input_stream = (
+        _jsonl_stream(
+            [
+                {"id": "gen-before-load", "kind": GENERATE, "payload": {"prompt": "hello", "max_new_tokens": 1}},
+                {"id": "stop", "kind": SHUTDOWN, "payload": {}},
+            ]
+        )
+        if rank == 0
+        else io.StringIO()
+    )
+    output_stream = io.StringIO()
+
+    with TpRuntime(launch) as runtime:
+        run_worker_protocol_loop(state, runtime, input_stream, output_stream)
+
+    assert state.should_shutdown is True
+    assert state.session is None
+    if rank != 0:
+        assert output_stream.getvalue() == ""
+        return
+
+    responses = _read_jsonl(output_stream)
+    assert [response["id"] for response in responses] == ["gen-before-load", "stop"]
+    generate = responses[0]
+    _assert_two_rank_response(generate, GENERATE, ok=False)
+    assert generate["data"] == {}
+    assert "rank 0:" in generate["error"]
+    assert "rank 1:" in generate["error"]
+    assert all("not loaded" in result["error"] for result in generate["rank_results"])
+    assert all(result["ok"] is False for result in generate["rank_results"])
+    _assert_two_rank_response(responses[1], SHUTDOWN)
+    assert responses[1]["data"]["shutdown"] is True
 
 
 def test_two_rank_gather_worker_results(tmp_path: Path) -> None:
@@ -300,14 +485,7 @@ def test_two_rank_worker_loop_receives_shutdown(tmp_path: Path) -> None:
 
 
 def _worker_loop_shutdown_worker(rank: int, tmp_path: Path) -> None:
-    launch = TpLaunchConfig(
-        world_size=2,
-        rank=rank,
-        local_rank=rank,
-        backend="gloo",
-        init_method=f"file://{tmp_path / 'worker-loop-dist-init'}",
-        device="cpu",
-    )
+    launch = _two_rank_launch(rank, tmp_path, "worker-loop-dist-init")
     with TpRuntime(launch) as runtime:
         state = WorkerState(launch)
         commands = [WorkerCommand(SHUTDOWN, {})] if rank == 0 else None
@@ -317,3 +495,32 @@ def _worker_loop_shutdown_worker(rank: int, tmp_path: Path) -> None:
     assert results[0].ok is True
     assert results[0].kind == SHUTDOWN
     assert state.should_shutdown is True
+
+
+def _two_rank_launch(rank: int, tmp_path: Path, name: str) -> TpLaunchConfig:
+    return TpLaunchConfig(
+        world_size=2,
+        rank=rank,
+        local_rank=rank,
+        backend="gloo",
+        init_method=f"file://{tmp_path / name}",
+        device="cpu",
+    )
+
+
+def _jsonl_stream(commands: list[dict[str, object]]) -> io.StringIO:
+    return io.StringIO("\n".join(json.dumps(command) for command in commands) + "\n")
+
+
+def _read_jsonl(stream: io.StringIO) -> list[dict[str, object]]:
+    return [json.loads(line) for line in stream.getvalue().splitlines()]
+
+
+def _assert_two_rank_response(response: dict[str, object], kind: str, *, ok: bool = True) -> None:
+    assert response["kind"] == kind
+    assert response["ok"] is ok
+    rank_results = response["rank_results"]
+    assert isinstance(rank_results, list)
+    assert [result["rank"] for result in rank_results] == [0, 1]
+    assert all(result["kind"] == kind for result in rank_results)
+    assert all(result["ok"] is ok for result in rank_results)
