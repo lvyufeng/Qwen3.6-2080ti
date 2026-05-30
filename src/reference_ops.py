@@ -25,6 +25,24 @@ class TopKRouting:
     indices: Any
 
 
+@dataclass
+class LinearDispatchStats:
+    calls: int = 0
+    fp8_weight_calls: int = 0
+    eligible_cuda_calls: int = 0
+    cuda_kernel_hits: int = 0
+    fallback_calls: int = 0
+    fallback_disabled_cuda_kernel: int = 0
+    fallback_missing_scale: int = 0
+    fallback_hidden_not_cuda: int = 0
+    fallback_weight_not_cuda: int = 0
+    fallback_scale_not_cuda: int = 0
+    fallback_weight_dtype: int = 0
+    fallback_scale_dtype: int = 0
+    fallback_hidden_alignment: int = 0
+    fallback_weight_alignment: int = 0
+
+
 def embedding(input_ids: Any, weight: Any) -> Any:
     import torch.nn.functional as F
 
@@ -301,21 +319,64 @@ def _cat_last(first: Any, second: Any) -> Any:
     return torch.cat((first, second), dim=-1)
 
 
-def linear(hidden_states: Any, weight: Any, scale_inv: Any | None = None, *, use_cuda_kernel: bool = True) -> Any:
+def linear(
+    hidden_states: Any,
+    weight: Any,
+    scale_inv: Any | None = None,
+    *,
+    use_cuda_kernel: bool = True,
+    stats: LinearDispatchStats | None = None,
+) -> Any:
     import torch
     import torch.nn.functional as F
 
-    if (
+    has_scale = scale_inv is not None
+    hidden_is_cuda = getattr(hidden_states, "is_cuda", False)
+    weight_is_cuda = getattr(weight, "is_cuda", False)
+    scale_is_cuda = bool(has_scale and getattr(scale_inv, "is_cuda", False))
+    weight_is_fp8 = weight.dtype == torch.float8_e4m3fn
+    scale_is_bf16 = bool(has_scale and scale_inv.dtype == torch.bfloat16)
+    hidden_aligned = hidden_states.shape[-1] % 128 == 0
+    weight_aligned = weight.shape[0] % 128 == 0
+    eligible = (
         use_cuda_kernel
-        and scale_inv is not None
-        and getattr(hidden_states, "is_cuda", False)
-        and getattr(weight, "is_cuda", False)
-        and getattr(scale_inv, "is_cuda", False)
-        and weight.dtype == torch.float8_e4m3fn
-        and scale_inv.dtype == torch.bfloat16
-        and hidden_states.shape[-1] % 128 == 0
-        and weight.shape[0] % 128 == 0
-    ):
+        and has_scale
+        and hidden_is_cuda
+        and weight_is_cuda
+        and scale_is_cuda
+        and weight_is_fp8
+        and scale_is_bf16
+        and hidden_aligned
+        and weight_aligned
+    )
+    if stats is not None:
+        stats.calls += 1
+        if weight_is_fp8:
+            stats.fp8_weight_calls += 1
+        if eligible:
+            stats.eligible_cuda_calls += 1
+            stats.cuda_kernel_hits += 1
+        else:
+            stats.fallback_calls += 1
+            if not use_cuda_kernel:
+                stats.fallback_disabled_cuda_kernel += 1
+            if weight_is_fp8 and not has_scale:
+                stats.fallback_missing_scale += 1
+            if weight_is_fp8 and not hidden_is_cuda:
+                stats.fallback_hidden_not_cuda += 1
+            if weight_is_fp8 and not weight_is_cuda:
+                stats.fallback_weight_not_cuda += 1
+            if weight_is_fp8 and has_scale and not scale_is_cuda:
+                stats.fallback_scale_not_cuda += 1
+            if not weight_is_fp8:
+                stats.fallback_weight_dtype += 1
+            if weight_is_fp8 and has_scale and not scale_is_bf16:
+                stats.fallback_scale_dtype += 1
+            if weight_is_fp8 and not hidden_aligned:
+                stats.fallback_hidden_alignment += 1
+            if weight_is_fp8 and not weight_aligned:
+                stats.fallback_weight_alignment += 1
+    if eligible:
         from fp8_cuda import fp8_e4m3_bf16_linear
 
         return fp8_e4m3_bf16_linear(hidden_states.float(), weight, scale_inv)

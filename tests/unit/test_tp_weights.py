@@ -106,6 +106,10 @@ def test_mapped_weights_linear_and_expert_reuse_preloaded_cache() -> None:
     torch.testing.assert_close(out, hidden)
     assert expert_out.shape == hidden.shape
     assert loader.calls == calls_after_preload
+    assert weights.dispatch_stats.calls == 4
+    assert weights.dispatch_stats.fallback_calls == 4
+    assert weights.dispatch_stats.fallback_weight_dtype == 4
+    assert weights.dispatch_stats.cuda_kernel_hits == 0
 
 
 def _mapping(names: tuple[str, ...]) -> LanguageModelMapping:

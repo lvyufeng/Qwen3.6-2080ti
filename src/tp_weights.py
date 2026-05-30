@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from loader import TensorLoader
-from reference_ops import linear, silu_mul
+from reference_ops import LinearDispatchStats, linear, silu_mul
 from weight_mapping import ExpertMapping, LanguageModelMapping, LinearTensor, ShardedTensor
 
 
@@ -22,6 +22,7 @@ class MappedWeights:
         self._cache: dict[str, Any] = {}
         self._tensors = _mapping_tensors(mapping)
         self.stats = MappedWeightStats(tensor_count=0, bytes=0)
+        self.dispatch_stats = LinearDispatchStats()
 
     def preload(self) -> MappedWeightStats:
         for name in sorted(self._tensors):
@@ -48,7 +49,7 @@ class MappedWeights:
 
     def linear(self, hidden_states: Any, tensor: LinearTensor) -> Any:
         weight, scale = self.linear_weight(tensor)
-        return linear(hidden_states, weight, scale)
+        return linear(hidden_states, weight, scale, stats=self.dispatch_stats)
 
     def expert(self, hidden_states: Any, expert: ExpertMapping) -> Any:
         gate = self.linear(hidden_states, expert.gate_proj)
@@ -58,6 +59,7 @@ class MappedWeights:
     def clear(self) -> None:
         self._cache.clear()
         self.stats = MappedWeightStats(tensor_count=0, bytes=0)
+        self.dispatch_stats = LinearDispatchStats()
 
     def _resolve_tensor(self, name: Any) -> tuple[str, ShardedTensor]:
         mapped_arg = name if hasattr(name, "info") and hasattr(name, "shard") else None

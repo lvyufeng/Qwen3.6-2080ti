@@ -8,6 +8,7 @@ import torch
 from checkpoint import TensorInfo
 from decode_state import DecodeState
 from reference_ops import (
+    LinearDispatchStats,
     ReferenceWeights,
     decoder_layer,
     decode_step,
@@ -72,6 +73,56 @@ def test_linear_applies_dequantized_weight() -> None:
     out = linear(x, weight, scale)
 
     torch.testing.assert_close(out, torch.tensor([[6.0, 4.0]]))
+
+
+def test_linear_dispatch_stats_count_non_fp8_fallback() -> None:
+    stats = LinearDispatchStats()
+    x = torch.tensor([[1.0, 2.0]])
+    weight = torch.tensor([[1.0, 1.0], [2.0, 0.0]])
+
+    out = linear(x, weight, stats=stats)
+
+    torch.testing.assert_close(out, torch.tensor([[3.0, 2.0]]))
+    assert stats.calls == 1
+    assert stats.fp8_weight_calls == 0
+    assert stats.cuda_kernel_hits == 0
+    assert stats.fallback_calls == 1
+    assert stats.fallback_weight_dtype == 1
+
+
+def test_linear_dispatch_stats_count_cpu_fp8_fallback_reasons() -> None:
+    stats = LinearDispatchStats()
+    x = torch.ones((1, 128), dtype=torch.float32)
+    weight = torch.ones((128, 128), dtype=torch.float8_e4m3fn)
+    scale = torch.ones((1, 1), dtype=torch.bfloat16)
+
+    out = linear(x, weight, scale, stats=stats)
+
+    assert out.shape == (1, 128)
+    assert stats.calls == 1
+    assert stats.fp8_weight_calls == 1
+    assert stats.eligible_cuda_calls == 0
+    assert stats.cuda_kernel_hits == 0
+    assert stats.fallback_calls == 1
+    assert stats.fallback_hidden_not_cuda == 1
+    assert stats.fallback_weight_not_cuda == 1
+    assert stats.fallback_scale_not_cuda == 1
+    assert stats.fallback_hidden_alignment == 0
+    assert stats.fallback_weight_alignment == 0
+
+
+def test_linear_dispatch_stats_count_missing_scale_for_fp8_weight() -> None:
+    stats = LinearDispatchStats()
+    x = torch.ones((1, 128), dtype=torch.float32)
+    weight = torch.ones((128, 128), dtype=torch.float8_e4m3fn)
+
+    out = linear(x, weight, stats=stats)
+
+    assert out.shape == (1, 128)
+    assert stats.calls == 1
+    assert stats.fp8_weight_calls == 1
+    assert stats.fallback_calls == 1
+    assert stats.fallback_missing_scale == 1
 
 
 def test_topk_route_matches_qwen_softmax_then_renormalize() -> None:
