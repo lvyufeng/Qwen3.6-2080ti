@@ -865,6 +865,14 @@ def _dispatch_stats_data(result: GenerateResult) -> dict[str, Any]:
         "fallback_scale_dtype": dispatch.fallback_scale_dtype,
         "fallback_hidden_alignment": dispatch.fallback_hidden_alignment,
         "fallback_weight_alignment": dispatch.fallback_weight_alignment,
+        "moe_calls": dispatch.moe_calls,
+        "moe_packed_calls": dispatch.moe_packed_calls,
+        "moe_loop_calls": dispatch.moe_loop_calls,
+        "moe_assignments": dispatch.moe_assignments,
+        "moe_local_assignments": dispatch.moe_local_assignments,
+        "moe_active_expert_groups": dispatch.moe_active_expert_groups,
+        "moe_empty_local_dispatches": dispatch.moe_empty_local_dispatches,
+        "moe_max_group_tokens": dispatch.moe_max_group_tokens,
     }
 
 

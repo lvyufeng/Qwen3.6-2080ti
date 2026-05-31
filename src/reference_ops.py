@@ -41,6 +41,14 @@ class LinearDispatchStats:
     fallback_scale_dtype: int = 0
     fallback_hidden_alignment: int = 0
     fallback_weight_alignment: int = 0
+    moe_calls: int = 0
+    moe_packed_calls: int = 0
+    moe_loop_calls: int = 0
+    moe_assignments: int = 0
+    moe_local_assignments: int = 0
+    moe_active_expert_groups: int = 0
+    moe_empty_local_dispatches: int = 0
+    moe_max_group_tokens: int = 0
 
 
 def embedding(input_ids: Any, weight: Any) -> Any:

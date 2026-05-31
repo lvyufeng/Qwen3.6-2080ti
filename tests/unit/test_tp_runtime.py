@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
 
 from checkpoint import TensorInfo, build_manifest
-from reference_ops import ReferenceWeights, decoder_layer, language_model
+from reference_ops import LinearDispatchStats, ReferenceWeights, decoder_layer, language_model
 from runtime_config import parse_runtime_config
 from tensor_parallel import TensorParallel
 from decode_state import DecodeState
@@ -20,6 +21,7 @@ from tp_runtime import (
     tp_decoder_layer,
     tp_greedy_next_token,
     tp_language_model,
+    tp_moe,
 )
 from loader import TensorLoader
 from weight_mapping import (
@@ -65,6 +67,58 @@ def test_mapped_tensor_bytes_counts_local_expert_shard() -> None:
     assert mapped_tensor_bytes(mapping) == 36
 
 
+def test_packed_tp_moe_matches_loop_and_records_stats() -> None:
+    hidden = torch.tensor([[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]])
+    loader = _FakeLoader(_moe_test_tensors())
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    packed_config = _config_with_experts_per_token(2, packed=True)
+    loop_config = _config_with_experts_per_token(2, packed=False)
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        expected = tp_moe(hidden, mapping, loop_config, ReferenceWeights(loader), runtime)
+        weights = ReferenceWeights(loader)
+        weights.dispatch_stats = LinearDispatchStats()
+        actual = tp_moe(hidden, mapping, packed_config, weights, runtime)
+
+    torch.testing.assert_close(actual, expected)
+    stats = weights.dispatch_stats
+    assert stats.moe_calls == 1
+    assert stats.moe_packed_calls == 1
+    assert stats.moe_loop_calls == 0
+    assert stats.moe_assignments == 6
+    assert stats.moe_local_assignments == 6
+    assert stats.moe_active_expert_groups == 2
+    assert stats.moe_empty_local_dispatches == 0
+    assert stats.moe_max_group_tokens == 3
+
+
+def test_loop_tp_moe_records_loop_stats() -> None:
+    hidden = torch.tensor([[[1.0, 0.0]]])
+    loader = _FakeLoader(_moe_test_tensors())
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    config = _config_with_experts_per_token(2, packed=False)
+    weights = ReferenceWeights(loader)
+    weights.dispatch_stats = LinearDispatchStats()
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        tp_moe(hidden, mapping, config, weights, runtime)
+
+    assert weights.dispatch_stats.moe_calls == 1
+    assert weights.dispatch_stats.moe_packed_calls == 0
+    assert weights.dispatch_stats.moe_loop_calls == 1
+    assert weights.dispatch_stats.moe_assignments == 2
+    assert weights.dispatch_stats.moe_local_assignments == 0
+
+
+def test_two_rank_packed_tp_moe_matches_loop(tmp_path: Path) -> None:
+    torch.multiprocessing.spawn(
+        _tp_moe_worker,
+        args=(tmp_path,),
+        nprocs=2,
+        join=True,
+    )
+
+
 def test_two_rank_tp_decoder_layer_matches_dense_reference(tmp_path: Path) -> None:
     torch.multiprocessing.spawn(
         _tp_decoder_layer_worker,
@@ -102,6 +156,31 @@ def test_two_rank_tp_greedy_next_token_matches_full_gather_argmax(tmp_path: Path
     )
 
 
+def _tp_moe_worker(rank: int, tmp_path: Path) -> None:
+    hidden = torch.tensor([[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]])
+    loader = _FakeLoader(_moe_test_tensors())
+    packed_config = _config_with_experts_per_token(2, packed=True)
+    loop_config = _config_with_experts_per_token(2, packed=False)
+    tp_mapping = _moe_mapping((rank,), TensorParallel(world_size=2, rank=rank))
+    init_method = f"file://{tmp_path / 'tp-moe-dist-init'}"
+
+    with TpRuntime(TpLaunchConfig(world_size=2, rank=rank, local_rank=rank, backend="gloo", init_method=init_method, device="cpu")) as runtime:
+        expected = tp_moe(hidden, tp_mapping, loop_config, ReferenceWeights(loader), runtime)
+        weights = ReferenceWeights(loader)
+        weights.dispatch_stats = LinearDispatchStats()
+        actual = tp_moe(hidden, tp_mapping, packed_config, weights, runtime)
+
+    torch.testing.assert_close(actual, expected)
+    assert weights.dispatch_stats.moe_calls == 1
+    assert weights.dispatch_stats.moe_packed_calls == 1
+    assert weights.dispatch_stats.moe_loop_calls == 0
+    assert weights.dispatch_stats.moe_assignments == 6
+    assert weights.dispatch_stats.moe_local_assignments == 3
+    assert weights.dispatch_stats.moe_active_expert_groups == 1
+    assert weights.dispatch_stats.moe_empty_local_dispatches == 0
+    assert weights.dispatch_stats.moe_max_group_tokens == 3
+
+
 def _tp_greedy_next_token_worker(rank: int, tmp_path: Path) -> None:
     init_method = f"file://{tmp_path / 'tp-greedy-dist-init'}"
     with TpRuntime(TpLaunchConfig(world_size=2, rank=rank, local_rank=rank, backend="gloo", init_method=init_method, device="cpu")) as runtime:
@@ -126,6 +205,27 @@ def _tp_greedy_next_token_worker(rank: int, tmp_path: Path) -> None:
         expected = torch.argmax(full_logits[:, -1], dim=-1)
         actual = tp_greedy_next_token(local_logits, tp_mapping.lm_head, runtime)
         torch.testing.assert_close(actual, expected)
+
+
+def _moe_test_tensors() -> dict[str, torch.Tensor]:
+    return {
+        "gate": torch.tensor([[5.0, 0.0], [0.0, 5.0]]),
+        "shared_gate": torch.tensor([[-100.0, -100.0]]),
+        "e0_gate": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        "e0_up": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        "e0_down": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        "e1_gate": torch.tensor([[2.0, 0.0], [0.0, 2.0]]),
+        "e1_up": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        "e1_down": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        "shared_gate_proj": torch.zeros((2, 2)),
+        "shared_up_proj": torch.zeros((2, 2)),
+        "shared_down_proj": torch.zeros((2, 2)),
+    }
+
+
+def _config_with_experts_per_token(experts_per_token: int, *, packed: bool) -> object:
+    config = parse_runtime_config(_config())
+    return replace(config, moe=replace(config.moe, experts_per_token=experts_per_token, packed_expert_dispatch=packed))
 
 
 def _tp_decode_worker(rank: int, tmp_path: Path) -> None:

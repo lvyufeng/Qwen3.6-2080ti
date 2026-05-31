@@ -6,6 +6,7 @@ from typing import Any, Sequence
 
 from reference_ops import (
     ReferenceWeights,
+    TopKRouting,
     apply_rotary_pos_emb,
     gated_rms_norm,
     l2_norm,
@@ -402,6 +403,28 @@ def tp_moe(hidden_states: Any, mapping: MoEMapping, config: RuntimeConfig, weigh
     original_shape = hidden_states.shape
     flat = hidden_states.reshape(-1, original_shape[-1])
     routing = topk_route(flat, weights.tensor(mapping.gate), config.moe.experts_per_token)
+    stats = getattr(weights, "dispatch_stats", None)
+    if stats is not None:
+        stats.moe_calls += 1
+        stats.moe_assignments += int(routing.indices.numel())
+    if config.moe.packed_expert_dispatch:
+        if stats is not None:
+            stats.moe_packed_calls += 1
+        routed = _tp_moe_packed_local_experts(flat, routing, mapping, weights)
+    else:
+        if stats is not None:
+            stats.moe_loop_calls += 1
+        routed = _tp_moe_per_expert_loop(flat, routing, mapping, weights)
+    routed = runtime.all_reduce_sum(routed)
+    shared = weights.expert(flat, mapping.shared_expert)
+    shared_gate = weights.tensor(mapping.shared_expert_gate)
+    output = routed + torch.sigmoid(flat.float() @ shared_gate.float().t()) * shared.float()
+    return output.reshape(original_shape).to(hidden_states.dtype)
+
+
+def _tp_moe_per_expert_loop(flat: Any, routing: TopKRouting, mapping: MoEMapping, weights: ReferenceWeights) -> Any:
+    import torch
+
     routed = torch.zeros_like(flat.float())
     for expert in mapping.experts:
         token_indices, topk_indices = torch.where(routing.indices == expert.index)
@@ -410,11 +433,59 @@ def tp_moe(hidden_states: Any, mapping: MoEMapping, config: RuntimeConfig, weigh
         token_output = weights.expert(flat[token_indices], expert)
         token_output = token_output * routing.scores[token_indices, topk_indices, None]
         routed.index_add_(0, token_indices, token_output.float())
-    routed = runtime.all_reduce_sum(routed)
-    shared = weights.expert(flat, mapping.shared_expert)
-    shared_gate = weights.tensor(mapping.shared_expert_gate)
-    output = routed + torch.sigmoid(flat.float() @ shared_gate.float().t()) * shared.float()
-    return output.reshape(original_shape).to(hidden_states.dtype)
+    return routed
+
+
+def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMapping, weights: ReferenceWeights) -> Any:
+    import torch
+
+    routed = torch.zeros_like(flat.float())
+    stats = getattr(weights, "dispatch_stats", None)
+    token_count = int(flat.shape[0])
+    token_ids = torch.arange(token_count, device=flat.device)
+    assignment_tokens = token_ids[:, None].expand_as(routing.indices).reshape(-1)
+    assignment_experts = routing.indices.reshape(-1)
+    assignment_scores = routing.scores.reshape(-1)
+    local_mask = (assignment_experts >= mapping.expert_start) & (assignment_experts < mapping.expert_end)
+    local_tokens = assignment_tokens[local_mask]
+    local_assignment_count = int(local_tokens.numel())
+    if stats is not None:
+        stats.moe_local_assignments += local_assignment_count
+    if local_assignment_count == 0:
+        if stats is not None:
+            stats.moe_empty_local_dispatches += 1
+        return routed
+
+    local_experts = assignment_experts[local_mask]
+    local_scores = assignment_scores[local_mask]
+    order = torch.argsort(local_experts)
+    packed_tokens = local_tokens[order]
+    packed_experts = local_experts[order]
+    packed_scores = local_scores[order]
+    packed_hidden = flat.index_select(0, packed_tokens)
+    unique_experts, counts = torch.unique_consecutive(packed_experts, return_counts=True)
+    if stats is not None:
+        stats.moe_active_expert_groups += int(unique_experts.numel())
+        if counts.numel() > 0:
+            stats.moe_max_group_tokens = max(stats.moe_max_group_tokens, int(counts.max().item()))
+    expert_by_index = {expert.index: expert for expert in mapping.experts}
+    offset = 0
+    for expert_id_tensor, count_tensor in zip(unique_experts, counts, strict=True):
+        expert_id = int(expert_id_tensor.item())
+        count = int(count_tensor.item())
+        try:
+            expert = expert_by_index[expert_id]
+        except KeyError as exc:
+            raise RuntimeError(f"routing selected unmapped local expert {expert_id}") from exc
+        end = offset + count
+        hidden_chunk = packed_hidden[offset:end]
+        token_chunk = packed_tokens[offset:end]
+        score_chunk = packed_scores[offset:end]
+        token_output = weights.expert(hidden_chunk, expert)
+        token_output = token_output * score_chunk[:, None]
+        routed.index_add_(0, token_chunk, token_output.float())
+        offset = end
+    return routed
 
 
 def mapped_tensor_bytes(mapping: LanguageModelMapping) -> int:

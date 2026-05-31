@@ -67,6 +67,7 @@ def _summarize_runtime_config(config: RuntimeConfig) -> list[str]:
         f"runtime_attention_kv_dim: {config.full_attention.kv_dim}",
         f"runtime_experts_per_layer: {config.moe.num_experts}",
         f"runtime_experts_per_token: {config.moe.experts_per_token}",
+        f"runtime_packed_expert_dispatch: {config.moe.packed_expert_dispatch}",
         f"runtime_fp8_block_size: {config.fp8_block_size}",
     ]
 
@@ -323,6 +324,14 @@ def _format_tp_generate_result(result: GenerateResult) -> list[str]:
         f"tp_generate_dispatch_fallback_scale_dtype: {dispatch.fallback_scale_dtype}",
         f"tp_generate_dispatch_fallback_hidden_alignment: {dispatch.fallback_hidden_alignment}",
         f"tp_generate_dispatch_fallback_weight_alignment: {dispatch.fallback_weight_alignment}",
+        f"tp_generate_dispatch_moe_calls: {dispatch.moe_calls}",
+        f"tp_generate_dispatch_moe_packed_calls: {dispatch.moe_packed_calls}",
+        f"tp_generate_dispatch_moe_loop_calls: {dispatch.moe_loop_calls}",
+        f"tp_generate_dispatch_moe_assignments: {dispatch.moe_assignments}",
+        f"tp_generate_dispatch_moe_local_assignments: {dispatch.moe_local_assignments}",
+        f"tp_generate_dispatch_moe_active_expert_groups: {dispatch.moe_active_expert_groups}",
+        f"tp_generate_dispatch_moe_empty_local_dispatches: {dispatch.moe_empty_local_dispatches}",
+        f"tp_generate_dispatch_moe_max_group_tokens: {dispatch.moe_max_group_tokens}",
         f"tp_generate_all_finite: {result.all_finite}",
     ]
     memory = result.cuda_memory

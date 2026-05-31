@@ -55,6 +55,7 @@ class MoEConfig:
     experts_per_token: int
     intermediate_size: int
     shared_intermediate_size: int
+    packed_expert_dispatch: bool = True
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,7 @@ def parse_runtime_config(config: dict[str, Any]) -> RuntimeConfig:
             experts_per_token=_required_int(text_config, "num_experts_per_tok"),
             intermediate_size=_required_int(text_config, "moe_intermediate_size"),
             shared_intermediate_size=_required_int(text_config, "shared_expert_intermediate_size"),
+            packed_expert_dispatch=_optional_bool(text_config, "packed_expert_dispatch", default=True),
         ),
         max_position_embeddings=_required_int(text_config, "max_position_embeddings"),
         rms_norm_eps=_required_float(text_config, "rms_norm_eps"),
@@ -148,6 +150,13 @@ def _required_bool(config: dict[str, Any], key: str, *, prefix: str = "text_conf
     value = config.get(key)
     if not isinstance(value, bool):
         raise ConfigError(f"missing boolean {prefix}.{key}")
+    return value
+
+
+def _optional_bool(config: dict[str, Any], key: str, *, default: bool, prefix: str = "text_config") -> bool:
+    value = config.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigError(f"expected boolean {prefix}.{key}")
     return value
 
 
