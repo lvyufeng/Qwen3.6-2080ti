@@ -147,7 +147,10 @@ class TpModelSession:
         if input_ids.shape[1] == 0:
             raise EngineError("TP generation requires at least one prompt token")
         weights.dispatch_stats = LinearDispatchStats()
-        decode_state = DecodeState.empty(self.mapping, self.runtime_config)
+        # Final cache length is prompt_tokens + max_new_tokens - 1; this upper bound lets the
+        # full-attention buffers allocate once so the decode loop never reallocates.
+        max_seq_len = input_ids.shape[1] + max_new_tokens
+        decode_state = DecodeState.empty(self.mapping, self.runtime_config, max_seq_len=max_seq_len)
         _sync_device(runtime.device)
         total_start = time.perf_counter()
         prefill_start = time.perf_counter()
