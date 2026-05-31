@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from decode_state import DecodeState, FullAttentionCache, LinearAttentionCache
+from decode_state import DEFAULT_KV_BLOCK_SIZE, DecodeState, FullAttentionCache, LinearAttentionCache
 
 
 def _kv(step: int, *, batch: int = 1, heads: int = 2, seq: int = 1, head_dim: int = 4) -> tuple[torch.Tensor, torch.Tensor]:
@@ -23,7 +23,7 @@ def _mapping(layer_types: tuple[str, ...]) -> SimpleNamespace:
 
 
 def test_append_returns_views_equal_to_manual_concat() -> None:
-    cache = FullAttentionCache()
+    cache = FullAttentionCache(block_size=2)
     keys: list[torch.Tensor] = []
     values: list[torch.Tensor] = []
 
@@ -36,8 +36,8 @@ def test_append_returns_views_equal_to_manual_concat() -> None:
         torch.testing.assert_close(out_value, torch.cat(values, dim=2))
 
 
-def test_append_handles_prefill_chunk_then_single_steps() -> None:
-    cache = FullAttentionCache()
+def test_append_handles_prefill_chunk_then_single_steps_across_blocks() -> None:
+    cache = FullAttentionCache(block_size=2)
     prefill_key, prefill_value = _kv(0, seq=3)
     keys = [prefill_key]
     values = [prefill_value]
@@ -51,40 +51,61 @@ def test_append_handles_prefill_chunk_then_single_steps() -> None:
 
     torch.testing.assert_close(out_key, torch.cat(keys, dim=2))
     torch.testing.assert_close(out_value, torch.cat(values, dim=2))
+    assert cache.block_table == [0, 1, 2, 3]
+    assert cache.capacity == 8
 
 
-def test_length_tracks_total_appended_tokens() -> None:
-    cache = FullAttentionCache()
+def test_length_tracks_total_appended_tokens_not_allocated_capacity() -> None:
+    cache = FullAttentionCache(capacity_hint=8, block_size=4)
     assert cache.length == 0
+    assert cache.capacity == 0
 
     cache.append(*_kv(0, seq=3))
     assert cache.length == 3
+    assert cache.capacity == 8
 
     cache.append(*_kv(1, seq=1))
     cache.append(*_kv(2, seq=1))
     assert cache.length == 5
+    assert cache.capacity == 8
 
 
-def test_capacity_hint_allocates_once_without_reallocation() -> None:
-    cache = FullAttentionCache(capacity_hint=8)
+def test_capacity_hint_allocates_expected_contiguous_blocks() -> None:
+    cache = FullAttentionCache(capacity_hint=8, block_size=4)
 
-    cache.append(*_kv(0, seq=3))
-    buffer_ptr = cache.key.data_ptr()
-    value_ptr = cache.value.data_ptr()
-    assert cache.key.shape[2] == 8
+    out_key, out_value = cache.append(*_kv(0, seq=3))
 
-    for step in range(1, 5):
-        cache.append(*_kv(step, seq=1))
-
-    # The buffer object is preallocated once and written in place — never replaced.
-    assert cache.key.data_ptr() == buffer_ptr
-    assert cache.value.data_ptr() == value_ptr
-    assert cache.key.shape[2] == 8
-    assert cache.length == 7
+    assert cache.pool.block_count == 2
+    assert cache.block_table == [0, 1]
+    assert cache.pool.free_blocks == []
+    assert cache.key_blocks.shape[2] == 2
+    assert cache.value_blocks.shape[2] == 2
+    assert out_key.shape == (1, 2, 3, 4)
+    assert out_value.shape == (1, 2, 3, 4)
 
 
-def test_growth_beyond_hint_preserves_contents() -> None:
-    cache = FullAttentionCache(capacity_hint=2)
+def test_contiguous_fast_path_returns_view_of_block_storage() -> None:
+    cache = FullAttentionCache(capacity_hint=8, block_size=4)
+
+    out_key, out_value = cache.append(*_kv(0, seq=3))
+    key_ptr = cache.key_blocks.data_ptr()
+    value_ptr = cache.value_blocks.data_ptr()
+
+    assert out_key.data_ptr() == key_ptr
+    assert out_value.data_ptr() == value_ptr
+    assert out_key._base is not None
+    assert out_value._base is not None
+
+    out_key, out_value = cache.append(*_kv(1, seq=2))
+    assert cache.key_blocks.data_ptr() == key_ptr
+    assert cache.value_blocks.data_ptr() == value_ptr
+    assert out_key.data_ptr() == key_ptr
+    assert out_value.data_ptr() == value_ptr
+    assert out_key.shape[2] == 5
+
+
+def test_growth_beyond_hint_allocates_blocks_and_preserves_contents() -> None:
+    cache = FullAttentionCache(capacity_hint=2, block_size=2)
     keys: list[torch.Tensor] = []
     values: list[torch.Tensor] = []
 
@@ -94,26 +115,51 @@ def test_growth_beyond_hint_preserves_contents() -> None:
         values.append(value)
         out_key, out_value = cache.append(key, value)
 
-    # Grew past the (deliberately too-small) hint, yet contents still match a full concat.
-    assert cache.key.shape[2] >= cache.length
+    assert cache.pool.block_count >= len(cache.block_table)
+    assert cache.capacity >= cache.length
     torch.testing.assert_close(out_key, torch.cat(keys, dim=2))
     torch.testing.assert_close(out_value, torch.cat(values, dim=2))
 
 
-def test_growth_without_hint_preserves_contents() -> None:
-    cache = FullAttentionCache()
-    keys: list[torch.Tensor] = []
-    values: list[torch.Tensor] = []
+def test_release_clears_logical_state_and_reuses_blocks() -> None:
+    cache = FullAttentionCache(capacity_hint=4, block_size=2)
+    cache.append(*_kv(0, seq=3))
+    released_blocks = list(cache.block_table)
+    key_storage_ptr = cache.key_blocks.data_ptr()
 
-    for step in range(4):
-        key, value = _kv(step)
-        keys.append(key)
-        values.append(value)
-        out_key, out_value = cache.append(key, value)
+    cache.release()
 
-    torch.testing.assert_close(out_key, torch.cat(keys, dim=2))
-    torch.testing.assert_close(out_value, torch.cat(values, dim=2))
-    assert cache.length == 4
+    assert cache.length == 0
+    assert cache.block_table == []
+    assert cache.pool.free_blocks == released_blocks
+
+    out_key, _out_value = cache.append(*_kv(1, seq=2))
+    assert cache.block_table == released_blocks
+    assert cache.key_blocks.data_ptr() == key_storage_ptr
+    torch.testing.assert_close(out_key, _kv(1, seq=2)[0])
+
+
+def test_non_contiguous_block_table_gather_matches_logical_order() -> None:
+    cache = FullAttentionCache(capacity_hint=6, block_size=2)
+    first_key, first_value = _kv(0, seq=2)
+    second_key, second_value = _kv(1, seq=2)
+    third_key, third_value = _kv(2, seq=2)
+    cache.append(first_key, first_value)
+    cache.append(second_key, second_value)
+    cache.append(third_key, third_value)
+
+    cache.block_table = [2, 0, 1]
+    cache.pool.key_blocks[:, :, 2] = first_key
+    cache.pool.value_blocks[:, :, 2] = first_value
+    cache.pool.key_blocks[:, :, 0] = second_key
+    cache.pool.value_blocks[:, :, 0] = second_value
+    cache.pool.key_blocks[:, :, 1] = third_key
+    cache.pool.value_blocks[:, :, 1] = third_value
+
+    out_key, out_value = cache.as_tensors()
+
+    torch.testing.assert_close(out_key, torch.cat([first_key, second_key, third_key], dim=2))
+    torch.testing.assert_close(out_value, torch.cat([first_value, second_value, third_value], dim=2))
 
 
 def test_append_preserves_dtype_and_device() -> None:
@@ -128,20 +174,21 @@ def test_append_preserves_dtype_and_device() -> None:
     assert out_key.device == key.device
 
 
-def test_decode_state_empty_threads_hint_to_full_attention_only() -> None:
+def test_decode_state_empty_threads_hint_and_block_size_to_full_attention_only() -> None:
     mapping = _mapping(("full_attention", "linear_attention", "full_attention"))
 
-    state = DecodeState.empty(mapping, None, max_seq_len=16)
+    state = DecodeState.empty(mapping, None, max_seq_len=16, kv_block_size=4)
 
     full_caches = [layer for layer in state.layers if isinstance(layer, FullAttentionCache)]
     linear_caches = [layer for layer in state.layers if isinstance(layer, LinearAttentionCache)]
     assert len(full_caches) == 2
     assert len(linear_caches) == 1
     assert all(cache.capacity_hint == 16 for cache in full_caches)
+    assert all(cache.block_size == 4 for cache in full_caches)
     assert state.position_offset == 0
 
 
-def test_decode_state_empty_without_hint_leaves_capacity_unset() -> None:
+def test_decode_state_empty_without_hint_leaves_pool_unallocated() -> None:
     mapping = _mapping(("full_attention",))
 
     state = DecodeState.empty(mapping)
@@ -149,7 +196,28 @@ def test_decode_state_empty_without_hint_leaves_capacity_unset() -> None:
     full_cache = state.layers[0]
     assert isinstance(full_cache, FullAttentionCache)
     assert full_cache.capacity_hint is None
-    assert full_cache.key is None
+    assert full_cache.block_size == DEFAULT_KV_BLOCK_SIZE
+    assert full_cache.key_blocks is None
+
+
+def test_decode_state_release_releases_full_attention_caches_only() -> None:
+    mapping = _mapping(("full_attention", "linear_attention", "full_attention"))
+    state = DecodeState.empty(mapping, None, max_seq_len=4, kv_block_size=2)
+    for layer in state.layers:
+        if isinstance(layer, FullAttentionCache):
+            layer.append(*_kv(layer.block_size, seq=2))
+
+    state.release()
+
+    for layer in state.layers:
+        if isinstance(layer, FullAttentionCache):
+            assert layer.length == 0
+            assert layer.block_table == []
+            assert layer.pool.free_blocks == [0, 1]
+        else:
+            assert isinstance(layer, LinearAttentionCache)
+            assert layer.state is None
+            assert layer.conv_tail is None
 
 
 def test_linear_attention_cache_remains_lazily_allocated() -> None:

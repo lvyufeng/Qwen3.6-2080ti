@@ -427,6 +427,8 @@ def _execute_step(state: WorkerState, command: WorkerCommand, runtime: TpRuntime
     except Exception as exc:
         max_new_tokens = active.state.max_new_tokens if active is not None else None
         generated_tokens = len(active.state.generated_token_ids) if active is not None else 0
+        if active is not None:
+            active.state.decode_state.release()
         if state.scheduler.running_request() is not None:
             state.scheduler.fail_running(exc)
         state.active_generation = None
@@ -785,6 +787,8 @@ def _event_data(
 
 
 def _close_worker_state(state: WorkerState) -> None:
+    if state.active_generation is not None:
+        state.active_generation.state.decode_state.release()
     if state.session is not None:
         state.session.close()
     state.session = None

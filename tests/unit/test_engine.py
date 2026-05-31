@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from checkpoint import build_manifest
+from decode_state import FullAttentionCache
 from engine import EngineError, TpModelRunner, TpModelSession
 import engine
 from runtime_config import parse_runtime_config
@@ -126,6 +127,10 @@ def test_tp_model_session_steps_generation_to_completion(tmp_path: Path, monkeyp
         assert second.token_id == state.generated_token_ids[1]
 
         result = session.finish_generation(state)
+        full_cache = state.decode_state.layers[0]
+        assert isinstance(full_cache, FullAttentionCache)
+        assert full_cache.length == 0
+        assert full_cache.block_table == []
 
     assert result.prompt_tokens == 2
     assert result.max_new_tokens == 2

@@ -132,9 +132,13 @@ class TpModelSession:
 
     def generate(self, prompt: str, max_new_tokens: int) -> GenerateResult:
         state = self.start_generation(prompt, max_new_tokens)
-        while not state.completed:
-            self.step_generation(state)
-        return self.finish_generation(state)
+        try:
+            while not state.completed:
+                self.step_generation(state)
+            return self.finish_generation(state)
+        except Exception:
+            state.decode_state.release()
+            raise
 
     def start_generation(self, prompt: str, max_new_tokens: int) -> GenerationRequestState:
         import time
@@ -154,7 +158,11 @@ class TpModelSession:
         _sync_device(runtime.device)
         total_start = time.perf_counter()
         prefill_start = time.perf_counter()
-        logits = tp_decode_step_local_logits(input_ids, self.mapping, self.runtime_config, weights, runtime, decode_state)
+        try:
+            logits = tp_decode_step_local_logits(input_ids, self.mapping, self.runtime_config, weights, runtime, decode_state)
+        except Exception:
+            decode_state.release()
+            raise
         _sync_device(runtime.device)
         prefill_end = time.perf_counter()
         return GenerationRequestState(
@@ -243,6 +251,7 @@ class TpModelSession:
             text=self.tokenizer.decode(state.generated_token_ids, skip_special_tokens=False) if self.launch.rank == 0 else None,
         )
         runtime.barrier()
+        state.decode_state.release()
         return result
 
     def close(self) -> None:
