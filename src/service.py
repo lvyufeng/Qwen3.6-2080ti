@@ -9,7 +9,21 @@ from typing import Any, Iterator
 from urllib.parse import unquote, urlparse
 
 from tp_runtime import TpRuntime
-from worker import LOAD, GENERATE, POLL, STATUS, STEP, SUBMIT, SHUTDOWN, WorkerCommand, WorkerState, dispatch_protocol_command
+from worker import (
+    DEFAULT_MAX_ACTIVE_REQUESTS,
+    DEFAULT_MAX_PENDING_REQUESTS,
+    LOAD,
+    GENERATE,
+    POLL,
+    STATUS,
+    STEP,
+    STEP_MODE_COOPERATIVE,
+    SUBMIT,
+    SHUTDOWN,
+    WorkerCommand,
+    WorkerState,
+    dispatch_protocol_command,
+)
 
 
 class ServiceError(RuntimeError):
@@ -21,6 +35,9 @@ class ServiceConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     model_dir: str | None = None
+    max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS
+    max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS
+    batch_step_mode: str = STEP_MODE_COOPERATIVE
 
 
 class WorkerService:
@@ -52,6 +69,12 @@ class WorkerService:
     def shutdown(self) -> dict[str, Any]:
         return self.dispatch("shutdown", SHUTDOWN, {})
 
+    def scheduler_tick(self, request_id: str | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"mode": STEP_MODE_COOPERATIVE}
+        if request_id is not None:
+            payload["request_id"] = request_id
+        return self.dispatch(request_id, STEP, payload)
+
     def stream_generate(
         self,
         prompt: str,
@@ -67,7 +90,7 @@ class WorkerService:
                 return
             request_label = submit.get("id") if isinstance(submit.get("id"), str) else submit["data"].get("request_id")
             while True:
-                step = self.dispatch(request_label, STEP, {"request_id": request_label})
+                step = self.scheduler_tick(request_label)
                 yield step
                 if not step.get("ok", False) or _response_event_is_terminal_or_idle(step):
                     return
@@ -95,6 +118,7 @@ class WorkerService:
 
 
 def serve_worker_http(state: WorkerState, runtime: TpRuntime, config: ServiceConfig) -> None:
+    _apply_service_config_to_state(state, config)
     if runtime.config.rank != 0:
         _run_service_peer_loop(state, runtime)
         return
@@ -111,8 +135,15 @@ def serve_worker_http(state: WorkerState, runtime: TpRuntime, config: ServiceCon
 
 
 def create_worker_http_server(service: WorkerService, config: ServiceConfig) -> ThreadingHTTPServer:
+    _apply_service_config_to_state(service.state, config)
     handler = make_worker_http_handler(service)
     return ThreadingHTTPServer((config.host, config.port), handler)
+
+
+def _apply_service_config_to_state(state: WorkerState, config: ServiceConfig) -> None:
+    state.max_active_requests = config.max_active_requests
+    state.max_pending_requests = config.max_pending_requests
+    state.batch_step_mode = config.batch_step_mode
 
 
 def make_worker_http_handler(service: WorkerService) -> type[BaseHTTPRequestHandler]:

@@ -15,7 +15,14 @@ from tensor_parallel import TensorParallel
 from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_decode_step, tp_language_model
 from tp_weights import MappedWeights
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
-from worker import WorkerState, run_worker_protocol_loop
+from worker import (
+    DEFAULT_MAX_ACTIVE_REQUESTS,
+    DEFAULT_MAX_PENDING_REQUESTS,
+    STEP_MODE_COOPERATIVE,
+    STEP_MODE_LEGACY,
+    WorkerState,
+    run_worker_protocol_loop,
+)
 
 
 class CliError(RuntimeError):
@@ -568,10 +575,26 @@ def _run_tp_service(args: argparse.Namespace, model_dir: Path) -> int:
         args.tp_init_method,
         args.tp_device,
     )
-    config = ServiceConfig(host=args.tp_host, port=args.tp_port, model_dir=str(model_dir))
+    config = ServiceConfig(
+        host=args.tp_host,
+        port=args.tp_port,
+        model_dir=str(model_dir),
+        max_active_requests=args.tp_service_max_active,
+        max_pending_requests=args.tp_service_max_pending,
+        batch_step_mode=args.tp_service_batch_step_mode,
+    )
     try:
         with TpRuntime(launch) as runtime:
-            serve_worker_http(WorkerState(launch), runtime, config)
+            serve_worker_http(
+                WorkerState(
+                    launch,
+                    max_active_requests=args.tp_service_max_active,
+                    max_pending_requests=args.tp_service_max_pending,
+                    batch_step_mode=args.tp_service_batch_step_mode,
+                ),
+                runtime,
+                config,
+            )
     except (TpRuntimeError, OSError) as exc:
         raise CliError(str(exc)) from exc
     return 0
@@ -888,6 +911,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tp-host", default="127.0.0.1", help="Host interface for --tp-service.")
     parser.add_argument("--tp-port", type=int, default=8000, help="TCP port for --tp-service.")
+    parser.add_argument(
+        "--tp-service-max-active",
+        type=int,
+        default=DEFAULT_MAX_ACTIVE_REQUESTS,
+        help="Maximum active generation requests admitted by --tp-service.",
+    )
+    parser.add_argument(
+        "--tp-service-max-pending",
+        type=int,
+        default=DEFAULT_MAX_PENDING_REQUESTS,
+        help="Maximum pending generation requests queued by --tp-service.",
+    )
+    parser.add_argument(
+        "--tp-service-batch-step-mode",
+        choices=(STEP_MODE_COOPERATIVE, STEP_MODE_LEGACY),
+        default=STEP_MODE_COOPERATIVE,
+        help="Default service batch-step mode metadata; SSE streams use cooperative ticks.",
+    )
     parser.add_argument("--tp-world-size", type=int, help="TP runtime world size; defaults to WORLD_SIZE or 1.")
     parser.add_argument("--tp-rank", type=int, help="TP runtime global rank; defaults to RANK or 0.")
     parser.add_argument("--tp-local-rank", type=int, help="TP runtime local CUDA rank; defaults to LOCAL_RANK or rank.")
@@ -944,6 +985,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--tp-local-rank must be non-negative")
     if args.tp_port <= 0 or args.tp_port > 65535:
         parser.error("--tp-port must be in [1, 65535]")
+    if args.tp_service_max_active <= 0:
+        parser.error("--tp-service-max-active must be positive")
+    if args.tp_service_max_pending <= 0:
+        parser.error("--tp-service-max-pending must be positive")
     if args.inspect_tp is not None and args.inspect_tp <= 0:
         parser.error("--inspect-tp must be positive")
     try:

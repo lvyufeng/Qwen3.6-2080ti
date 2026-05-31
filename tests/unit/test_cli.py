@@ -467,6 +467,12 @@ def test_cli_tp_service_runs_http_service_without_human_stdout(
     assert config.host == "127.0.0.2"
     assert config.port == 8123
     assert config.model_dir == str(tmp_path.resolve())
+    assert config.max_active_requests == cli.DEFAULT_MAX_ACTIVE_REQUESTS
+    assert config.max_pending_requests == cli.DEFAULT_MAX_PENDING_REQUESTS
+    assert config.batch_step_mode == cli.STEP_MODE_COOPERATIVE
+    assert state.max_active_requests == cli.DEFAULT_MAX_ACTIVE_REQUESTS
+    assert state.max_pending_requests == cli.DEFAULT_MAX_PENDING_REQUESTS
+    assert state.batch_step_mode == cli.STEP_MODE_COOPERATIVE
 
     config = _runtime_config()
     text = config["text_config"]
@@ -511,6 +517,68 @@ def test_cli_tp_service_runs_http_service_without_human_stdout(
     assert "reference_decode_steps: 3" in out
     assert "reference_decode_all_finite: True" in out
     assert "reference_decode_next_tokens:" in out
+
+
+def test_cli_tp_service_passes_custom_serving_controls(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(_runtime_config()), encoding="utf-8")
+    (tmp_path / "model.safetensors").write_bytes(b"\x02\x00\x00\x00\x00\x00\x00\x00{}")
+    calls = []
+
+    def fake_service(state, runtime, config):
+        calls.append((state, runtime, config))
+        print('{"service":true}')
+
+    monkeypatch.setattr(cli, "serve_worker_http", fake_service)
+
+    rc = main(
+        [
+            "--model",
+            str(tmp_path),
+            "--prompt",
+            "unused",
+            "--max-new-tokens",
+            "1",
+            "--tp-service",
+            "--tp-service-max-active",
+            "2",
+            "--tp-service-max-pending",
+            "8",
+            "--tp-service-batch-step-mode",
+            cli.STEP_MODE_LEGACY,
+            "--tp-world-size",
+            "1",
+            "--tp-backend",
+            "gloo",
+            "--tp-device",
+            "cpu",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out == '{"service":true}\n'
+    assert len(calls) == 1
+    state, _runtime, config = calls[0]
+    assert config.max_active_requests == 2
+    assert config.max_pending_requests == 8
+    assert config.batch_step_mode == cli.STEP_MODE_LEGACY
+    assert state.max_active_requests == 2
+    assert state.max_pending_requests == 8
+    assert state.batch_step_mode == cli.STEP_MODE_LEGACY
+
+
+def test_cli_rejects_invalid_service_limits(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(_runtime_config()), encoding="utf-8")
+    (tmp_path / "model.safetensors").write_bytes(b"\x02\x00\x00\x00\x00\x00\x00\x00{}")
+
+    with pytest.raises(SystemExit):
+        main(["--model", str(tmp_path), "--prompt", "unused", "--max-new-tokens", "1", "--tp-service-max-active", "0"])
+    with pytest.raises(SystemExit):
+        main(["--model", str(tmp_path), "--prompt", "unused", "--max-new-tokens", "1", "--tp-service-max-pending", "0"])
 
 
 def test_reference_layer_defaults_to_first_full_attention_layer() -> None:

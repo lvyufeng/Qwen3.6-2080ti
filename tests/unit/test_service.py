@@ -13,7 +13,7 @@ import torch
 from service import ServiceConfig, WorkerService, create_worker_http_server
 from test_engine import _patch_tokenizer, _write_tiny_model
 from tp_runtime import TpLaunchConfig, TpRuntime
-from worker import LOAD, GENERATE, STATUS, STEP, SUBMIT, WorkerState
+from worker import LOAD, GENERATE, STATUS, STEP, SUBMIT, STEP_MODE_COOPERATIVE, WorkerState
 
 
 def test_worker_service_status_dispatches_protocol_response() -> None:
@@ -107,6 +107,81 @@ def test_worker_service_stream_generate_iterators_interleave_progress(
     assert completed_b["id"] == "b"
     assert completed_a["data"]["event"]["type"] == "completed"
     assert completed_b["data"]["event"]["type"] == "completed"
+
+
+def test_worker_service_stream_generate_cooperatively_batches_active_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    launch = TpLaunchConfig(backend="gloo", device="cpu")
+    state = WorkerState(launch)
+
+    with TpRuntime(launch) as runtime:
+        service = WorkerService(state, runtime)
+        assert service.load_model(str(tmp_path))["ok"] is True
+        assert state.session is not None
+        original_batch = state.session.step_generations_batch
+        batch_calls = 0
+
+        def counted_batch(states):
+            nonlocal batch_calls
+            batch_calls += 1
+            return original_batch(states)
+
+        monkeypatch.setattr(state.session, "step_generations_batch", counted_batch)
+
+        stream_a = service.stream_generate("first", 3, request_id="a")
+        stream_b = service.stream_generate("second", 3, request_id="b")
+
+        queued_a = next(stream_a)
+        queued_b = next(stream_b)
+        token_a = next(stream_a)
+        token_b = next(stream_b)
+
+    assert queued_a["data"]["event"]["type"] == "queued"
+    assert queued_b["data"]["event"]["type"] == "queued"
+    assert token_a["id"] == "a"
+    assert token_b["id"] == "b"
+    assert token_a["data"]["event"]["type"] == "token"
+    assert token_b["data"]["event"]["type"] == "token"
+    assert token_a["data"]["progress"]["generated_tokens"] == 1
+    assert token_b["data"]["progress"]["generated_tokens"] == 1
+    assert batch_calls == 1
+
+
+def test_worker_service_status_reflects_service_config() -> None:
+    launch = TpLaunchConfig(backend="gloo", device="cpu")
+    state = WorkerState(launch)
+    config = ServiceConfig(max_active_requests=2, max_pending_requests=7, batch_step_mode=STEP_MODE_COOPERATIVE)
+    with TpRuntime(launch) as runtime:
+        service = WorkerService(state, runtime)
+        create_worker_http_server(service, config).server_close()
+        response = service.status()
+
+    assert response["data"]["serving"]["max_active_requests"] == 2
+    assert response["data"]["serving"]["max_pending_requests"] == 7
+    assert response["data"]["serving"]["batch_step_mode"] == STEP_MODE_COOPERATIVE
+
+
+def test_worker_service_submit_rejects_full_pending_queue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    launch = TpLaunchConfig(backend="gloo", device="cpu")
+    state = WorkerState(launch, max_pending_requests=1)
+
+    with TpRuntime(launch) as runtime:
+        service = WorkerService(state, runtime)
+        assert service.load_model(str(tmp_path))["ok"] is True
+        first = service.stream_generate("first", 1, request_id="a")
+        second = service.stream_generate("second", 1, request_id="b")
+        first_submit = next(first)
+        second_submit = next(second)
+
+    assert first_submit["ok"] is True
+    assert second_submit["ok"] is False
+    assert "pending request queue is full" in second_submit["error"]
 
 
 def test_worker_http_healthz_and_status() -> None:

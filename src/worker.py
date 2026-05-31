@@ -22,6 +22,9 @@ STATUS = "STATUS"
 SHUTDOWN = "SHUTDOWN"
 
 DEFAULT_MAX_ACTIVE_REQUESTS = 4
+DEFAULT_MAX_PENDING_REQUESTS = 128
+STEP_MODE_LEGACY = "legacy"
+STEP_MODE_COOPERATIVE = "cooperative"
 
 
 class WorkerError(RuntimeError):
@@ -62,6 +65,9 @@ class WorkerState:
     active_generations: dict[str, ActiveGeneration] = field(default_factory=dict)
     round_robin_index: int = 0
     pending_events: dict[str, deque[dict[str, Any]]] = field(default_factory=dict)
+    max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS
+    max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS
+    batch_step_mode: str = STEP_MODE_LEGACY
 
     @property
     def active_generation(self) -> ActiveGeneration | None:
@@ -343,9 +349,13 @@ def _execute_generate(state: WorkerState, command: WorkerCommand, runtime: TpRun
 
 def _execute_submit(state: WorkerState, command: WorkerCommand, runtime: TpRuntime | None = None) -> WorkerResult:
     _require_loaded_session(state, runtime)
+    _validate_serving_config(state)
     prompt = _payload_str(command, "prompt")
     max_new_tokens = _payload_positive_int(command, "max_new_tokens")
     request_id = _payload_optional_str(command, "request_id")
+    snapshot_before = state.scheduler.snapshot()
+    if snapshot_before.pending >= state.max_pending_requests:
+        raise WorkerError("pending request queue is full")
     request = state.scheduler.submit_generate(prompt, max_new_tokens, request_id=request_id)
     snapshot = state.scheduler.snapshot()
     return WorkerResult(
@@ -365,6 +375,7 @@ def _execute_submit(state: WorkerState, command: WorkerCommand, runtime: TpRunti
                 is_terminal=False,
             ),
             "scheduler": _scheduler_snapshot_data(snapshot),
+            "serving": _serving_state_data(state),
         },
     )
 
@@ -392,7 +403,11 @@ def _execute_poll(state: WorkerState, command: WorkerCommand, runtime: TpRuntime
 
 def _execute_step(state: WorkerState, command: WorkerCommand, runtime: TpRuntime | None = None) -> WorkerResult:
     session = _require_loaded_session(state, runtime)
+    _validate_serving_config(state)
     request_id = _payload_optional_str(command, "request_id")
+    mode = _step_mode(state, command)
+    if mode == STEP_MODE_COOPERATIVE:
+        return _execute_cooperative_step(state, session, request_id)
 
     # Targeted STEP: check pending_events buffer first (populated by batch step)
     if request_id is not None:
@@ -406,27 +421,84 @@ def _execute_step(state: WorkerState, command: WorkerCommand, runtime: TpRuntime
 
     # Untargeted STEP with multiple active requests: batch step all
     if request_id is None and len(state.active_generations) > 1:
-        return _batch_step_active_generations(state, session)
+        result = _batch_step_active_generations(state, session)
+        assert result is not None
+        return result
 
     active = _select_active_generation(state, request_id)
     if active is None:
-        if request_id is not None and state.scheduler.is_pending(request_id):
-            data = _step_pending_data(state, request_id)
-            return WorkerResult(STEP, state.launch.rank, True, data)
-        if request_id is not None:
-            scheduled = state.scheduler.result_for(request_id)
-            if scheduled is not None:
-                data = _poll_terminal_data(request_id, scheduled)
-                data["scheduler"] = _scheduler_snapshot_data(state.scheduler.snapshot())
-                return WorkerResult(STEP, state.launch.rank, True, data)
-            data = _poll_unknown_data(request_id)
-            data["progress"] = None
-            data["timings"] = None
-            data["scheduler"] = _scheduler_snapshot_data(state.scheduler.snapshot())
-            return WorkerResult(STEP, state.launch.rank, True, data)
-        return _step_idle_response(state)
+        return _targeted_or_idle_step_response(state, request_id)
     return _step_active_generation(state, session, active)
 
+
+
+def _step_mode(state: WorkerState, command: WorkerCommand) -> str:
+    mode = command.payload.get("mode", command.payload.get("batch_step_mode"))
+    if mode is None:
+        return STEP_MODE_LEGACY
+    if not isinstance(mode, str) or mode not in (STEP_MODE_LEGACY, STEP_MODE_COOPERATIVE):
+        raise WorkerError(f"unsupported STEP mode: {mode}")
+    if mode == STEP_MODE_LEGACY:
+        return STEP_MODE_LEGACY
+    _validate_serving_config(state)
+    return mode
+
+
+def _execute_cooperative_step(state: WorkerState, session: TpModelSession, request_id: str | None) -> WorkerResult:
+    """Cooperative scheduler tick used by service streams.
+
+    A targeted stream asks for its own next event. If no event is buffered, the tick may
+    batch-step every active request, return the requested request's event, and buffer the
+    rest. Legacy STEP behavior is preserved outside this opt-in mode.
+    """
+    if request_id is not None:
+        buffered = _drain_pending_event(state, request_id)
+        if buffered is not None:
+            return WorkerResult(STEP, state.launch.rank, True, buffered)
+
+    activation_failure = _activate_pending_requests(state, session, target_request_id=None)
+    if activation_failure is not None:
+        if request_id is None or activation_failure.data.get("request_id") == request_id:
+            return activation_failure
+        failed_request_id = activation_failure.data.get("request_id")
+        if isinstance(failed_request_id, str):
+            _buffer_pending_event(state, failed_request_id, activation_failure.data)
+
+    if not state.active_generations:
+        return _targeted_or_idle_step_response(state, request_id)
+
+    if request_id is not None:
+        if request_id in state.active_generations:
+            result = _batch_step_active_generations(state, session, preferred_request_id=request_id)
+            assert result is not None
+            return result
+        if state.scheduler.is_pending(request_id):
+            _batch_step_active_generations(state, session, buffer_all=True)
+            data = _step_pending_data(state, request_id)
+            return WorkerResult(STEP, state.launch.rank, True, data)
+        return _targeted_or_idle_step_response(state, request_id)
+
+    result = _batch_step_active_generations(state, session)
+    assert result is not None
+    return result
+
+
+def _targeted_or_idle_step_response(state: WorkerState, request_id: str | None) -> WorkerResult:
+    if request_id is not None and state.scheduler.is_pending(request_id):
+        data = _step_pending_data(state, request_id)
+        return WorkerResult(STEP, state.launch.rank, True, data)
+    if request_id is not None:
+        scheduled = state.scheduler.result_for(request_id)
+        if scheduled is not None:
+            data = _poll_terminal_data(request_id, scheduled)
+            data["scheduler"] = _scheduler_snapshot_data(state.scheduler.snapshot())
+            return WorkerResult(STEP, state.launch.rank, True, data)
+        data = _poll_unknown_data(request_id)
+        data["progress"] = None
+        data["timings"] = None
+        data["scheduler"] = _scheduler_snapshot_data(state.scheduler.snapshot())
+        return WorkerResult(STEP, state.launch.rank, True, data)
+    return _step_idle_response(state)
 
 
 def _activate_pending_requests(
@@ -441,7 +513,7 @@ def _activate_pending_requests(
         and not state.scheduler.is_pending(target_request_id)
     ):
         return None
-    while len(state.active_generations) < DEFAULT_MAX_ACTIVE_REQUESTS:
+    while len(state.active_generations) < state.max_active_requests:
         try:
             request = state.scheduler.begin_next_running()
         except SchedulerError as exc:
@@ -502,20 +574,33 @@ def _step_active_generation(state: WorkerState, session: TpModelSession, active:
         )
 
 
-def _batch_step_active_generations(state: WorkerState, session: TpModelSession) -> WorkerResult:
+def _batch_step_active_generations(
+    state: WorkerState,
+    session: TpModelSession,
+    *,
+    preferred_request_id: str | None = None,
+    buffer_all: bool = False,
+) -> WorkerResult | None:
     """Step ALL active requests in one batched forward pass.
 
-    Returns the primary (round-robin selected) request's event as the response.
-    Non-primary request events are buffered in state.pending_events for later retrieval.
+    If preferred_request_id is active, return that request's event and buffer all others.
+    If buffer_all is True, buffer every event and return None.
+    Otherwise use round-robin to select the primary (legacy behavior).
     """
     ids = _active_generation_ids(state)
     if not ids:
         return _step_idle_response(state)
 
-    # Select primary via round-robin
-    primary_index = state.round_robin_index % len(ids)
-    state.round_robin_index = (primary_index + 1) % len(ids)
-    primary_id = ids[primary_index]
+    # Determine which request's event to return
+    if preferred_request_id is not None and preferred_request_id in state.active_generations:
+        primary_id = preferred_request_id
+    elif buffer_all:
+        primary_id = None
+    else:
+        # Legacy round-robin
+        primary_index = state.round_robin_index % len(ids)
+        state.round_robin_index = (primary_index + 1) % len(ids)
+        primary_id = ids[primary_index]
 
     # Collect all active states for batch step
     actives = [state.active_generations[rid] for rid in ids]
@@ -534,10 +619,11 @@ def _batch_step_active_generations(state: WorkerState, session: TpModelSession) 
         state.active_generations.clear()
         state.round_robin_index = 0
         state.pending_events.clear()
+        failure_active = next((active for active in actives if active.request_id == primary_id), actives[0])
         return _step_failed_response(
-            state, primary_id, exc,
-            max_new_tokens=actives[primary_index].state.max_new_tokens,
-            generated_tokens=len(actives[primary_index].state.generated_token_ids),
+            state, failure_active.request_id, exc,
+            max_new_tokens=failure_active.state.max_new_tokens,
+            generated_tokens=len(failure_active.state.generated_token_ids),
         )
 
     # Process each step result
@@ -567,6 +653,8 @@ def _batch_step_active_generations(state: WorkerState, session: TpModelSession) 
         _remove_active_generation(state, rid)
         # Clear pending events for completed requests (the completed event is already buffered)
 
+    if buffer_all:
+        return None
     assert primary_result is not None
     return primary_result
 
@@ -676,6 +764,7 @@ def _execute_status(state: WorkerState) -> WorkerResult:
             "active_generation": active_data,
             "active_generations": [_active_generation_data(item) for item in state.active_generations.values()],
             "scheduler": _scheduler_snapshot_data(state.scheduler.snapshot()),
+            "serving": _serving_state_data(state),
         },
     )
 
@@ -991,6 +1080,26 @@ def _scheduler_snapshot_data(snapshot: SchedulerSnapshot) -> dict[str, Any]:
         "total_completed": snapshot.total_completed,
         "total_failed": snapshot.total_failed,
     }
+
+
+def _serving_state_data(state: WorkerState) -> dict[str, Any]:
+    return {
+        "max_active_requests": state.max_active_requests,
+        "max_pending_requests": state.max_pending_requests,
+        "batch_step_mode": state.batch_step_mode,
+        "active_count": len(state.active_generations),
+        "pending_event_requests": len(state.pending_events),
+        "pending_event_count": sum(len(queue) for queue in state.pending_events.values()),
+    }
+
+
+def _validate_serving_config(state: WorkerState) -> None:
+    if state.max_active_requests <= 0:
+        raise WorkerError("max_active_requests must be positive")
+    if state.max_pending_requests <= 0:
+        raise WorkerError("max_pending_requests must be positive")
+    if state.batch_step_mode not in (STEP_MODE_LEGACY, STEP_MODE_COOPERATIVE):
+        raise WorkerError(f"unsupported batch_step_mode: {state.batch_step_mode}")
 
 
 def _event_data(

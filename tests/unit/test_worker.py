@@ -17,6 +17,7 @@ from worker import (
     POLL,
     STATUS,
     STEP,
+    STEP_MODE_COOPERATIVE,
     SUBMIT,
     SHUTDOWN,
     WorkerCommand,
@@ -1482,6 +1483,115 @@ def test_worker_batch_step_completion_removes_from_active(tmp_path: Path, monkey
     status = execute_command(state, WorkerCommand(STATUS, {}))
     assert status.data["active_generation"] is None
     assert status.data["scheduler"]["completed"] == 2
+
+
+def test_worker_cooperative_step_batches_preferred_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "first", "max_new_tokens": 3, "request_id": "a"})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "second", "max_new_tokens": 3, "request_id": "b"})).ok is True
+
+    cooperative_a = execute_command(state, WorkerCommand(STEP, {"request_id": "a", "mode": STEP_MODE_COOPERATIVE}))
+
+    assert cooperative_a.ok is True
+    assert cooperative_a.data["request_id"] == "a"
+    assert cooperative_a.data["status"] == "RUNNING"
+    assert cooperative_a.data["progress"]["generated_tokens"] == 1
+    assert "b" in state.pending_events
+
+    drain_b = execute_command(state, WorkerCommand(STEP, {"request_id": "b"}))
+    assert drain_b.ok is True
+    assert drain_b.data["request_id"] == "b"
+    assert drain_b.data["status"] == "RUNNING"
+    assert drain_b.data["progress"]["generated_tokens"] == 1
+    assert "b" not in state.pending_events
+
+
+def test_worker_cooperative_pending_request_advances_active_work(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"), max_active_requests=1)
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "first", "max_new_tokens": 2, "request_id": "a"})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "second", "max_new_tokens": 2, "request_id": "b"})).ok is True
+
+    pending_b = execute_command(state, WorkerCommand(STEP, {"request_id": "b", "mode": STEP_MODE_COOPERATIVE}))
+
+    assert pending_b.ok is True
+    assert pending_b.data["request_id"] == "b"
+    assert pending_b.data["status"] == "PENDING"
+    assert pending_b.data["scheduler"]["running_ids"] == ["a"]
+    assert "a" in state.pending_events
+
+    drain_a = execute_command(state, WorkerCommand(STEP, {"request_id": "a"}))
+    assert drain_a.data["request_id"] == "a"
+    assert drain_a.data["progress"]["generated_tokens"] == 1
+
+
+def test_worker_cooperative_completion_buffers_other_terminal_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "first", "max_new_tokens": 1, "request_id": "a"})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "second", "max_new_tokens": 1, "request_id": "b"})).ok is True
+
+    completed_a = execute_command(state, WorkerCommand(STEP, {"request_id": "a", "mode": STEP_MODE_COOPERATIVE}))
+
+    assert completed_a.ok is True
+    assert completed_a.data["request_id"] == "a"
+    assert completed_a.data["status"] == "COMPLETED"
+    assert "b" in state.pending_events
+
+    completed_b = execute_command(state, WorkerCommand(STEP, {"request_id": "b"}))
+    assert completed_b.data["request_id"] == "b"
+    assert completed_b.data["status"] == "COMPLETED"
+    assert len(state.active_generations) == 0
+    assert state.scheduler.snapshot().completed == 2
+
+
+def test_worker_submit_rejects_when_pending_queue_is_full(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"), max_pending_requests=1)
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    first = execute_command(state, WorkerCommand(SUBMIT, {"prompt": "first", "max_new_tokens": 1, "request_id": "a"}))
+    second = execute_command(state, WorkerCommand(SUBMIT, {"prompt": "second", "max_new_tokens": 1, "request_id": "b"}))
+
+    assert first.ok is True
+    assert second.ok is False
+    assert "pending request queue is full" in second.error
+    assert state.scheduler.snapshot().pending == 1
+
+
+def test_worker_status_reports_serving_controls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(
+        TpLaunchConfig(backend="gloo", device="cpu"),
+        max_active_requests=2,
+        max_pending_requests=5,
+        batch_step_mode=STEP_MODE_COOPERATIVE,
+    )
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    status = execute_command(state, WorkerCommand(STATUS, {}))
+
+    assert status.ok is True
+    assert status.data["serving"] == {
+        "max_active_requests": 2,
+        "max_pending_requests": 5,
+        "batch_step_mode": STEP_MODE_COOPERATIVE,
+        "active_count": 0,
+        "pending_event_requests": 0,
+        "pending_event_count": 0,
+    }
 
 
 def _control_data(*, rank_count: int) -> dict[str, object]:
