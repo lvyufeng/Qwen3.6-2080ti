@@ -251,6 +251,79 @@ def test_tp_model_session_zero_token_generate_still_finishes(tmp_path: Path, mon
     assert result.decode_seconds >= 0
     assert result.total_seconds >= 0
 
+
+def test_step_generations_batch_produces_same_tokens_as_sequential(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Batch step of two requests produces the same token sequence as stepping each independently."""
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    manifest = build_manifest(tmp_path)
+
+    with TpModelSession(manifest, parse_runtime_config(manifest.config), TpLaunchConfig(backend="gloo", device="cpu")) as session:
+        # Sequential: step each request independently
+        state_a_seq = session.start_generation("hello", max_new_tokens=3)
+        state_b_seq = session.start_generation("hello", max_new_tokens=3)
+        for _ in range(3):
+            session.step_generation(state_a_seq)
+        for _ in range(3):
+            session.step_generation(state_b_seq)
+
+        # Batch: step two requests together
+        state_a_batch = session.start_generation("hello", max_new_tokens=3)
+        state_b_batch = session.start_generation("hello", max_new_tokens=3)
+        for _ in range(3):
+            steps = session.step_generations_batch([state_a_batch, state_b_batch])
+            assert len(steps) == 2
+
+    # Both paths should produce the same tokens (deterministic greedy decode)
+    assert state_a_batch.generated_token_ids == state_a_seq.generated_token_ids
+    assert state_b_batch.generated_token_ids == state_b_seq.generated_token_ids
+
+
+def test_step_generations_batch_single_request_delegates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With one state, step_generations_batch delegates to step_generation."""
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    manifest = build_manifest(tmp_path)
+
+    with TpModelSession(manifest, parse_runtime_config(manifest.config), TpLaunchConfig(backend="gloo", device="cpu")) as session:
+        state_single = session.start_generation("hello", max_new_tokens=2)
+        state_batch = session.start_generation("hello", max_new_tokens=2)
+
+        # Single step_generation
+        step1 = session.step_generation(state_single)
+        step2 = session.step_generation(state_single)
+
+        # Batch with single element
+        batch_steps = []
+        batch_steps.append(session.step_generations_batch([state_batch])[0])
+        batch_steps.append(session.step_generations_batch([state_batch])[0])
+
+    assert state_single.generated_token_ids == state_batch.generated_token_ids
+    assert batch_steps[0].token_id == step1.token_id
+    assert batch_steps[1].token_id == step2.token_id
+    assert batch_steps[1].is_complete is True
+
+
+def test_step_generations_batch_handles_mixed_completion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When one request completes before another, batch step handles it correctly."""
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    manifest = build_manifest(tmp_path)
+
+    with TpModelSession(manifest, parse_runtime_config(manifest.config), TpLaunchConfig(backend="gloo", device="cpu")) as session:
+        # state_a completes after 1 token, state_b needs 3
+        state_a = session.start_generation("hello", max_new_tokens=1)
+        state_b = session.start_generation("hello", max_new_tokens=3)
+
+        steps = session.step_generations_batch([state_a, state_b])
+
+    assert steps[0].is_complete is True
+    assert steps[1].is_complete is False
+    assert state_a.completed is True
+    assert state_b.completed is False
+    assert len(state_a.generated_token_ids) == 1
+    assert len(state_b.generated_token_ids) == 1
+
 def _write_tiny_model(model_dir: Path) -> None:
     config = _runtime_config()
     text = config["text_config"]

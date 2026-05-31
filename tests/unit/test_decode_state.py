@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from decode_state import DEFAULT_KV_BLOCK_SIZE, DecodeState, FullAttentionCache, LinearAttentionCache
+from decode_state import DEFAULT_KV_BLOCK_SIZE, DecodeState, FullAttentionCache, LinearAttentionCache, batch_kv_tensors
 
 
 def _kv(step: int, *, batch: int = 1, heads: int = 2, seq: int = 1, head_dim: int = 4) -> tuple[torch.Tensor, torch.Tensor]:
@@ -225,3 +225,56 @@ def test_linear_attention_cache_remains_lazily_allocated() -> None:
 
     assert cache.state is None
     assert cache.conv_tail is None
+
+
+def test_batch_kv_tensors_pads_and_masks_different_valid_lengths() -> None:
+    """batch_kv_tensors stacks KV from caches with different fill levels."""
+    cache_a = FullAttentionCache(block_size=4)
+    cache_b = FullAttentionCache(block_size=4)
+
+    # Cache A has 3 tokens, cache B has 5 tokens
+    for step in range(3):
+        cache_a.append(*_kv(step, heads=2, head_dim=4))
+    for step in range(5):
+        cache_b.append(*_kv(step + 10, heads=2, head_dim=4))
+
+    keys, values, valid_mask = batch_kv_tensors([cache_a, cache_b])
+
+    # Shape: (2, heads=2, max_valid=5, head_dim=4)
+    assert keys.shape == (2, 2, 5, 4)
+    assert values.shape == (2, 2, 5, 4)
+    assert valid_mask.shape == (2, 5)
+
+    # Mask correctness
+    assert valid_mask[0].tolist() == [True, True, True, False, False]
+    assert valid_mask[1].tolist() == [True, True, True, True, True]
+
+    # Data correctness: cache_a's 3 tokens match
+    expected_k_a, expected_v_a = cache_a.as_tensors()
+    torch.testing.assert_close(keys[0:1, :, :3], expected_k_a)
+    torch.testing.assert_close(values[0:1, :, :3], expected_v_a)
+
+    # Padding is zero
+    assert (keys[0, :, 3:] == 0).all()
+    assert (values[0, :, 3:] == 0).all()
+
+    # Cache B's 5 tokens match
+    expected_k_b, expected_v_b = cache_b.as_tensors()
+    torch.testing.assert_close(keys[1:2, :, :5], expected_k_b)
+    torch.testing.assert_close(values[1:2, :, :5], expected_v_b)
+
+
+def test_batch_kv_tensors_single_cache() -> None:
+    """batch_kv_tensors works with a single cache (degenerate batch)."""
+    cache = FullAttentionCache(block_size=2)
+    cache.append(*_kv(0, heads=2, head_dim=4))
+    cache.append(*_kv(1, heads=2, head_dim=4))
+
+    keys, values, valid_mask = batch_kv_tensors([cache])
+
+    assert keys.shape == (1, 2, 2, 4)
+    assert valid_mask.shape == (1, 2)
+    assert valid_mask[0].tolist() == [True, True]
+    expected_k, expected_v = cache.as_tensors()
+    torch.testing.assert_close(keys[0:1], expected_k)
+    torch.testing.assert_close(values[0:1], expected_v)

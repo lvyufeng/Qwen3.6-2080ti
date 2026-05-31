@@ -9,7 +9,7 @@ from loader import TensorLoader
 from reference_ops import LinearDispatchStats
 from runtime_config import RuntimeConfig
 from tensor_parallel import TensorParallel
-from tp_runtime import TpLaunchConfig, TpRuntime, mapped_tensor_bytes, tp_decode_step_local_logits, tp_greedy_next_token
+from tp_runtime import TpLaunchConfig, TpRuntime, mapped_tensor_bytes, tp_decode_step_batch, tp_decode_step_local_logits, tp_greedy_next_token
 from tp_weights import MappedWeightStats, MappedWeights
 from weight_mapping import build_language_model_mapping
 
@@ -213,6 +213,99 @@ class TpModelSession:
             total_seconds=_elapsed_seconds(state.total_start, decode_end),
             is_complete=state.completed,
         )
+
+    def step_generations_batch(self, states: list[GenerationRequestState]) -> list[GenerationStep]:
+        """Advance multiple active requests in a single batched forward pass.
+
+        Each state must have completed prefill (has logits from the last step).
+        Returns one GenerationStep per state, same as step_generation would.
+        Falls back to sequential step_generation for single-request case.
+        """
+        import time
+
+        import torch
+
+        if not states:
+            return []
+        if len(states) == 1:
+            return [self.step_generation(states[0])]
+
+        runtime, weights, _load_stats = self._require_loaded_components()
+
+        # Validate all states are steppable
+        for state in states:
+            if state.completed:
+                raise EngineError("TP generation request is already complete")
+
+        # Initialize decode timing for states that haven't started decoding
+        now = time.perf_counter()
+        for state in states:
+            if state.decode_start is None:
+                state.decode_start = now
+
+        # Step 1: Extract next token for each state from their current logits
+        # Each state.logits is (1, seq, vocab_local) — take last position
+        next_tokens = []
+        step_finites = []
+        for state in states:
+            last_logits = state.logits[:, -1].float()
+            step_finite = bool(torch.isfinite(last_logits).all().item())
+            step_finites.append(step_finite)
+            next_token = tp_greedy_next_token(state.logits, self.mapping.lm_head, runtime)
+            next_token = _sync_next_token(next_token, runtime)
+            next_tokens.append(next_token)
+
+        # Step 2: Stack tokens into (B, 1) and run batched decode
+        input_ids = torch.stack(next_tokens, dim=0)  # (B,) -> need (B, 1)
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(1)
+
+        # Determine which states need a forward pass (not completing this step)
+        needs_forward = []
+        for i, state in enumerate(states):
+            token_id = int(next_tokens[i].item())
+            state.generated_token_ids.append(token_id)
+            state.step_all_finite.append(step_finites[i])
+            if len(state.generated_token_ids) >= state.max_new_tokens:
+                state.completed = True
+                needs_forward.append(False)
+            else:
+                needs_forward.append(True)
+
+        # Run batched forward pass only for states that need new logits
+        forward_indices = [i for i, need in enumerate(needs_forward) if need]
+        if forward_indices:
+            forward_ids = input_ids[forward_indices]  # (F, 1)
+            forward_states = [states[i].decode_state for i in forward_indices]
+            batch_logits = tp_decode_step_batch(
+                forward_ids, self.mapping, self.runtime_config, weights, runtime, forward_states
+            )
+            # Split logits back to per-state
+            for idx_in_batch, state_idx in enumerate(forward_indices):
+                states[state_idx].logits = batch_logits[idx_in_batch: idx_in_batch + 1]
+        else:
+            # All states completed — still need to advance decode states for completed ones
+            # (they don't need new logits but their caches are already consistent)
+            pass
+
+        _sync_device(runtime.device)
+        decode_end = time.perf_counter()
+
+        # Build GenerationStep results
+        results = []
+        for i, state in enumerate(states):
+            state.decode_seconds = _elapsed_seconds(state.decode_start, decode_end)
+            step_index = len(state.generated_token_ids) - 1
+            results.append(GenerationStep(
+                index=step_index,
+                token_id=state.generated_token_ids[-1],
+                all_finite=step_finites[i],
+                prefill_seconds=state.prefill_seconds,
+                decode_seconds=state.decode_seconds,
+                total_seconds=_elapsed_seconds(state.total_start, decode_end),
+                is_complete=state.completed,
+            ))
+        return results
 
     def finish_generation(self, state: GenerationRequestState) -> GenerateResult:
         import time

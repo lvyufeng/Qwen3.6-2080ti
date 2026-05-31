@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 from reference_ops import (
     ReferenceWeights,
@@ -15,7 +15,7 @@ from reference_ops import (
     silu_mul,
     topk_route,
 )
-from decode_state import DecodeState, FullAttentionCache, LinearAttentionCache
+from decode_state import DecodeState, FullAttentionCache, LinearAttentionCache, batch_kv_tensors
 from runtime_config import RuntimeConfig
 from weight_mapping import LanguageModelMapping, LayerMapping, LinearTensor, MoEMapping, ShardedTensor
 
@@ -229,6 +229,49 @@ def tp_decode_step_local_logits(
     return logits
 
 
+def tp_decode_step_batch(
+    input_ids: Any,
+    mapping: LanguageModelMapping,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    states: Sequence[DecodeState],
+) -> Any:
+    """Batched decode step: input_ids (B, 1), one DecodeState per row.
+
+    Runs a single forward pass for all B requests. Each request has its own
+    position_offset and KV caches at potentially different fill levels.
+    Returns local logits (B, 1, vocab_local).
+    """
+    import torch
+
+    batch = len(states)
+    if batch == 0:
+        raise TpRuntimeError("tp_decode_step_batch requires at least one state")
+    if batch == 1:
+        # Single-request fast path: delegate to avoid overhead
+        logits = tp_decode_step_local_logits(input_ids, mapping, config, weights, runtime, states[0])
+        return logits
+
+    hidden_states = tp_embedding(input_ids, mapping, weights, runtime)
+    position_offsets = torch.tensor(
+        [s.position_offset for s in states], device=hidden_states.device, dtype=torch.long
+    )
+
+    for layer_idx, layer in enumerate(mapping.layers):
+        caches = [states[r].layers[layer_idx] for r in range(batch)]
+        hidden_states = _tp_decoder_layer_batch(
+            hidden_states, layer, config, weights, runtime,
+            caches=caches, position_offsets=position_offsets,
+        )
+
+    hidden_states = rms_norm(hidden_states, weights.tensor(mapping.final_norm), config.rms_norm_eps)
+    logits = weights.linear(hidden_states, LinearTensor(weight=mapping.lm_head, scale=None))
+    for s in states:
+        s.advance(1)
+    return logits
+
+
 def tp_local_argmax(logits: Any, lm_head: ShardedTensor) -> tuple[Any, Any]:
     import torch
 
@@ -397,6 +440,207 @@ def _mapped_tensor_infos(mapping: LanguageModelMapping):
                 if linear_tensor.scale is not None:
                     tensors.append(linear_tensor.scale)
     return tensors
+
+
+def _tp_decoder_layer_batch(
+    hidden_states: Any,
+    mapping: LayerMapping,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    *,
+    caches: list[FullAttentionCache | LinearAttentionCache],
+    position_offsets: Any,
+) -> Any:
+    """Batched decoder layer: hidden_states (B, 1, D), per-row caches and positions."""
+    residual = hidden_states
+    hidden_states = rms_norm(hidden_states, weights.tensor(mapping.input_layernorm), config.rms_norm_eps)
+    if mapping.layer_type == "full_attention":
+        hidden_states = residual + _tp_full_attention_batch(
+            hidden_states, mapping.attention, config, weights, runtime,
+            caches=caches, position_offsets=position_offsets,
+        )
+    elif mapping.layer_type == "linear_attention":
+        hidden_states = residual + _tp_linear_attention_batch(
+            hidden_states, mapping.attention, config, weights, runtime,
+            caches=caches,
+        )
+    else:
+        raise ValueError(f"unsupported TP layer type: {mapping.layer_type}")
+    residual = hidden_states
+    hidden_states = rms_norm(hidden_states, weights.tensor(mapping.post_attention_layernorm), config.rms_norm_eps)
+    return residual + tp_moe(hidden_states, mapping.mlp, config, weights, runtime)
+
+
+def _tp_full_attention_batch(
+    hidden_states: Any,
+    mapping: Any,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    *,
+    caches: list[FullAttentionCache],
+    position_offsets: Any,
+) -> Any:
+    """Batched full attention for decode: hidden_states (B, 1, D), per-row KV caches."""
+    import torch
+
+    batch, seq_len, _ = hidden_states.shape  # seq_len == 1 for decode
+    full = config.full_attention
+    local_heads = full.num_heads // runtime.config.world_size
+
+    # Projections — shared computation across batch
+    q_proj = weights.linear(hidden_states, mapping.q_proj).view(batch, seq_len, local_heads, full.head_dim * 2)
+    query, gate = q_proj.chunk(2, dim=-1)
+    gate = gate.reshape(batch, seq_len, local_heads * full.head_dim)
+    key = weights.linear(hidden_states, mapping.k_proj).view(batch, seq_len, full.num_key_value_heads, full.head_dim)
+    value = weights.linear(hidden_states, mapping.v_proj).view(batch, seq_len, full.num_key_value_heads, full.head_dim)
+    query = rms_norm(query, weights.tensor(mapping.q_norm), config.rms_norm_eps).transpose(1, 2)
+    key = rms_norm(key, weights.tensor(mapping.k_norm), config.rms_norm_eps).transpose(1, 2)
+    value = value.transpose(1, 2)
+
+    # Per-row rotary positions: position_offsets is (B,), seq_len=1
+    positions = position_offsets.unsqueeze(1)  # (B, 1)
+    cos, sin = rotary_embeddings(positions, config, device=hidden_states.device, dtype=query.dtype)
+    query, key = apply_rotary_pos_emb(query, key, cos, sin)
+
+    # KV head repeat and TP shard selection
+    key = _repeat_kv(key, full.num_heads // full.num_key_value_heads)
+    value = _repeat_kv(value, full.num_heads // full.num_key_value_heads)
+    head_start = runtime.config.rank * local_heads
+    key = key[:, head_start: head_start + local_heads]
+    value = value[:, head_start: head_start + local_heads]
+
+    # Per-request cache append: each row has batch=1 in its cache
+    # key/value are (B, local_heads, 1, head_dim) — split per row
+    for r in range(batch):
+        caches[r].append(key[r: r + 1], value[r: r + 1])
+
+    # Gather KV across requests with padding
+    batched_keys, batched_values, valid_mask = batch_kv_tensors(caches)
+    # batched_keys: (B, local_heads, max_valid, head_dim)
+    # valid_mask: (B, max_valid)
+
+    # Attention scores
+    scores = torch.matmul(query.float(), batched_keys.float().transpose(2, 3)) * (full.head_dim ** -0.5)
+    # scores: (B, local_heads, 1, max_valid)
+
+    # Causal mask: for decode (seq_len=1), query position is position_offsets[r].
+    # Key positions are 0..max_valid-1. Mask where key_pos > query_pos OR not valid.
+    max_valid = batched_keys.shape[2]
+    key_positions = torch.arange(max_valid, device=hidden_states.device)  # (max_valid,)
+    query_pos = position_offsets.unsqueeze(1)  # (B, 1)
+    causal_mask = key_positions.unsqueeze(0) > query_pos  # (B, max_valid)
+    padding_mask = ~valid_mask  # (B, max_valid)
+    combined_mask = (causal_mask | padding_mask).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, max_valid)
+    scores = scores.masked_fill(combined_mask, torch.finfo(scores.dtype).min)
+
+    probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    out = torch.matmul(probs, batched_values).transpose(1, 2).reshape(batch, seq_len, local_heads * full.head_dim)
+    out = out * torch.sigmoid(gate)
+    partial = weights.linear(out, mapping.o_proj).to(hidden_states.dtype)
+    return runtime.all_reduce_sum(partial)
+
+
+def _tp_linear_attention_batch(
+    hidden_states: Any,
+    mapping: Any,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    *,
+    caches: list[LinearAttentionCache],
+) -> Any:
+    """Batched linear attention: stack per-request recurrent state, run, scatter back."""
+    import torch
+    import torch.nn.functional as F
+
+    batch, seq_len, _ = hidden_states.shape
+    linear_cfg = config.linear_attention
+    world = runtime.config.world_size
+    local_key_heads = linear_cfg.key_heads // world
+    local_value_heads = linear_cfg.value_heads // world
+    local_key_dim = local_key_heads * linear_cfg.key_head_dim
+    local_value_dim = local_value_heads * linear_cfg.value_head_dim
+    local_qkv_dim = local_key_dim * 2 + local_value_dim
+
+    mixed_qkv = weights.linear(hidden_states, mapping.in_proj_qkv).transpose(1, 2)
+    conv_weight = weights.tensor(mapping.conv1d_weight).float()
+    kernel = linear_cfg.conv_kernel_dim
+    conv_input = mixed_qkv.float()
+
+    # Per-request conv tail handling: stack tails into batch, run conv, scatter back
+    # Each cache has conv_tail (1, local_qkv_dim, kernel-1) or None
+    for r in range(batch):
+        cache = caches[r]
+        if cache.conv_tail is None:
+            cache.conv_tail = torch.zeros(
+                1, local_qkv_dim, kernel - 1, device=conv_input.device, dtype=torch.float32
+            )
+
+    # Stack conv tails: (B, local_qkv_dim, kernel-1)
+    stacked_tails = torch.cat([cache.conv_tail for cache in caches], dim=0)
+    padded = torch.cat((stacked_tails, conv_input), dim=2)
+
+    # Update conv tails
+    for r in range(batch):
+        caches[r].conv_tail = padded[r: r + 1, :, -(kernel - 1):] if kernel > 1 else caches[r].conv_tail
+
+    mixed_qkv = F.conv1d(padded, conv_weight, padding=0, groups=local_qkv_dim)
+    mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)
+
+    query, key, value = torch.split(mixed_qkv, [local_key_dim, local_key_dim, local_value_dim], dim=-1)
+    query = query.reshape(batch, seq_len, local_key_heads, linear_cfg.key_head_dim)
+    key = key.reshape(batch, seq_len, local_key_heads, linear_cfg.key_head_dim)
+    value = value.reshape(batch, seq_len, local_value_heads, linear_cfg.value_head_dim)
+
+    beta = torch.sigmoid(weights.linear(hidden_states, mapping.in_proj_b))
+    a = weights.linear(hidden_states, mapping.in_proj_a)
+    a_log = weights.tensor(mapping.a_log).float()
+    dt_bias = weights.tensor(mapping.dt_bias).float()
+    g = -a_log.exp() * F.softplus(a.float() + dt_bias)
+
+    repeats = local_value_heads // local_key_heads
+    if repeats > 1:
+        query = query.repeat_interleave(repeats, dim=2)
+        key = key.repeat_interleave(repeats, dim=2)
+
+    # Stack recurrent states: each cache.state is (1, heads, key_dim, value_dim) or None
+    initial_states = []
+    for cache in caches:
+        initial_states.append(cache.state)
+
+    # If all None, pass None; otherwise stack with zeros for None entries
+    if all(s is None for s in initial_states):
+        stacked_initial = None
+    else:
+        parts = []
+        for s in initial_states:
+            if s is None:
+                parts.append(torch.zeros(
+                    1, local_value_heads, linear_cfg.key_head_dim, linear_cfg.value_head_dim,
+                    device=hidden_states.device, dtype=torch.float32,
+                ))
+            else:
+                parts.append(s)
+        stacked_initial = torch.cat(parts, dim=0)
+
+    core = _recurrent_gated_delta_rule(
+        query, key, value, g, beta,
+        initial_state=stacked_initial, return_state=True,
+    )
+    core, new_state = core
+
+    # Scatter state back to per-request caches
+    for r in range(batch):
+        caches[r].state = new_state[r: r + 1]
+
+    core = core.reshape(-1, linear_cfg.value_head_dim)
+    z = weights.linear(hidden_states, mapping.in_proj_z).reshape(-1, linear_cfg.value_head_dim)
+    core = gated_rms_norm(core, weights.tensor(mapping.norm), z, config.rms_norm_eps)
+    core = core.reshape(batch, seq_len, local_value_dim)
+    partial = weights.linear(core, mapping.out_proj).to(hidden_states.dtype)
+    return runtime.all_reduce_sum(partial)
 
 
 def _repeat_kv(hidden_states: Any, repeats: int) -> Any:

@@ -541,12 +541,19 @@ def test_worker_untargeted_step_round_robins_active_requests(tmp_path: Path, mon
     assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "first", "max_new_tokens": 3, "request_id": "a"})).ok is True
     assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "second", "max_new_tokens": 3, "request_id": "b"})).ok is True
 
-    steps = [execute_command(state, WorkerCommand(STEP, {})) for _ in range(4)]
+    # With batch stepping, untargeted STEP advances ALL active requests and returns
+    # the primary (round-robin selected) request's event. The other request's event
+    # is buffered for later retrieval via targeted STEP.
+    step1 = execute_command(state, WorkerCommand(STEP, {}))
+    step2 = execute_command(state, WorkerCommand(STEP, {}))
 
-    assert [step.data["request_id"] for step in steps] == ["a", "b", "a", "b"]
-    assert [step.data["status"] for step in steps] == ["RUNNING", "RUNNING", "RUNNING", "RUNNING"]
-    assert steps[0].data["scheduler"]["running_count"] == 2
-    assert steps[0].data["scheduler"]["running_ids"] == ["a", "b"]
+    # Round-robin: step1 primary is "a", step2 primary is "b"
+    assert step1.data["request_id"] == "a"
+    assert step2.data["request_id"] == "b"
+    assert step1.data["status"] == "RUNNING"
+    assert step2.data["status"] == "RUNNING"
+    assert step1.data["scheduler"]["running_count"] == 2
+    assert step1.data["scheduler"]["running_ids"] == ["a", "b"]
 
 
 def test_worker_load_reload_clears_active_stepped_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1371,6 +1378,110 @@ def _assert_event(
         "token_ids": token_ids,
         "is_terminal": is_terminal,
     }
+
+
+def test_worker_untargeted_step_batch_advances_all_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Untargeted STEP with multiple active requests uses batch step.
+
+    The primary (round-robin) request gets its event in the response.
+    The other request's event is buffered and returned by a subsequent targeted STEP.
+    """
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "first", "max_new_tokens": 3, "request_id": "a"})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "second", "max_new_tokens": 3, "request_id": "b"})).ok is True
+
+    # Untargeted STEP: batch steps both, returns primary (round-robin index 0 = "a")
+    batch_result = execute_command(state, WorkerCommand(STEP, {}))
+
+    assert batch_result.ok is True
+    assert batch_result.data["request_id"] == "a"
+    assert batch_result.data["status"] == "RUNNING"
+    assert batch_result.data["event"]["type"] == "token"
+    assert batch_result.data["progress"]["generated_tokens"] == 1
+
+    # "b" should have a buffered event from the batch step
+    assert "b" in state.pending_events
+    targeted_b = execute_command(state, WorkerCommand(STEP, {"request_id": "b"}))
+    assert targeted_b.ok is True
+    assert targeted_b.data["request_id"] == "b"
+    assert targeted_b.data["status"] == "RUNNING"
+    assert targeted_b.data["event"]["type"] == "token"
+    assert targeted_b.data["progress"]["generated_tokens"] == 1
+
+    # After draining, no more buffered events for "b"
+    assert "b" not in state.pending_events
+
+
+def test_worker_pending_events_drained_by_targeted_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Multiple batch steps buffer multiple events; targeted STEP drains them in order."""
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "first", "max_new_tokens": 3, "request_id": "a"})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "second", "max_new_tokens": 3, "request_id": "b"})).ok is True
+
+    # Two untargeted STEPs: each batch-steps both requests
+    step1 = execute_command(state, WorkerCommand(STEP, {}))
+    step2 = execute_command(state, WorkerCommand(STEP, {}))
+
+    # Primary alternates: step1 returns "a", step2 returns "b"
+    assert step1.data["request_id"] == "a"
+    assert step2.data["request_id"] == "b"
+
+    # "b" has one buffered event from step1, "a" has one from step2
+    drain_b = execute_command(state, WorkerCommand(STEP, {"request_id": "b"}))
+    drain_a = execute_command(state, WorkerCommand(STEP, {"request_id": "a"}))
+
+    assert drain_b.ok is True
+    assert drain_b.data["request_id"] == "b"
+    assert drain_b.data["progress"]["generated_tokens"] == 1
+
+    assert drain_a.ok is True
+    assert drain_a.data["request_id"] == "a"
+    assert drain_a.data["progress"]["generated_tokens"] == 2
+
+
+def test_worker_batch_step_completion_removes_from_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When batch step completes a request, it's removed from active and its completed event is buffered."""
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    # "a" needs 2 tokens, "b" needs 2 tokens
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "first", "max_new_tokens": 2, "request_id": "a"})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "second", "max_new_tokens": 2, "request_id": "b"})).ok is True
+
+    # First untargeted STEP: batch steps both (1 token each), primary = "a"
+    step1 = execute_command(state, WorkerCommand(STEP, {}))
+    assert step1.data["request_id"] == "a"
+    assert step1.data["status"] == "RUNNING"
+
+    # Drain "b"'s buffered event
+    drain_b1 = execute_command(state, WorkerCommand(STEP, {"request_id": "b"}))
+    assert drain_b1.data["status"] == "RUNNING"
+
+    # Second untargeted STEP: batch steps both (2nd token each = completion), primary = "b"
+    step2 = execute_command(state, WorkerCommand(STEP, {}))
+    assert step2.data["request_id"] == "b"
+    assert step2.data["status"] == "COMPLETED"
+
+    # "a"'s completed event should be buffered
+    drain_a = execute_command(state, WorkerCommand(STEP, {"request_id": "a"}))
+    assert drain_a.data["request_id"] == "a"
+    assert drain_a.data["status"] == "COMPLETED"
+
+    # Both removed from active
+    assert len(state.active_generations) == 0
+    status = execute_command(state, WorkerCommand(STATUS, {}))
+    assert status.data["active_generation"] is None
+    assert status.data["scheduler"]["completed"] == 2
 
 
 def _control_data(*, rank_count: int) -> dict[str, object]:

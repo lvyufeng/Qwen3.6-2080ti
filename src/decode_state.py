@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 from runtime_config import RuntimeConfig
 from weight_mapping import LanguageModelMapping
@@ -251,3 +251,47 @@ class DecodeState:
         for layer in self.layers:
             if isinstance(layer, FullAttentionCache):
                 layer.release()
+
+
+def batch_kv_tensors(caches: Sequence[FullAttentionCache]) -> tuple[Any, Any, Any]:
+    """Stack KV from multiple per-request caches, padding to max valid length.
+
+    Each cache has batch=1. Returns:
+      keys:       (B, heads, max_valid, head_dim)
+      values:     (B, heads, max_valid, head_dim)
+      valid_mask: (B, max_valid) bool — True for valid positions
+    """
+    import torch
+
+    if not caches:
+        raise ValueError("batch_kv_tensors requires at least one cache")
+    valids = [cache.valid for cache in caches]
+    max_valid = max(valids)
+    if max_valid == 0:
+        raise ValueError("batch_kv_tensors requires at least one non-empty cache")
+
+    # Get shape info from first cache
+    first_k, first_v = caches[0].as_tensors()
+    # first_k shape: (1, heads, valid_0, head_dim)
+    heads = first_k.shape[1]
+    head_dim = first_k.shape[3]
+    device = first_k.device
+    dtype = first_k.dtype
+    batch = len(caches)
+
+    keys = torch.zeros(batch, heads, max_valid, head_dim, device=device, dtype=dtype)
+    values = torch.zeros(batch, heads, max_valid, head_dim, device=device, dtype=dtype)
+    valid_mask = torch.zeros(batch, max_valid, device=device, dtype=torch.bool)
+
+    for i, cache in enumerate(caches):
+        v = cache.valid
+        if i == 0:
+            k_i, v_i = first_k, first_v
+        else:
+            k_i, v_i = cache.as_tensors()
+        # k_i shape: (1, heads, valid_i, head_dim)
+        keys[i : i + 1, :, :v] = k_i
+        values[i : i + 1, :, :v] = v_i
+        valid_mask[i, :v] = True
+
+    return keys, values, valid_mask

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, TextIO, cast
@@ -60,6 +61,7 @@ class WorkerState:
     scheduler: RequestScheduler = field(default_factory=RequestScheduler)
     active_generations: dict[str, ActiveGeneration] = field(default_factory=dict)
     round_robin_index: int = 0
+    pending_events: dict[str, deque[dict[str, Any]]] = field(default_factory=dict)
 
     @property
     def active_generation(self) -> ActiveGeneration | None:
@@ -391,9 +393,21 @@ def _execute_poll(state: WorkerState, command: WorkerCommand, runtime: TpRuntime
 def _execute_step(state: WorkerState, command: WorkerCommand, runtime: TpRuntime | None = None) -> WorkerResult:
     session = _require_loaded_session(state, runtime)
     request_id = _payload_optional_str(command, "request_id")
+
+    # Targeted STEP: check pending_events buffer first (populated by batch step)
+    if request_id is not None:
+        buffered = _drain_pending_event(state, request_id)
+        if buffered is not None:
+            return WorkerResult(STEP, state.launch.rank, True, buffered)
+
     activation_failure = _activate_pending_requests(state, session, target_request_id=request_id)
     if activation_failure is not None:
         return activation_failure
+
+    # Untargeted STEP with multiple active requests: batch step all
+    if request_id is None and len(state.active_generations) > 1:
+        return _batch_step_active_generations(state, session)
+
     active = _select_active_generation(state, request_id)
     if active is None:
         if request_id is not None and state.scheduler.is_pending(request_id):
@@ -486,6 +500,93 @@ def _step_active_generation(state: WorkerState, session: TpModelSession, active:
             max_new_tokens=max_new_tokens,
             generated_tokens=generated_tokens,
         )
+
+
+def _batch_step_active_generations(state: WorkerState, session: TpModelSession) -> WorkerResult:
+    """Step ALL active requests in one batched forward pass.
+
+    Returns the primary (round-robin selected) request's event as the response.
+    Non-primary request events are buffered in state.pending_events for later retrieval.
+    """
+    ids = _active_generation_ids(state)
+    if not ids:
+        return _step_idle_response(state)
+
+    # Select primary via round-robin
+    primary_index = state.round_robin_index % len(ids)
+    state.round_robin_index = (primary_index + 1) % len(ids)
+    primary_id = ids[primary_index]
+
+    # Collect all active states for batch step
+    actives = [state.active_generations[rid] for rid in ids]
+    active_states = [active.state for active in actives]
+
+    try:
+        steps = session.step_generations_batch(active_states)
+    except Exception as exc:
+        # On batch failure, fail all active requests
+        for active in actives:
+            max_new_tokens = active.state.max_new_tokens
+            generated_tokens = len(active.state.generated_token_ids)
+            active.state.decode_state.release()
+            if state.scheduler.running_request(active.request_id) is not None:
+                state.scheduler.fail_request(active.request_id, exc)
+        state.active_generations.clear()
+        state.round_robin_index = 0
+        state.pending_events.clear()
+        return _step_failed_response(
+            state, primary_id, exc,
+            max_new_tokens=actives[primary_index].state.max_new_tokens,
+            generated_tokens=len(actives[primary_index].state.generated_token_ids),
+        )
+
+    # Process each step result
+    primary_result: WorkerResult | None = None
+    completed_ids: list[str] = []
+
+    for i, (active, step) in enumerate(zip(actives, steps)):
+        active.last_step = step
+        if step.is_complete:
+            result = session.finish_generation(active.state)
+            scheduled = state.scheduler.complete_request(active.request_id, result)
+            data = _step_completed_data(state, active, result, scheduled)
+            completed_ids.append(active.request_id)
+            if active.request_id == primary_id:
+                primary_result = WorkerResult(STEP, state.launch.rank, True, data)
+            else:
+                _buffer_pending_event(state, active.request_id, data)
+        else:
+            data = _step_running_data(state, active, event_type="token")
+            if active.request_id == primary_id:
+                primary_result = WorkerResult(STEP, state.launch.rank, True, data)
+            else:
+                _buffer_pending_event(state, active.request_id, data)
+
+    # Remove completed generations
+    for rid in completed_ids:
+        _remove_active_generation(state, rid)
+        # Clear pending events for completed requests (the completed event is already buffered)
+
+    assert primary_result is not None
+    return primary_result
+
+
+def _drain_pending_event(state: WorkerState, request_id: str) -> dict[str, Any] | None:
+    """Pop and return the next buffered event for request_id, or None."""
+    queue = state.pending_events.get(request_id)
+    if queue is None or not queue:
+        return None
+    data = queue.popleft()
+    if not queue:
+        del state.pending_events[request_id]
+    return data
+
+
+def _buffer_pending_event(state: WorkerState, request_id: str, data: dict[str, Any]) -> None:
+    """Buffer an event for later retrieval by targeted STEP or POLL."""
+    if request_id not in state.pending_events:
+        state.pending_events[request_id] = deque()
+    state.pending_events[request_id].append(data)
 
 
 def _remove_active_generation(state: WorkerState, request_id: str) -> None:
@@ -916,6 +1017,7 @@ def _close_worker_state(state: WorkerState) -> None:
         active.state.decode_state.release()
     state.active_generations.clear()
     state.round_robin_index = 0
+    state.pending_events.clear()
     if state.session is not None:
         state.session.close()
     state.session = None
