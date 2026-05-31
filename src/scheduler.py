@@ -58,6 +58,7 @@ class RequestScheduler:
         self.clock = time.perf_counter if clock is None else clock
         self._pending: deque[GenerateRequest] = deque()
         self._running: GenerateRequest | None = None
+        self._running_started_at: float | None = None
         self._completed: deque[ScheduledResult[object]] = deque()
         self._failed: deque[ScheduledResult[object]] = deque()
         self._result_by_id: dict[str, ScheduledResult[object]] = {}
@@ -85,7 +86,7 @@ class RequestScheduler:
         self._total_submitted += 1
         return request
 
-    def run_next(self, executor: Callable[[GenerateRequest], T], *, reraise: bool = True) -> ScheduledResult[T]:
+    def begin_next(self) -> GenerateRequest:
         if self._running is not None:
             raise SchedulerError(f"request is already running: {self._running.request_id}")
         try:
@@ -93,37 +94,52 @@ class RequestScheduler:
         except IndexError as exc:
             raise SchedulerError("no pending request to run") from exc
         self._running = request
-        start = self.clock()
+        self._running_started_at = self.clock()
+        return request
+
+    def running_request(self) -> GenerateRequest | None:
+        return self._running
+
+    def complete_running(self, result: T) -> ScheduledResult[T]:
+        request, started_at = self._require_running()
+        end = self.clock()
+        scheduled = ScheduledResult(
+            request_id=request.request_id,
+            status=RequestStatus.COMPLETED,
+            result=result,
+            error=None,
+            queued_seconds=_elapsed_seconds(request.created_at, started_at),
+            run_seconds=_elapsed_seconds(started_at, end),
+        )
+        self._record_terminal(cast(ScheduledResult[object], scheduled))
+        self._clear_running()
+        return scheduled
+
+    def fail_running(self, error: BaseException | str) -> ScheduledResult[object]:
+        request, started_at = self._require_running()
+        end = self.clock()
+        scheduled = ScheduledResult(
+            request_id=request.request_id,
+            status=RequestStatus.FAILED,
+            result=None,
+            error=str(error),
+            queued_seconds=_elapsed_seconds(request.created_at, started_at),
+            run_seconds=_elapsed_seconds(started_at, end),
+        )
+        self._record_terminal(scheduled)
+        self._clear_running()
+        return scheduled
+
+    def run_next(self, executor: Callable[[GenerateRequest], T], *, reraise: bool = True) -> ScheduledResult[T]:
+        request = self.begin_next()
         try:
             value = executor(request)
         except Exception as exc:
-            end = self.clock()
-            scheduled = ScheduledResult(
-                request_id=request.request_id,
-                status=RequestStatus.FAILED,
-                result=None,
-                error=str(exc),
-                queued_seconds=_elapsed_seconds(request.created_at, start),
-                run_seconds=_elapsed_seconds(start, end),
-            )
-            self._record_terminal(cast(ScheduledResult[object], scheduled))
+            scheduled = self.fail_running(exc)
             if reraise:
                 raise
-            return scheduled
-        else:
-            end = self.clock()
-            scheduled = ScheduledResult(
-                request_id=request.request_id,
-                status=RequestStatus.COMPLETED,
-                result=value,
-                error=None,
-                queued_seconds=_elapsed_seconds(request.created_at, start),
-                run_seconds=_elapsed_seconds(start, end),
-            )
-            self._record_terminal(cast(ScheduledResult[object], scheduled))
-            return scheduled
-        finally:
-            self._running = None
+            return cast(ScheduledResult[T], scheduled)
+        return self.complete_running(value)
 
     def run_blocking_generate(
         self,
@@ -149,7 +165,7 @@ class RequestScheduler:
 
     def clear(self) -> None:
         self._pending.clear()
-        self._running = None
+        self._clear_running()
         self._completed.clear()
         self._failed.clear()
         self._result_by_id.clear()
@@ -193,6 +209,17 @@ class RequestScheduler:
             self._trim_history(self._failed)
             return
         raise SchedulerError(f"unexpected terminal status: {scheduled.status}")
+
+    def _require_running(self) -> tuple[GenerateRequest, float]:
+        request = self._running
+        started_at = self._running_started_at
+        if request is None or started_at is None:
+            raise SchedulerError("no running request to complete")
+        return request, started_at
+
+    def _clear_running(self) -> None:
+        self._running = None
+        self._running_started_at = None
 
     def _trim_history(self, history: deque[ScheduledResult[object]]) -> None:
         while len(history) > self.max_history:

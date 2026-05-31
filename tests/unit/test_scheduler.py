@@ -181,3 +181,88 @@ def test_scheduler_is_pending_tracks_pending_only() -> None:
 
     assert scheduler.is_pending("pending") is False
     assert scheduler.result_for("pending") == result
+
+
+def test_scheduler_begin_next_claims_fifo_head() -> None:
+    scheduler = RequestScheduler(clock=FakeClock())
+    first = scheduler.submit_generate("first", 1)
+    scheduler.submit_generate("second", 1)
+
+    running = scheduler.begin_next()
+
+    assert running == first
+    assert scheduler.running_request() == first
+    snapshot = scheduler.snapshot()
+    assert snapshot.pending == 1
+    assert snapshot.running == "gen-1"
+
+
+def test_scheduler_complete_running_records_terminal_result() -> None:
+    scheduler = RequestScheduler(clock=FakeClock())
+    request = scheduler.submit_generate("hello", 1, request_id="job")
+    assert scheduler.begin_next() == request
+
+    result = scheduler.complete_running("done")
+
+    assert result.request_id == "job"
+    assert result.status is RequestStatus.COMPLETED
+    assert result.result == "done"
+    assert result.error is None
+    assert result.queued_seconds >= 0
+    assert result.run_seconds >= 0
+    assert scheduler.running_request() is None
+    assert scheduler.result_for("job") == result
+    snapshot = scheduler.snapshot()
+    assert snapshot.running is None
+    assert snapshot.completed == 1
+    assert snapshot.total_completed == 1
+
+
+def test_scheduler_fail_running_records_terminal_error() -> None:
+    scheduler = RequestScheduler(clock=FakeClock())
+    scheduler.submit_generate("hello", 1, request_id="job")
+    scheduler.begin_next()
+
+    result = scheduler.fail_running(RuntimeError("boom"))
+
+    assert result.request_id == "job"
+    assert result.status is RequestStatus.FAILED
+    assert result.result is None
+    assert result.error == "boom"
+    assert scheduler.running_request() is None
+    assert scheduler.result_for("job") == result
+    snapshot = scheduler.snapshot()
+    assert snapshot.running is None
+    assert snapshot.failed == 1
+    assert snapshot.total_failed == 1
+
+
+def test_scheduler_rejects_begin_next_while_running() -> None:
+    scheduler = RequestScheduler(clock=FakeClock())
+    scheduler.submit_generate("first", 1, request_id="first")
+    scheduler.submit_generate("second", 1, request_id="second")
+    scheduler.begin_next()
+
+    with pytest.raises(SchedulerError, match="already running"):
+        scheduler.begin_next()
+
+
+def test_scheduler_rejects_complete_or_fail_without_running() -> None:
+    scheduler = RequestScheduler(clock=FakeClock())
+
+    with pytest.raises(SchedulerError, match="no running request"):
+        scheduler.complete_running("done")
+    with pytest.raises(SchedulerError, match="no running request"):
+        scheduler.fail_running("boom")
+
+
+def test_scheduler_clear_resets_running_request() -> None:
+    scheduler = RequestScheduler(clock=FakeClock())
+    scheduler.submit_generate("hello", 1)
+    scheduler.begin_next()
+
+    scheduler.clear()
+
+    assert scheduler.running_request() is None
+    assert scheduler.snapshot().running is None
+    assert scheduler.submit_generate("again", 1).request_id == "gen-1"
