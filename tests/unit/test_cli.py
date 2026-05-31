@@ -417,7 +417,57 @@ def test_cli_tp_worker_runs_protocol_loop_without_human_stdout(
     assert str(runtime.device) == "cpu"
 
 
-def test_cli_reference_decode_smoke(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:
+
+def test_cli_tp_service_runs_http_service_without_human_stdout(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(_runtime_config()), encoding="utf-8")
+    (tmp_path / "model.safetensors").write_bytes(b"\x02\x00\x00\x00\x00\x00\x00\x00{}")
+    calls = []
+
+    def fake_service(state, runtime, config):
+        calls.append((state, runtime, config))
+        print('{"service":true}')
+
+    monkeypatch.setattr(cli, "serve_worker_http", fake_service)
+
+    rc = main(
+        [
+            "--model",
+            str(tmp_path),
+            "--prompt",
+            "unused",
+            "--max-new-tokens",
+            "1",
+            "--tp-service",
+            "--tp-host",
+            "127.0.0.2",
+            "--tp-port",
+            "8123",
+            "--tp-world-size",
+            "1",
+            "--tp-backend",
+            "gloo",
+            "--tp-device",
+            "cpu",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out == '{"service":true}\n'
+    assert "Loaded model config" not in out
+    assert "inference: not implemented yet" not in out
+    assert len(calls) == 1
+    state, runtime, config = calls[0]
+    assert isinstance(state, cli.WorkerState)
+    assert str(runtime.device) == "cpu"
+    assert config.host == "127.0.0.2"
+    assert config.port == 8123
+    assert config.model_dir == str(tmp_path.resolve())
+
     config = _runtime_config()
     text = config["text_config"]
     text["hidden_size"] = 256

@@ -10,6 +10,7 @@ from fp8_smoke import Fp8SmokeReport, inspect_fp8_checkpoint
 from loader import LoaderError, TensorLoader
 from reference_ops import ReferenceWeights, decode_step, decoder_layer, embedding, language_model
 from runtime_config import ConfigError, RuntimeConfig, parse_runtime_config
+from service import ServiceConfig, serve_worker_http
 from tensor_parallel import TensorParallel
 from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_decode_step, tp_language_model
 from tp_weights import MappedWeights
@@ -558,6 +559,24 @@ def _run_tp_worker(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_tp_service(args: argparse.Namespace, model_dir: Path) -> int:
+    launch = _tp_launch_from_args(
+        args.tp_world_size,
+        args.tp_rank,
+        args.tp_local_rank,
+        args.tp_backend,
+        args.tp_init_method,
+        args.tp_device,
+    )
+    config = ServiceConfig(host=args.tp_host, port=args.tp_port, model_dir=str(model_dir))
+    try:
+        with TpRuntime(launch) as runtime:
+            serve_worker_http(WorkerState(launch), runtime, config)
+    except (TpRuntimeError, OSError) as exc:
+        raise CliError(str(exc)) from exc
+    return 0
+
+
 def _reference_layer(mapping: LanguageModelMapping, layer_index: int | None):
     if layer_index is None:
         for layer in mapping.layers:
@@ -583,6 +602,8 @@ def run(args: argparse.Namespace) -> int:
         raise CliError(str(exc)) from exc
     if args.tp_worker:
         return _run_tp_worker(args)
+    if args.tp_service:
+        return _run_tp_service(args, model_dir)
     config = manifest.config
     print("Loaded model config")
     print(f"model_dir: {model_dir}")
@@ -860,6 +881,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run a resident tensor-parallel worker that reads JSONL commands on rank 0.",
     )
+    parser.add_argument(
+        "--tp-service",
+        action="store_true",
+        help="Run a resident tensor-parallel HTTP/SSE service on rank 0.",
+    )
+    parser.add_argument("--tp-host", default="127.0.0.1", help="Host interface for --tp-service.")
+    parser.add_argument("--tp-port", type=int, default=8000, help="TCP port for --tp-service.")
     parser.add_argument("--tp-world-size", type=int, help="TP runtime world size; defaults to WORLD_SIZE or 1.")
     parser.add_argument("--tp-rank", type=int, help="TP runtime global rank; defaults to RANK or 0.")
     parser.add_argument("--tp-local-rank", type=int, help="TP runtime local CUDA rank; defaults to LOCAL_RANK or rank.")
@@ -914,6 +942,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--tp-rank must be in [0, --tp-world-size)")
     if args.tp_local_rank is not None and args.tp_local_rank < 0:
         parser.error("--tp-local-rank must be non-negative")
+    if args.tp_port <= 0 or args.tp_port > 65535:
+        parser.error("--tp-port must be in [1, 65535]")
     if args.inspect_tp is not None and args.inspect_tp <= 0:
         parser.error("--inspect-tp must be positive")
     try:

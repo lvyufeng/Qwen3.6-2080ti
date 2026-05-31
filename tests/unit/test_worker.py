@@ -25,6 +25,7 @@ from worker import (
     WorkerState,
     broadcast_command,
     command_from_dict,
+    dispatch_protocol_command,
     execute_command,
     gather_worker_results,
     protocol_response,
@@ -112,6 +113,22 @@ def test_worker_protocol_error_response_includes_control_metadata() -> None:
     assert response["control"] == _control_data(rank_count=0)
 
 
+
+def test_dispatch_protocol_command_single_rank_returns_protocol_response() -> None:
+    launch = TpLaunchConfig(backend="gloo", device="cpu")
+    state = WorkerState(launch)
+    with TpRuntime(launch) as runtime:
+        response = dispatch_protocol_command(state, runtime, "status", WorkerCommand(STATUS, {}))
+
+    assert response is not None
+    assert response["id"] == "status"
+    assert response["kind"] == STATUS
+    assert response["ok"] is True
+    assert response["control"] == _control_data(rank_count=1)
+    assert response["data"]["loaded"] is False
+    assert response["rank_results"][0]["rank"] == 0
+
+
 def test_gather_worker_results_single_rank() -> None:
     launch = TpLaunchConfig(backend="gloo", device="cpu")
     result = WorkerResult(GENERATE, 0, True, {"rank": 0})
@@ -173,7 +190,9 @@ def test_worker_load_then_generate_single_rank(tmp_path: Path, monkeypatch: pyte
     state = WorkerState(launch)
 
     load_result = execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)}))
-    generate_result = execute_command(state, WorkerCommand(GENERATE, {"prompt": "hello", "max_new_tokens": 2}))
+    generate_result = execute_command(
+        state, WorkerCommand(GENERATE, {"prompt": "hello", "max_new_tokens": 2, "request_id": "gen-1"})
+    )
 
     assert load_result.ok is True
     assert generate_result.ok is True

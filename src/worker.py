@@ -182,6 +182,21 @@ def protocol_response(request_id: str | None, command: WorkerCommand, rank_resul
     }
 
 
+def dispatch_protocol_command(
+    state: WorkerState,
+    runtime: TpRuntime,
+    request_id: str | None,
+    command: WorkerCommand | None,
+) -> dict[str, Any] | None:
+    command = broadcast_command(command, runtime)
+    result = execute_command(state, command, runtime)
+    rank_results = gather_worker_results(result, runtime)
+    if runtime.config.rank != 0:
+        return None
+    assert rank_results is not None
+    return protocol_response(request_id, command, rank_results)
+
+
 def run_worker_protocol_loop(
     state: WorkerState,
     runtime: TpRuntime,
@@ -196,12 +211,10 @@ def run_worker_protocol_loop(
         command: WorkerCommand | None = None
         if iterator is not None:
             request_id, command = _read_protocol_command(iterator, output_stream)
-        command = broadcast_command(command, runtime)
-        result = execute_command(state, command, runtime)
-        rank_results = gather_worker_results(result, runtime)
+        response = dispatch_protocol_command(state, runtime, request_id, command)
         if runtime.config.rank == 0:
-            assert rank_results is not None
-            _write_protocol_response(output_stream, protocol_response(request_id, command, rank_results))
+            assert response is not None
+            _write_protocol_response(output_stream, response)
         if state.should_shutdown:
             break
 
@@ -280,10 +293,12 @@ def _execute_generate(state: WorkerState, command: WorkerCommand, runtime: TpRun
     session = _require_loaded_session(state, runtime)
     prompt = _payload_str(command, "prompt")
     max_new_tokens = _payload_positive_int(command, "max_new_tokens")
+    request_id = _payload_optional_str(command, "request_id")
     scheduled = state.scheduler.run_blocking_generate(
         prompt,
         max_new_tokens,
         lambda request: session.generate(request.prompt, request.max_new_tokens),
+        request_id=request_id,
     )
     assert scheduled.result is not None
     data = _generate_result_data(scheduled.result)
