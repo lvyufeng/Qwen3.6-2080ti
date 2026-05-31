@@ -31,6 +31,7 @@ from worker import (
     run_worker_loop,
     run_worker_protocol_loop,
     worker_result_to_dict,
+    _protocol_error_response,
 )
 
 
@@ -99,7 +100,16 @@ def test_worker_result_to_dict_and_protocol_response() -> None:
     assert response["rank"] == 0
     assert response["data"] == {"text": "hi"}
     assert response["rank_results"] == [worker_result_to_dict(ok), worker_result_to_dict(failed)]
+    assert response["control"] == _control_data(rank_count=2)
     assert "rank 1: boom" in response["error"]
+
+
+def test_worker_protocol_error_response_includes_control_metadata() -> None:
+    response = _protocol_error_response("bad", "boom")
+
+    assert response["id"] == "bad"
+    assert response["ok"] is False
+    assert response["control"] == _control_data(rank_count=0)
 
 
 def test_gather_worker_results_single_rank() -> None:
@@ -175,6 +185,18 @@ def test_worker_load_then_generate_single_rank(tmp_path: Path, monkeypatch: pyte
     assert generate_result.data["all_finite"] is True
     assert len(generate_result.data["generated_token_ids"]) == 2
     assert generate_result.data["text"].startswith("decoded:")
+    assert generate_result.data["request_id"] == "gen-1"
+    assert generate_result.data["status"] == "COMPLETED"
+    assert generate_result.data["error"] is None
+    _assert_event(
+        generate_result.data["event"],
+        request_id="gen-1",
+        type="completed",
+        status="COMPLETED",
+        sequence=2,
+        token_ids=generate_result.data["generated_token_ids"],
+        is_terminal=True,
+    )
     assert generate_result.data["scheduler"]["request_id"] == "gen-1"
     assert generate_result.data["scheduler"]["status"] == "COMPLETED"
     assert generate_result.data["scheduler"]["queued_seconds"] >= 0
@@ -272,6 +294,15 @@ def test_worker_submit_enqueues_without_generating(tmp_path: Path, monkeypatch: 
     assert submit_result.data["request_id"] == "gen-1"
     assert submit_result.data["status"] == "PENDING"
     assert submit_result.data["pending"] == 1
+    _assert_event(
+        submit_result.data["event"],
+        request_id="gen-1",
+        type="queued",
+        status="PENDING",
+        sequence=0,
+        token_ids=[],
+        is_terminal=False,
+    )
     assert status_result.data["scheduler"]["pending"] == 1
     assert status_result.data["scheduler"]["completed"] == 0
     assert status_result.data["scheduler"]["total_submitted"] == 1
@@ -305,6 +336,9 @@ def test_worker_poll_unknown_request_id_reports_not_found(tmp_path: Path, monkey
     assert poll_result.data["found"] is False
     assert poll_result.data["status"] is None
     assert poll_result.data["result"] is None
+    assert poll_result.data["event"]["type"] == "not_found"
+    assert poll_result.data["event"]["status"] is None
+    assert poll_result.data["event"]["is_terminal"] is True
 
 
 def test_worker_step_with_no_pending_work_reports_idle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -322,6 +356,15 @@ def test_worker_step_with_no_pending_work_reports_idle(tmp_path: Path, monkeypat
     assert step_result.data["status"] is None
     assert step_result.data["result"] is None
     assert step_result.data["scheduler"] == _empty_scheduler_data()
+    _assert_event(
+        step_result.data["event"],
+        request_id=None,
+        type="idle",
+        status=None,
+        sequence=None,
+        token_ids=[],
+        is_terminal=False,
+    )
 
 
 def test_worker_step_advances_request_and_poll_reports_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -348,6 +391,15 @@ def test_worker_step_advances_request_and_poll_reports_progress(tmp_path: Path, 
     assert first_step.data["progress"]["max_new_tokens"] == 2
     assert first_step.data["progress"]["latest_token_index"] == 0
     assert first_step.data["progress"]["is_complete"] is False
+    _assert_event(
+        first_step.data["event"],
+        request_id="job-1",
+        type="token",
+        status="RUNNING",
+        sequence=1,
+        token_ids=[first_step.data["progress"]["latest_token_id"]],
+        is_terminal=False,
+    )
     assert first_step.data["scheduler"]["running"] == "job-1"
     assert first_step.data["scheduler"]["pending"] == 0
 
@@ -357,6 +409,15 @@ def test_worker_step_advances_request_and_poll_reports_progress(tmp_path: Path, 
     assert poll_result.data["status"] == "RUNNING"
     assert poll_result.data["result"] is None
     assert poll_result.data["progress"] == first_step.data["progress"]
+    _assert_event(
+        poll_result.data["event"],
+        request_id="job-1",
+        type="running",
+        status="RUNNING",
+        sequence=1,
+        token_ids=[],
+        is_terminal=False,
+    )
     assert poll_result.data["scheduler"]["running"] == "job-1"
 
     assert status_running.ok is True
@@ -384,6 +445,15 @@ def test_worker_step_advances_request_and_poll_reports_progress(tmp_path: Path, 
     assert result["world_size"] == 1
     assert result["runtime"]["backend"] == "gloo"
     assert result["timings"]["total_seconds"] >= 0
+    _assert_event(
+        second_step.data["event"],
+        request_id="job-1",
+        type="completed",
+        status="COMPLETED",
+        sequence=2,
+        token_ids=[second_step.data["progress"]["latest_token_id"]],
+        is_terminal=True,
+    )
     assert second_step.data["scheduler"]["running"] is None
     assert second_step.data["scheduler"]["completed"] == 1
     assert second_step.data["scheduler"]["total_completed"] == 1
@@ -461,6 +531,15 @@ def test_worker_shutdown_clears_active_stepped_request(tmp_path: Path, monkeypat
     assert result["runtime"]["local_rank"] == 0
     assert result["timings"]["total_seconds"] >= 0
     assert result["throughput"]["total_tokens_per_second"] > 0
+    _assert_event(
+        poll_result.data["event"],
+        request_id="job-1",
+        type="completed",
+        status="COMPLETED",
+        sequence=2,
+        token_ids=[],
+        is_terminal=True,
+    )
     assert status_result.data["scheduler"]["completed"] == 1
     assert status_result.data["scheduler"]["pending"] == 0
 
@@ -488,6 +567,15 @@ def test_worker_poll_reports_failed_job_without_command_failure(tmp_path: Path, 
     assert poll_result.data["status"] == "FAILED"
     assert "generate kaboom" in poll_result.data["error"]
     assert poll_result.data["result"] is None
+    _assert_event(
+        poll_result.data["event"],
+        request_id="job-1",
+        type="failed",
+        status="FAILED",
+        sequence=0,
+        token_ids=[],
+        is_terminal=True,
+    )
     assert status_result.data["scheduler"]["failed"] == 1
     assert status_result.data["scheduler"]["total_failed"] == 1
 
@@ -508,6 +596,15 @@ def test_worker_poll_drains_one_request_per_call_in_fifo_order(tmp_path: Path, m
     assert first_poll.data["found"] is True
     assert first_poll.data["status"] == "PENDING"
     assert first_poll.data["result"] is None
+    _assert_event(
+        first_poll.data["event"],
+        request_id="b",
+        type="pending",
+        status="PENDING",
+        sequence=0,
+        token_ids=[],
+        is_terminal=False,
+    )
     assert second_poll.ok is True
     assert second_poll.data["status"] == "COMPLETED"
     assert second_poll.data["result"]["text"].startswith("decoded:")
@@ -544,6 +641,7 @@ def test_worker_protocol_loop_submit_poll_status(tmp_path: Path, monkeypatch: py
     ]
     assert [response["kind"] for response in responses] == [LOAD, SUBMIT, STATUS, POLL, STATUS, SHUTDOWN]
     assert all(response["ok"] for response in responses)
+    assert all(response["control"] == _control_data(rank_count=1) for response in responses)
     submit = responses[1]
     assert submit["data"]["request_id"] == "job-1"
     assert submit["data"]["status"] == "PENDING"
@@ -553,6 +651,8 @@ def test_worker_protocol_loop_submit_poll_status(tmp_path: Path, monkeypatch: py
     assert poll["data"]["request_id"] == "job-1"
     assert poll["data"]["status"] == "COMPLETED"
     assert poll["data"]["result"]["text"].startswith("decoded:")
+    assert poll["data"]["event"]["type"] == "completed"
+    assert poll["data"]["event"]["is_terminal"] is True
     assert responses[4]["data"]["scheduler"]["completed"] == 1
     assert responses[4]["data"]["scheduler"]["pending"] == 0
     assert responses[5]["data"]["shutdown"] is True
@@ -593,21 +693,30 @@ def test_worker_protocol_loop_step_poll_status(tmp_path: Path, monkeypatch: pyte
     ]
     assert [response["kind"] for response in responses] == [LOAD, SUBMIT, STEP, STATUS, POLL, STEP, STATUS, SHUTDOWN]
     assert all(response["ok"] for response in responses)
+    assert all(response["control"] == _control_data(rank_count=1) for response in responses)
     first_step = responses[2]
     assert first_step["data"]["request_id"] == "job-1"
     assert first_step["data"]["status"] == "RUNNING"
     assert first_step["data"]["progress"]["generated_tokens"] == 1
+    assert first_step["data"]["event"]["type"] == "token"
+    assert first_step["data"]["event"]["sequence"] == 1
+    assert first_step["data"]["event"]["token_ids"] == [first_step["data"]["progress"]["latest_token_id"]]
     assert first_step["data"]["scheduler"]["running"] == "job-1"
     assert responses[3]["data"]["active_generation"]["request_id"] == "job-1"
     assert responses[3]["data"]["active_generation"]["generated_tokens"] == 1
     poll = responses[4]
     assert poll["data"]["status"] == "RUNNING"
     assert poll["data"]["progress"] == first_step["data"]["progress"]
+    assert poll["data"]["event"]["type"] == "running"
+    assert poll["data"]["event"]["sequence"] == 1
     second_step = responses[5]
     assert second_step["data"]["status"] == "COMPLETED"
     assert second_step["data"]["result"]["text"].startswith("decoded:")
     assert len(second_step["data"]["result"]["generated_token_ids"]) == 2
     assert second_step["data"]["progress"]["generated_tokens"] == 2
+    assert second_step["data"]["event"]["type"] == "completed"
+    assert second_step["data"]["event"]["sequence"] == 2
+    assert second_step["data"]["event"]["is_terminal"] is True
     assert responses[6]["data"]["active_generation"] is None
     assert responses[6]["data"]["scheduler"]["completed"] == 1
     assert responses[7]["data"]["shutdown"] is True
@@ -701,6 +810,7 @@ def test_worker_protocol_loop_reports_invalid_json_without_stopping() -> None:
     assert len(responses) == 2
     assert responses[0]["ok"] is False
     assert responses[0]["kind"] == "UNKNOWN"
+    assert responses[0]["control"] == _control_data(rank_count=0)
     assert "invalid JSON" in responses[0]["error"]
     assert responses[1]["ok"] is True
     assert responses[1]["kind"] == SHUTDOWN
@@ -727,6 +837,8 @@ def test_worker_protocol_loop_reports_invalid_envelope_without_stopping() -> Non
     assert responses[0]["ok"] is False
     assert responses[0]["kind"] == "UNKNOWN"
     assert "payload must be a dict" in responses[0]["error"]
+    assert responses[0]["control"] == _control_data(rank_count=0)
+    assert responses[1]["control"] == _control_data(rank_count=1)
     assert responses[1]["ok"] is True
     assert responses[1]["kind"] == SHUTDOWN
     assert state.should_shutdown is True
@@ -753,6 +865,8 @@ def test_worker_protocol_loop_reports_unknown_command_without_stopping() -> None
     assert responses[0]["ok"] is False
     assert responses[0]["rank_results"][0]["rank"] == 0
     assert "unknown worker command" in responses[0]["rank_results"][0]["error"]
+    assert responses[0]["control"] == _control_data(rank_count=1)
+    assert responses[1]["control"] == _control_data(rank_count=1)
     assert responses[1]["ok"] is True
     assert responses[1]["kind"] == SHUTDOWN
     assert state.should_shutdown is True
@@ -772,6 +886,7 @@ def test_worker_protocol_loop_shutdown_on_eof() -> None:
     assert responses[0]["id"] is None
     assert responses[0]["kind"] == SHUTDOWN
     assert responses[0]["ok"] is True
+    assert responses[0]["control"] == _control_data(rank_count=1)
     assert responses[0]["data"]["shutdown"] is True
     assert state.should_shutdown is True
 
@@ -1142,11 +1257,42 @@ def _read_jsonl(stream: io.StringIO) -> list[dict[str, object]]:
 def _assert_two_rank_response(response: dict[str, object], kind: str, *, ok: bool = True) -> None:
     assert response["kind"] == kind
     assert response["ok"] is ok
+    assert response["control"] == _control_data(rank_count=2)
     rank_results = response["rank_results"]
     assert isinstance(rank_results, list)
     assert [result["rank"] for result in rank_results] == [0, 1]
     assert all(result["kind"] == kind for result in rank_results)
     assert all(result["ok"] is ok for result in rank_results)
+
+
+
+def _assert_event(
+    event: dict[str, object],
+    *,
+    request_id: str | None,
+    type: str,
+    status: str | None,
+    sequence: int | None,
+    token_ids: list[int],
+    is_terminal: bool,
+) -> None:
+    assert event == {
+        "request_id": request_id,
+        "type": type,
+        "status": status,
+        "sequence": sequence,
+        "token_ids": token_ids,
+        "is_terminal": is_terminal,
+    }
+
+
+def _control_data(*, rank_count: int) -> dict[str, object]:
+    return {
+        "protocol_version": 1,
+        "response_shape": "rank_aggregate",
+        "streaming_ready": True,
+        "rank_count": rank_count,
+    }
 
 
 def _empty_scheduler_data() -> dict[str, object]:

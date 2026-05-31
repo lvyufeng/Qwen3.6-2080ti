@@ -178,6 +178,7 @@ def protocol_response(request_id: str | None, command: WorkerCommand, rank_resul
         "data": primary.data,
         "rank_results": [worker_result_to_dict(result) for result in rank_results],
         "error": None if ok else "; ".join(errors),
+        "control": _control_data(len(rank_results)),
     }
 
 
@@ -230,6 +231,16 @@ def _protocol_error_response(request_id: str | None, error: str) -> dict[str, An
         "data": {},
         "rank_results": [],
         "error": error,
+        "control": _control_data(0),
+    }
+
+
+def _control_data(rank_count: int) -> dict[str, Any]:
+    return {
+        "protocol_version": 1,
+        "response_shape": "rank_aggregate",
+        "streaming_ready": True,
+        "rank_count": rank_count,
     }
 
 
@@ -276,6 +287,17 @@ def _execute_generate(state: WorkerState, command: WorkerCommand, runtime: TpRun
     )
     assert scheduled.result is not None
     data = _generate_result_data(scheduled.result)
+    data["request_id"] = scheduled.request_id
+    data["status"] = scheduled.status.value
+    data["error"] = scheduled.error
+    data["event"] = _event_data(
+        request_id=scheduled.request_id,
+        type="completed",
+        status=scheduled.status.value,
+        sequence=scheduled.result.max_new_tokens,
+        token_ids=scheduled.result.generated_token_ids,
+        is_terminal=True,
+    )
     data["scheduler"] = _scheduled_result_data(scheduled)
     return WorkerResult(GENERATE, state.launch.rank, True, data)
 
@@ -295,6 +317,14 @@ def _execute_submit(state: WorkerState, command: WorkerCommand, runtime: TpRunti
             "request_id": request.request_id,
             "status": RequestStatus.PENDING.value,
             "pending": snapshot.pending,
+            "event": _event_data(
+                request_id=request.request_id,
+                type="queued",
+                status=RequestStatus.PENDING.value,
+                sequence=0,
+                token_ids=[],
+                is_terminal=False,
+            ),
             "scheduler": _scheduler_snapshot_data(snapshot),
         },
     )
@@ -305,7 +335,7 @@ def _execute_poll(state: WorkerState, command: WorkerCommand, runtime: TpRuntime
     request_id = _payload_str(command, "request_id")
     active = state.active_generation
     if active is not None and active.request_id == request_id:
-        data = _step_running_data(state, active)
+        data = _step_running_data(state, active, event_type="running")
         return WorkerResult(POLL, state.launch.rank, True, data)
     scheduled = state.scheduler.result_for(request_id)
     if scheduled is None and active is None and state.scheduler.is_pending(request_id):
@@ -343,6 +373,14 @@ def _execute_step(state: WorkerState, command: WorkerCommand, runtime: TpRuntime
                     "error": None,
                     "progress": None,
                     "timings": None,
+                    "event": _event_data(
+                        request_id=None,
+                        type="idle",
+                        status=None,
+                        sequence=None,
+                        token_ids=[],
+                        is_terminal=False,
+                    ),
                     "scheduler": _scheduler_snapshot_data(snapshot),
                 },
             )
@@ -369,7 +407,7 @@ def _execute_step(state: WorkerState, command: WorkerCommand, runtime: TpRuntime
             data = _step_completed_data(state, active, result, scheduled)
             state.active_generation = None
             return WorkerResult(STEP, state.launch.rank, True, data)
-        data = _step_running_data(state, active)
+        data = _step_running_data(state, active, event_type="token")
         return WorkerResult(STEP, state.launch.rank, True, data)
     except Exception as exc:
         max_new_tokens = active.state.max_new_tokens if active is not None else None
@@ -520,7 +558,7 @@ def _scheduled_result_data(result: ScheduledResult[GenerateResult]) -> dict[str,
     }
 
 
-def _step_running_data(state: WorkerState, active: ActiveGeneration) -> dict[str, Any]:
+def _step_running_data(state: WorkerState, active: ActiveGeneration, *, event_type: str) -> dict[str, Any]:
     step = active.last_step
     assert step is not None
     return {
@@ -535,6 +573,14 @@ def _step_running_data(state: WorkerState, active: ActiveGeneration) -> dict[str
             "decode_seconds": active.state.decode_seconds,
             "total_seconds": step.total_seconds,
         },
+        "event": _event_data(
+            request_id=active.request_id,
+            type=event_type,
+            status=RequestStatus.RUNNING.value,
+            sequence=len(active.state.generated_token_ids),
+            token_ids=[step.token_id] if event_type == "token" else [],
+            is_terminal=False,
+        ),
         "scheduler": _scheduler_snapshot_data(state.scheduler.snapshot()),
     }
 
@@ -561,6 +607,14 @@ def _step_completed_data(
             "decode_seconds": result.decode_seconds,
             "total_seconds": result.total_seconds,
         },
+        "event": _event_data(
+            request_id=scheduled.request_id,
+            type="completed",
+            status=RequestStatus.COMPLETED.value,
+            sequence=scheduled.result.max_new_tokens,
+            token_ids=[step.token_id],
+            is_terminal=True,
+        ),
         "scheduler": _scheduler_snapshot_data(state.scheduler.snapshot()),
     }
 
@@ -602,6 +656,14 @@ def _step_failed_response(
                 "is_complete": False,
             },
             "timings": None,
+            "event": _event_data(
+                request_id=request_id,
+                type="failed",
+                status=RequestStatus.FAILED.value,
+                sequence=generated_tokens,
+                token_ids=[],
+                is_terminal=True,
+            ),
             "scheduler": _scheduler_snapshot_data(snapshot),
         },
     )
@@ -609,9 +671,14 @@ def _step_failed_response(
 
 def _poll_terminal_data(request_id: str, scheduled: ScheduledResult[object]) -> dict[str, Any]:
     result_data = None
+    event_type = "failed"
+    sequence = 0
     if scheduled.status is RequestStatus.COMPLETED:
         assert scheduled.result is not None
-        result_data = _generate_result_data(cast(GenerateResult, scheduled.result))
+        result = cast(GenerateResult, scheduled.result)
+        result_data = _generate_result_data(result)
+        sequence = len(result.generated_token_ids)
+        event_type = "completed"
     return {
         "request_id": request_id,
         "found": True,
@@ -620,6 +687,14 @@ def _poll_terminal_data(request_id: str, scheduled: ScheduledResult[object]) -> 
         "error": scheduled.error,
         "queued_seconds": scheduled.queued_seconds,
         "run_seconds": scheduled.run_seconds,
+        "event": _event_data(
+            request_id=request_id,
+            type=event_type,
+            status=scheduled.status.value,
+            sequence=sequence,
+            token_ids=[],
+            is_terminal=True,
+        ),
     }
 
 
@@ -632,6 +707,14 @@ def _poll_pending_data(request_id: str) -> dict[str, Any]:
         "error": None,
         "queued_seconds": None,
         "run_seconds": None,
+        "event": _event_data(
+            request_id=request_id,
+            type="pending",
+            status=RequestStatus.PENDING.value,
+            sequence=0,
+            token_ids=[],
+            is_terminal=False,
+        ),
     }
 
 
@@ -644,6 +727,14 @@ def _poll_unknown_data(request_id: str) -> dict[str, Any]:
         "error": None,
         "queued_seconds": None,
         "run_seconds": None,
+        "event": _event_data(
+            request_id=request_id,
+            type="not_found",
+            status=None,
+            sequence=None,
+            token_ids=[],
+            is_terminal=True,
+        ),
     }
 
 
@@ -656,6 +747,25 @@ def _scheduler_snapshot_data(snapshot: SchedulerSnapshot) -> dict[str, Any]:
         "total_submitted": snapshot.total_submitted,
         "total_completed": snapshot.total_completed,
         "total_failed": snapshot.total_failed,
+    }
+
+
+def _event_data(
+    *,
+    request_id: str | None,
+    type: str,
+    status: str | None,
+    sequence: int | None,
+    token_ids: list[int],
+    is_terminal: bool,
+) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "type": type,
+        "status": status,
+        "sequence": sequence,
+        "token_ids": list(token_ids),
+        "is_terminal": is_terminal,
     }
 
 
