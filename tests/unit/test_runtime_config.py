@@ -23,6 +23,7 @@ def test_parse_runtime_config_derives_runtime_dimensions() -> None:
     assert config.moe.num_experts == 2
     assert config.moe.experts_per_token == 1
     assert config.moe.packed_expert_dispatch is True
+    assert config.moe.native_fused_expert_dispatch is True
     assert config.fp8_scale_shape((257, 255)) == (3, 2)
 
 
@@ -40,6 +41,23 @@ def test_parse_runtime_config_rejects_bad_packed_expert_dispatch_type() -> None:
     raw["text_config"]["packed_expert_dispatch"] = "yes"
 
     with pytest.raises(ConfigError, match="packed_expert_dispatch"):
+        parse_runtime_config(raw)
+
+
+def test_parse_runtime_config_can_disable_native_fused_expert_dispatch() -> None:
+    raw = _config()
+    raw["text_config"]["native_fused_expert_dispatch"] = False
+
+    config = parse_runtime_config(raw)
+
+    assert config.moe.native_fused_expert_dispatch is False
+
+
+def test_parse_runtime_config_rejects_bad_native_fused_expert_dispatch_type() -> None:
+    raw = _config()
+    raw["text_config"]["native_fused_expert_dispatch"] = "yes"
+
+    with pytest.raises(ConfigError, match="native_fused_expert_dispatch"):
         parse_runtime_config(raw)
 
 

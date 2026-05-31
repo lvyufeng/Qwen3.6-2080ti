@@ -25,6 +25,9 @@ class TpRuntimeError(RuntimeError):
     pass
 
 
+_NATIVE_MOE_EXPERT_MAX_GROUP_TOKENS = 8
+
+
 @dataclass(frozen=True)
 class TpLaunchConfig:
     world_size: int = 1
@@ -410,7 +413,7 @@ def tp_moe(hidden_states: Any, mapping: MoEMapping, config: RuntimeConfig, weigh
     if config.moe.packed_expert_dispatch:
         if stats is not None:
             stats.moe_packed_calls += 1
-        routed = _tp_moe_packed_local_experts(flat, routing, mapping, weights)
+        routed = _tp_moe_packed_local_experts(flat, routing, mapping, config, weights)
     else:
         if stats is not None:
             stats.moe_loop_calls += 1
@@ -436,7 +439,7 @@ def _tp_moe_per_expert_loop(flat: Any, routing: TopKRouting, mapping: MoEMapping
     return routed
 
 
-def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMapping, weights: ReferenceWeights) -> Any:
+def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMapping, config: RuntimeConfig, weights: ReferenceWeights) -> Any:
     import torch
 
     routed = torch.zeros_like(flat.float())
@@ -481,11 +484,102 @@ def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMa
         hidden_chunk = packed_hidden[offset:end]
         token_chunk = packed_tokens[offset:end]
         score_chunk = packed_scores[offset:end]
-        token_output = weights.expert(hidden_chunk, expert)
+        token_output = _tp_moe_expert_group(hidden_chunk, expert, config, weights)
         token_output = token_output * score_chunk[:, None]
         routed.index_add_(0, token_chunk, token_output.float())
         offset = end
     return routed
+
+
+def _tp_moe_expert_group(hidden_chunk: Any, expert: Any, config: RuntimeConfig, weights: ReferenceWeights) -> Any:
+    stats = getattr(weights, "dispatch_stats", None)
+    group_tokens = int(hidden_chunk.shape[0]) if hasattr(hidden_chunk, "shape") and len(hidden_chunk.shape) > 0 else 0
+    if stats is not None:
+        stats.moe_native_expert_calls += 1
+        stats.moe_native_expert_max_group_tokens = max(stats.moe_native_expert_max_group_tokens, group_tokens)
+    if not config.moe.native_fused_expert_dispatch:
+        _record_native_expert_fallback(stats, "disabled")
+        return weights.expert(hidden_chunk, expert)
+
+    eligible, reason, tensors = _tp_moe_native_expert_eligibility(hidden_chunk, expert, weights)
+    if not eligible:
+        _record_native_expert_fallback(stats, reason)
+        return weights.expert(hidden_chunk, expert)
+    if stats is not None:
+        stats.moe_native_expert_eligible += 1
+    try:
+        from fp8_cuda import fp8_e4m3_bf16_moe_expert
+
+        output = fp8_e4m3_bf16_moe_expert(hidden_chunk.float(), *tensors)
+    except RuntimeError:
+        _record_native_expert_fallback(stats, "exception")
+        return weights.expert(hidden_chunk, expert)
+    if stats is not None:
+        stats.moe_native_expert_hits += 1
+    return output
+
+
+def _tp_moe_native_expert_eligibility(hidden_chunk: Any, expert: Any, weights: ReferenceWeights) -> tuple[bool, str, tuple[Any, ...]]:
+    import torch
+
+    if len(getattr(hidden_chunk, "shape", ())) != 2:
+        return False, "shape", ()
+    group_tokens = int(hidden_chunk.shape[0])
+    hidden_size = int(hidden_chunk.shape[1])
+    if group_tokens < 1 or group_tokens > _NATIVE_MOE_EXPERT_MAX_GROUP_TOKENS:
+        return False, "group_tokens", ()
+    if not getattr(hidden_chunk, "is_cuda", False):
+        return False, "device", ()
+    gate_weight, gate_scale = weights.linear_weight(expert.gate_proj)
+    up_weight, up_scale = weights.linear_weight(expert.up_proj)
+    down_weight, down_scale = weights.linear_weight(expert.down_proj)
+    tensors = (gate_weight, gate_scale, up_weight, up_scale, down_weight, down_scale)
+    if any(tensor is None for tensor in (gate_scale, up_scale, down_scale)):
+        return False, "missing_scale", ()
+    if not all(getattr(tensor, "is_cuda", False) for tensor in tensors):
+        return False, "device", ()
+    if gate_weight.dtype != torch.float8_e4m3fn or up_weight.dtype != torch.float8_e4m3fn or down_weight.dtype != torch.float8_e4m3fn:
+        return False, "dtype", ()
+    if gate_scale.dtype != torch.bfloat16 or up_scale.dtype != torch.bfloat16 or down_scale.dtype != torch.bfloat16:
+        return False, "dtype", ()
+    if len(gate_weight.shape) != 2 or len(up_weight.shape) != 2 or len(down_weight.shape) != 2:
+        return False, "shape", ()
+    intermediate_size = int(gate_weight.shape[0])
+    if int(gate_weight.shape[1]) != hidden_size:
+        return False, "shape", ()
+    if tuple(up_weight.shape) != tuple(gate_weight.shape):
+        return False, "shape", ()
+    if tuple(down_weight.shape) != (hidden_size, intermediate_size):
+        return False, "shape", ()
+    if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+        return False, "shape", ()
+    if tuple(gate_scale.shape) != (intermediate_size // 128, hidden_size // 128):
+        return False, "shape", ()
+    if tuple(up_scale.shape) != (intermediate_size // 128, hidden_size // 128):
+        return False, "shape", ()
+    if tuple(down_scale.shape) != (hidden_size // 128, intermediate_size // 128):
+        return False, "shape", ()
+    return True, "", tensors
+
+
+def _record_native_expert_fallback(stats: Any, reason: str) -> None:
+    if stats is None:
+        return
+    stats.moe_native_expert_fallbacks += 1
+    if reason == "disabled":
+        stats.moe_native_expert_fallback_disabled += 1
+    elif reason == "missing_scale":
+        stats.moe_native_expert_fallback_missing_scale += 1
+    elif reason == "dtype":
+        stats.moe_native_expert_fallback_dtype += 1
+    elif reason == "device":
+        stats.moe_native_expert_fallback_device += 1
+    elif reason == "group_tokens":
+        stats.moe_native_expert_fallback_group_tokens += 1
+    elif reason == "exception":
+        stats.moe_native_expert_fallback_exception += 1
+    else:
+        stats.moe_native_expert_fallback_shape += 1
 
 
 def mapped_tensor_bytes(mapping: LanguageModelMapping) -> int:

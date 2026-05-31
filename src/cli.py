@@ -68,6 +68,7 @@ def _summarize_runtime_config(config: RuntimeConfig) -> list[str]:
         f"runtime_experts_per_layer: {config.moe.num_experts}",
         f"runtime_experts_per_token: {config.moe.experts_per_token}",
         f"runtime_packed_expert_dispatch: {config.moe.packed_expert_dispatch}",
+        f"runtime_native_fused_expert_dispatch: {config.moe.native_fused_expert_dispatch}",
         f"runtime_fp8_block_size: {config.fp8_block_size}",
     ]
 
@@ -332,6 +333,18 @@ def _format_tp_generate_result(result: GenerateResult) -> list[str]:
         f"tp_generate_dispatch_moe_active_expert_groups: {dispatch.moe_active_expert_groups}",
         f"tp_generate_dispatch_moe_empty_local_dispatches: {dispatch.moe_empty_local_dispatches}",
         f"tp_generate_dispatch_moe_max_group_tokens: {dispatch.moe_max_group_tokens}",
+        f"tp_generate_dispatch_moe_native_expert_calls: {dispatch.moe_native_expert_calls}",
+        f"tp_generate_dispatch_moe_native_expert_eligible: {dispatch.moe_native_expert_eligible}",
+        f"tp_generate_dispatch_moe_native_expert_hits: {dispatch.moe_native_expert_hits}",
+        f"tp_generate_dispatch_moe_native_expert_fallbacks: {dispatch.moe_native_expert_fallbacks}",
+        f"tp_generate_dispatch_moe_native_expert_fallback_disabled: {dispatch.moe_native_expert_fallback_disabled}",
+        f"tp_generate_dispatch_moe_native_expert_fallback_missing_scale: {dispatch.moe_native_expert_fallback_missing_scale}",
+        f"tp_generate_dispatch_moe_native_expert_fallback_dtype: {dispatch.moe_native_expert_fallback_dtype}",
+        f"tp_generate_dispatch_moe_native_expert_fallback_device: {dispatch.moe_native_expert_fallback_device}",
+        f"tp_generate_dispatch_moe_native_expert_fallback_shape: {dispatch.moe_native_expert_fallback_shape}",
+        f"tp_generate_dispatch_moe_native_expert_fallback_group_tokens: {dispatch.moe_native_expert_fallback_group_tokens}",
+        f"tp_generate_dispatch_moe_native_expert_fallback_exception: {dispatch.moe_native_expert_fallback_exception}",
+        f"tp_generate_dispatch_moe_native_expert_max_group_tokens: {dispatch.moe_native_expert_max_group_tokens}",
         f"tp_generate_all_finite: {result.all_finite}",
     ]
     memory = result.cuda_memory

@@ -49,6 +49,18 @@ class LinearDispatchStats:
     moe_active_expert_groups: int = 0
     moe_empty_local_dispatches: int = 0
     moe_max_group_tokens: int = 0
+    moe_native_expert_calls: int = 0
+    moe_native_expert_eligible: int = 0
+    moe_native_expert_hits: int = 0
+    moe_native_expert_fallbacks: int = 0
+    moe_native_expert_fallback_disabled: int = 0
+    moe_native_expert_fallback_missing_scale: int = 0
+    moe_native_expert_fallback_dtype: int = 0
+    moe_native_expert_fallback_device: int = 0
+    moe_native_expert_fallback_shape: int = 0
+    moe_native_expert_fallback_group_tokens: int = 0
+    moe_native_expert_fallback_exception: int = 0
+    moe_native_expert_max_group_tokens: int = 0
 
 
 def embedding(input_ids: Any, weight: Any) -> Any:

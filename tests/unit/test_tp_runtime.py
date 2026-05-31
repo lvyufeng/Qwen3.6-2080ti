@@ -90,6 +90,31 @@ def test_packed_tp_moe_matches_loop_and_records_stats() -> None:
     assert stats.moe_active_expert_groups == 2
     assert stats.moe_empty_local_dispatches == 0
     assert stats.moe_max_group_tokens == 3
+    assert stats.moe_native_expert_calls == 2
+    assert stats.moe_native_expert_hits == 0
+    assert stats.moe_native_expert_fallbacks == 2
+    assert stats.moe_native_expert_fallback_device == 2
+    assert stats.moe_native_expert_max_group_tokens == 3
+
+
+def test_packed_tp_moe_records_native_disabled_fallback() -> None:
+    hidden = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    loader = _FakeLoader(_moe_test_tensors())
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    packed_config = _config_with_experts_per_token(2, packed=True, native=False)
+    loop_config = _config_with_experts_per_token(2, packed=False)
+    weights = ReferenceWeights(loader)
+    weights.dispatch_stats = LinearDispatchStats()
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        expected = tp_moe(hidden, mapping, loop_config, ReferenceWeights(loader), runtime)
+        actual = tp_moe(hidden, mapping, packed_config, weights, runtime)
+
+    torch.testing.assert_close(actual, expected)
+    assert weights.dispatch_stats.moe_native_expert_calls == 2
+    assert weights.dispatch_stats.moe_native_expert_hits == 0
+    assert weights.dispatch_stats.moe_native_expert_fallbacks == 2
+    assert weights.dispatch_stats.moe_native_expert_fallback_disabled == 2
 
 
 def test_loop_tp_moe_records_loop_stats() -> None:
@@ -179,6 +204,10 @@ def _tp_moe_worker(rank: int, tmp_path: Path) -> None:
     assert weights.dispatch_stats.moe_active_expert_groups == 1
     assert weights.dispatch_stats.moe_empty_local_dispatches == 0
     assert weights.dispatch_stats.moe_max_group_tokens == 3
+    assert weights.dispatch_stats.moe_native_expert_calls == 1
+    assert weights.dispatch_stats.moe_native_expert_hits == 0
+    assert weights.dispatch_stats.moe_native_expert_fallbacks == 1
+    assert weights.dispatch_stats.moe_native_expert_fallback_device == 1
 
 
 def _tp_greedy_next_token_worker(rank: int, tmp_path: Path) -> None:
@@ -223,9 +252,17 @@ def _moe_test_tensors() -> dict[str, torch.Tensor]:
     }
 
 
-def _config_with_experts_per_token(experts_per_token: int, *, packed: bool) -> object:
+def _config_with_experts_per_token(experts_per_token: int, *, packed: bool, native: bool = True) -> object:
     config = parse_runtime_config(_config())
-    return replace(config, moe=replace(config.moe, experts_per_token=experts_per_token, packed_expert_dispatch=packed))
+    return replace(
+        config,
+        moe=replace(
+            config.moe,
+            experts_per_token=experts_per_token,
+            packed_expert_dispatch=packed,
+            native_fused_expert_dispatch=native,
+        ),
+    )
 
 
 def _tp_decode_worker(rank: int, tmp_path: Path) -> None:

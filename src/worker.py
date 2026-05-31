@@ -873,6 +873,18 @@ def _dispatch_stats_data(result: GenerateResult) -> dict[str, Any]:
         "moe_active_expert_groups": dispatch.moe_active_expert_groups,
         "moe_empty_local_dispatches": dispatch.moe_empty_local_dispatches,
         "moe_max_group_tokens": dispatch.moe_max_group_tokens,
+        "moe_native_expert_calls": dispatch.moe_native_expert_calls,
+        "moe_native_expert_eligible": dispatch.moe_native_expert_eligible,
+        "moe_native_expert_hits": dispatch.moe_native_expert_hits,
+        "moe_native_expert_fallbacks": dispatch.moe_native_expert_fallbacks,
+        "moe_native_expert_fallback_disabled": dispatch.moe_native_expert_fallback_disabled,
+        "moe_native_expert_fallback_missing_scale": dispatch.moe_native_expert_fallback_missing_scale,
+        "moe_native_expert_fallback_dtype": dispatch.moe_native_expert_fallback_dtype,
+        "moe_native_expert_fallback_device": dispatch.moe_native_expert_fallback_device,
+        "moe_native_expert_fallback_shape": dispatch.moe_native_expert_fallback_shape,
+        "moe_native_expert_fallback_group_tokens": dispatch.moe_native_expert_fallback_group_tokens,
+        "moe_native_expert_fallback_exception": dispatch.moe_native_expert_fallback_exception,
+        "moe_native_expert_max_group_tokens": dispatch.moe_native_expert_max_group_tokens,
     }
 
 

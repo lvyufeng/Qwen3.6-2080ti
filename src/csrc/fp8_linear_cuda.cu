@@ -109,6 +109,88 @@ __global__ void float_rows_to_half_kernel(const float* __restrict__ x, __half* _
     }
 }
 
+__global__ void fp8_moe_gate_up_silu_kernel(
+    const float* __restrict__ hidden,
+    const uint8_t* __restrict__ gate_weight,
+    const uint16_t* __restrict__ gate_scale,
+    const uint8_t* __restrict__ up_weight,
+    const uint16_t* __restrict__ up_scale,
+    float* __restrict__ activation,
+    int hidden_size,
+    int intermediate_size,
+    int input_scale_cols) {
+    const int row = blockIdx.x;
+    const int batch = blockIdx.y;
+    if (row >= intermediate_size) return;
+    const int row_block = row / kFp8BlockSize;
+    const float* batch_hidden = hidden + static_cast<size_t>(batch) * hidden_size;
+
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (int col = threadIdx.x; col < hidden_size; col += blockDim.x) {
+        const int col_block = col / kFp8BlockSize;
+        const size_t weight_idx = static_cast<size_t>(row) * hidden_size + col;
+        const size_t scale_idx = static_cast<size_t>(row_block) * input_scale_cols + col_block;
+        const float x = batch_hidden[col];
+        gate_sum += kFp8E4M3Lut[gate_weight[weight_idx]] * bf16_bits_to_float(gate_scale[scale_idx]) * x;
+        up_sum += kFp8E4M3Lut[up_weight[weight_idx]] * bf16_bits_to_float(up_scale[scale_idx]) * x;
+    }
+
+    extern __shared__ float scratch[];
+    float* gate_scratch = scratch;
+    float* up_scratch = scratch + blockDim.x;
+    gate_scratch[threadIdx.x] = gate_sum;
+    up_scratch[threadIdx.x] = up_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            gate_scratch[threadIdx.x] += gate_scratch[threadIdx.x + stride];
+            up_scratch[threadIdx.x] += up_scratch[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const float gate = gate_scratch[0];
+        const float up = up_scratch[0];
+        const float silu = gate / (1.0f + expf(-gate));
+        activation[static_cast<size_t>(batch) * intermediate_size + row] = silu * up;
+    }
+}
+
+__global__ void fp8_moe_down_kernel(
+    const float* __restrict__ activation,
+    const uint8_t* __restrict__ down_weight,
+    const uint16_t* __restrict__ down_scale,
+    float* __restrict__ output,
+    int hidden_size,
+    int intermediate_size,
+    int down_scale_cols) {
+    const int row = blockIdx.x;
+    const int batch = blockIdx.y;
+    if (row >= hidden_size) return;
+    const int row_block = row / kFp8BlockSize;
+    const float* batch_activation = activation + static_cast<size_t>(batch) * intermediate_size;
+
+    float sum = 0.0f;
+    for (int col = threadIdx.x; col < intermediate_size; col += blockDim.x) {
+        const int col_block = col / kFp8BlockSize;
+        const size_t weight_idx = static_cast<size_t>(row) * intermediate_size + col;
+        const size_t scale_idx = static_cast<size_t>(row_block) * down_scale_cols + col_block;
+        sum += kFp8E4M3Lut[down_weight[weight_idx]] * bf16_bits_to_float(down_scale[scale_idx]) * batch_activation[col];
+    }
+
+    extern __shared__ float scratch[];
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) output[static_cast<size_t>(batch) * hidden_size + row] = scratch[0];
+}
+
 struct Fp8Workspace {
     int device = -1;
     __half* d_x_half = nullptr;
@@ -171,7 +253,15 @@ void check_cublas(cublasStatus_t status, const char* what) {
     TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, what, ": cublas status ", static_cast<int>(status));
 }
 
+void check_moe_expert_tensor_basics(const torch::Tensor& tensor, const char* name, at::ScalarType scalar_type) {
+    TORCH_CHECK(tensor.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(tensor.scalar_type() == scalar_type, name, " has unexpected dtype");
+    TORCH_CHECK(tensor.dim() == 2, name, " must be rank-2");
+}
+
 }  // namespace
+
 
 torch::Tensor fp8_e4m3_bf16_linear(torch::Tensor input, torch::Tensor weight, torch::Tensor scale) {
     TORCH_CHECK(input.is_cuda(), "input must be CUDA");
@@ -265,4 +355,82 @@ torch::Tensor fp8_e4m3_bf16_linear(torch::Tensor input, torch::Tensor weight, to
     auto out_shape = input.sizes().vec();
     out_shape.back() = rows;
     return out.view(out_shape);
+}
+
+
+torch::Tensor fp8_e4m3_bf16_moe_expert(
+    torch::Tensor hidden,
+    torch::Tensor gate_weight,
+    torch::Tensor gate_scale,
+    torch::Tensor up_weight,
+    torch::Tensor up_scale,
+    torch::Tensor down_weight,
+    torch::Tensor down_scale) {
+    check_moe_expert_tensor_basics(hidden, "hidden", at::kFloat);
+    check_moe_expert_tensor_basics(gate_weight, "gate_weight", at::kFloat8_e4m3fn);
+    check_moe_expert_tensor_basics(gate_scale, "gate_scale", at::kBFloat16);
+    check_moe_expert_tensor_basics(up_weight, "up_weight", at::kFloat8_e4m3fn);
+    check_moe_expert_tensor_basics(up_scale, "up_scale", at::kBFloat16);
+    check_moe_expert_tensor_basics(down_weight, "down_weight", at::kFloat8_e4m3fn);
+    check_moe_expert_tensor_basics(down_scale, "down_scale", at::kBFloat16);
+
+    const auto batch64 = hidden.size(0);
+    const auto hidden64 = hidden.size(1);
+    const auto intermediate64 = gate_weight.size(0);
+    TORCH_CHECK(batch64 > 0 && batch64 <= INT_MAX, "batch must be positive and fit int32");
+    TORCH_CHECK(hidden64 > 0 && hidden64 <= INT_MAX, "hidden size must be positive and fit int32");
+    TORCH_CHECK(intermediate64 > 0 && intermediate64 <= INT_MAX, "intermediate size must be positive and fit int32");
+    TORCH_CHECK(gate_weight.size(1) == hidden64, "gate_weight cols must match hidden size");
+    TORCH_CHECK(up_weight.size(0) == intermediate64 && up_weight.size(1) == hidden64, "up_weight shape must match gate_weight");
+    TORCH_CHECK(down_weight.size(0) == hidden64 && down_weight.size(1) == intermediate64, "down_weight shape must be [hidden, intermediate]");
+    TORCH_CHECK(hidden64 % kFp8BlockSize == 0, "hidden size must be divisible by 128 for fused MoE expert op");
+    TORCH_CHECK(intermediate64 % kFp8BlockSize == 0, "intermediate size must be divisible by 128 for fused MoE expert op");
+    TORCH_CHECK(gate_scale.size(0) == intermediate64 / kFp8BlockSize, "gate_scale row blocks mismatch");
+    TORCH_CHECK(gate_scale.size(1) == hidden64 / kFp8BlockSize, "gate_scale col blocks mismatch");
+    TORCH_CHECK(up_scale.size(0) == intermediate64 / kFp8BlockSize, "up_scale row blocks mismatch");
+    TORCH_CHECK(up_scale.size(1) == hidden64 / kFp8BlockSize, "up_scale col blocks mismatch");
+    TORCH_CHECK(down_scale.size(0) == hidden64 / kFp8BlockSize, "down_scale row blocks mismatch");
+    TORCH_CHECK(down_scale.size(1) == intermediate64 / kFp8BlockSize, "down_scale col blocks mismatch");
+
+    c10::cuda::CUDAGuard device_guard(hidden.device());
+    TORCH_CHECK(gate_weight.device() == hidden.device(), "gate_weight must be on same CUDA device as hidden");
+    TORCH_CHECK(gate_scale.device() == hidden.device(), "gate_scale must be on same CUDA device as hidden");
+    TORCH_CHECK(up_weight.device() == hidden.device(), "up_weight must be on same CUDA device as hidden");
+    TORCH_CHECK(up_scale.device() == hidden.device(), "up_scale must be on same CUDA device as hidden");
+    TORCH_CHECK(down_weight.device() == hidden.device(), "down_weight must be on same CUDA device as hidden");
+    TORCH_CHECK(down_scale.device() == hidden.device(), "down_scale must be on same CUDA device as hidden");
+    TORCH_CHECK(ensure_fp8_lut(), "failed to initialize FP8 LUT");
+
+    const int batch = static_cast<int>(batch64);
+    const int hidden_size = static_cast<int>(hidden64);
+    const int intermediate_size = static_cast<int>(intermediate64);
+    auto activation = torch::empty({batch, intermediate_size}, hidden.options());
+    auto output = torch::empty({batch, hidden_size}, hidden.options());
+    auto stream = at::cuda::getCurrentCUDAStream(hidden.device().index()).stream();
+    const int threads = 256;
+    const int input_scale_cols = hidden_size / kFp8BlockSize;
+    const int down_scale_cols = intermediate_size / kFp8BlockSize;
+
+    fp8_moe_gate_up_silu_kernel<<<dim3(intermediate_size, batch), threads, 2 * threads * sizeof(float), stream>>>(
+        hidden.data_ptr<float>(),
+        reinterpret_cast<const uint8_t*>(gate_weight.data_ptr()),
+        reinterpret_cast<const uint16_t*>(gate_scale.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const uint8_t*>(up_weight.data_ptr()),
+        reinterpret_cast<const uint16_t*>(up_scale.data_ptr<at::BFloat16>()),
+        activation.data_ptr<float>(),
+        hidden_size,
+        intermediate_size,
+        input_scale_cols);
+    check_cuda(cudaGetLastError(), "fp8_moe_gate_up_silu_kernel");
+
+    fp8_moe_down_kernel<<<dim3(hidden_size, batch), threads, threads * sizeof(float), stream>>>(
+        activation.data_ptr<float>(),
+        reinterpret_cast<const uint8_t*>(down_weight.data_ptr()),
+        reinterpret_cast<const uint16_t*>(down_scale.data_ptr<at::BFloat16>()),
+        output.data_ptr<float>(),
+        hidden_size,
+        intermediate_size,
+        down_scale_cols);
+    check_cuda(cudaGetLastError(), "fp8_moe_down_kernel");
+    return output;
 }
