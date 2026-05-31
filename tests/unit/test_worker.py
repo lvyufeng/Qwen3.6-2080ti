@@ -481,6 +481,74 @@ def test_worker_step_advances_request_and_poll_reports_progress(tmp_path: Path, 
     assert status_done.data["scheduler"]["completed"] == 1
 
 
+def test_worker_targeted_step_runs_multiple_active_requests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "first", "max_new_tokens": 2, "request_id": "a"})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "second", "max_new_tokens": 2, "request_id": "b"})).ok is True
+
+    first_a = execute_command(state, WorkerCommand(STEP, {"request_id": "a"}))
+    poll_b = execute_command(state, WorkerCommand(POLL, {"request_id": "b"}))
+    first_b = execute_command(state, WorkerCommand(STEP, {"request_id": "b"}))
+    done_a = execute_command(state, WorkerCommand(STEP, {"request_id": "a"}))
+    status_mid = execute_command(state, WorkerCommand(STATUS, {}))
+    done_b = execute_command(state, WorkerCommand(STEP, {"request_id": "b"}))
+    status_done = execute_command(state, WorkerCommand(STATUS, {}))
+
+    assert first_a.data["request_id"] == "a"
+    assert first_a.data["status"] == "RUNNING"
+    assert first_a.data["scheduler"]["running"] == "a"
+    assert first_a.data["scheduler"]["running_count"] == 2
+    assert first_a.data["scheduler"]["running_ids"] == ["a", "b"]
+    _assert_event(first_a.data["event"], request_id="a", type="token", status="RUNNING", sequence=1, token_ids=[first_a.data["progress"]["latest_token_id"]], is_terminal=False)
+
+    assert poll_b.data["request_id"] == "b"
+    assert poll_b.data["status"] == "RUNNING"
+    assert poll_b.data["progress"]["generated_tokens"] == 0
+    assert poll_b.data["progress"]["latest_token_id"] is None
+    _assert_event(poll_b.data["event"], request_id="b", type="running", status="RUNNING", sequence=0, token_ids=[], is_terminal=False)
+
+    assert first_b.data["request_id"] == "b"
+    assert first_b.data["status"] == "RUNNING"
+    assert first_b.data["progress"]["generated_tokens"] == 1
+    _assert_event(first_b.data["event"], request_id="b", type="token", status="RUNNING", sequence=1, token_ids=[first_b.data["progress"]["latest_token_id"]], is_terminal=False)
+
+    assert done_a.data["request_id"] == "a"
+    assert done_a.data["status"] == "COMPLETED"
+    assert done_a.data["scheduler"]["running"] == "b"
+    assert done_a.data["scheduler"]["running_count"] == 1
+    assert status_mid.data["active_generation"]["request_id"] == "b"
+    assert [item["request_id"] for item in status_mid.data["active_generations"]] == ["b"]
+
+    assert done_b.data["request_id"] == "b"
+    assert done_b.data["status"] == "COMPLETED"
+    assert done_b.data["scheduler"]["running"] is None
+    assert done_b.data["scheduler"]["running_count"] == 0
+    assert status_done.data["active_generation"] is None
+    assert status_done.data["active_generations"] == []
+    assert status_done.data["scheduler"]["completed"] == 2
+
+
+def test_worker_untargeted_step_round_robins_active_requests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "first", "max_new_tokens": 3, "request_id": "a"})).ok is True
+    assert execute_command(state, WorkerCommand(SUBMIT, {"prompt": "second", "max_new_tokens": 3, "request_id": "b"})).ok is True
+
+    steps = [execute_command(state, WorkerCommand(STEP, {})) for _ in range(4)]
+
+    assert [step.data["request_id"] for step in steps] == ["a", "b", "a", "b"]
+    assert [step.data["status"] for step in steps] == ["RUNNING", "RUNNING", "RUNNING", "RUNNING"]
+    assert steps[0].data["scheduler"]["running_count"] == 2
+    assert steps[0].data["scheduler"]["running_ids"] == ["a", "b"]
+
+
 def test_worker_load_reload_clears_active_stepped_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_tiny_model(tmp_path)
     _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
@@ -1318,6 +1386,8 @@ def _empty_scheduler_data() -> dict[str, object]:
     return {
         "pending": 0,
         "running": None,
+        "running_count": 0,
+        "running_ids": [],
         "completed": 0,
         "failed": 0,
         "total_submitted": 0,

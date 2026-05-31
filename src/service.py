@@ -61,17 +61,16 @@ class WorkerService:
         payload = _generate_payload(prompt, max_new_tokens, request_id)
 
         def _iterator() -> Iterator[dict[str, Any]]:
-            with self._lock:
-                submit = self._maybe_alias_request_id(self._dispatch_unlocked(request_id, SUBMIT, payload))
-                yield submit
-                if not submit.get("ok", False):
+            submit = self.dispatch(request_id, SUBMIT, payload)
+            yield submit
+            if not submit.get("ok", False):
+                return
+            request_label = submit.get("id") if isinstance(submit.get("id"), str) else submit["data"].get("request_id")
+            while True:
+                step = self.dispatch(request_label, STEP, {"request_id": request_label})
+                yield step
+                if not step.get("ok", False) or _response_event_is_terminal_or_idle(step):
                     return
-                request_label = submit.get("id") if isinstance(submit.get("id"), str) else submit["data"].get("request_id")
-                while True:
-                    step = self._maybe_alias_request_id(self._dispatch_unlocked(request_label, STEP, {}))
-                    yield step
-                    if not step.get("ok", False) or _response_event_is_terminal_or_idle(step):
-                        return
 
         return _iterator()
 

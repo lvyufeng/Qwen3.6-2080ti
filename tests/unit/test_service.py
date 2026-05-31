@@ -75,6 +75,40 @@ def test_worker_service_stream_generate_emits_queued_token_and_completed_events(
     assert responses[2]["data"]["event"]["is_terminal"] is True
 
 
+def test_worker_service_stream_generate_iterators_interleave_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    launch = TpLaunchConfig(backend="gloo", device="cpu")
+    state = WorkerState(launch)
+
+    with TpRuntime(launch) as runtime:
+        service = WorkerService(state, runtime)
+        assert service.load_model(str(tmp_path))["ok"] is True
+        stream_a = service.stream_generate("first", 2, request_id="a")
+        stream_b = service.stream_generate("second", 2, request_id="b")
+
+        queued_a = next(stream_a)
+        queued_b = next(stream_b)
+        token_a = next(stream_a)
+        token_b = next(stream_b)
+        completed_a = next(stream_a)
+        completed_b = next(stream_b)
+
+    assert [queued_a["data"]["event"]["type"], queued_b["data"]["event"]["type"]] == ["queued", "queued"]
+    assert token_a["id"] == "a"
+    assert token_b["id"] == "b"
+    assert token_a["data"]["event"]["type"] == "token"
+    assert token_b["data"]["event"]["type"] == "token"
+    assert token_a["data"]["scheduler"]["running_ids"] == ["a", "b"]
+    assert completed_a["id"] == "a"
+    assert completed_b["id"] == "b"
+    assert completed_a["data"]["event"]["type"] == "completed"
+    assert completed_b["data"]["event"]["type"] == "completed"
+
+
 def test_worker_http_healthz_and_status() -> None:
     launch = TpLaunchConfig(backend="gloo", device="cpu")
     state = WorkerState(launch)

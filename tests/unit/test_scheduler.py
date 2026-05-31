@@ -27,6 +27,8 @@ def test_scheduler_submit_generate_assigns_fifo_ids() -> None:
     snapshot = scheduler.snapshot()
     assert snapshot.pending == 2
     assert snapshot.running is None
+    assert snapshot.running_count == 0
+    assert snapshot.running_ids == ()
     assert snapshot.total_submitted == 2
 
 
@@ -195,6 +197,8 @@ def test_scheduler_begin_next_claims_fifo_head() -> None:
     snapshot = scheduler.snapshot()
     assert snapshot.pending == 1
     assert snapshot.running == "gen-1"
+    assert snapshot.running_count == 1
+    assert snapshot.running_ids == ("gen-1",)
 
 
 def test_scheduler_complete_running_records_terminal_result() -> None:
@@ -264,5 +268,72 @@ def test_scheduler_clear_resets_running_request() -> None:
     scheduler.clear()
 
     assert scheduler.running_request() is None
-    assert scheduler.snapshot().running is None
+    snapshot = scheduler.snapshot()
+    assert snapshot.running is None
+    assert snapshot.running_count == 0
+    assert snapshot.running_ids == ()
     assert scheduler.submit_generate("again", 1).request_id == "gen-1"
+
+
+def test_scheduler_begin_many_claims_fifo_requests() -> None:
+    scheduler = RequestScheduler(clock=FakeClock())
+    first = scheduler.submit_generate("first", 1, request_id="a")
+    second = scheduler.submit_generate("second", 1, request_id="b")
+    scheduler.submit_generate("third", 1, request_id="c")
+
+    running = scheduler.begin_many(2)
+
+    assert running == [first, second]
+    assert scheduler.running_request() == first
+    assert scheduler.running_request("b") == second
+    assert scheduler.running_request_ids() == ("a", "b")
+    snapshot = scheduler.snapshot()
+    assert snapshot.pending == 1
+    assert snapshot.running == "a"
+    assert snapshot.running_count == 2
+    assert snapshot.running_ids == ("a", "b")
+
+
+def test_scheduler_complete_and_fail_specific_running_requests() -> None:
+    scheduler = RequestScheduler(clock=FakeClock())
+    scheduler.submit_generate("first", 1, request_id="a")
+    scheduler.submit_generate("second", 1, request_id="b")
+    scheduler.begin_many(2)
+
+    completed = scheduler.complete_request("b", "done-b")
+    failed = scheduler.fail_request("a", RuntimeError("boom-a"))
+
+    assert completed.request_id == "b"
+    assert completed.status is RequestStatus.COMPLETED
+    assert completed.result == "done-b"
+    assert failed.request_id == "a"
+    assert failed.status is RequestStatus.FAILED
+    assert failed.error == "boom-a"
+    assert scheduler.running_request() is None
+    assert scheduler.result_for("a") == failed
+    assert scheduler.result_for("b") == completed
+    snapshot = scheduler.snapshot()
+    assert snapshot.running_count == 0
+    assert snapshot.completed == 1
+    assert snapshot.failed == 1
+
+
+def test_scheduler_legacy_complete_requires_single_running_request() -> None:
+    scheduler = RequestScheduler(clock=FakeClock())
+    scheduler.submit_generate("first", 1, request_id="a")
+    scheduler.submit_generate("second", 1, request_id="b")
+    scheduler.begin_many(2)
+
+    with pytest.raises(SchedulerError, match="exactly one running"):
+        scheduler.complete_running("done")
+    with pytest.raises(SchedulerError, match="exactly one running"):
+        scheduler.fail_running("boom")
+
+
+def test_scheduler_rejects_duplicate_running_request_id() -> None:
+    scheduler = RequestScheduler(clock=FakeClock())
+    scheduler.submit_generate("first", 1, request_id="a")
+    scheduler.begin_next_running()
+
+    with pytest.raises(SchedulerError, match="duplicate active request id"):
+        scheduler.submit_generate("again", 1, request_id="a")

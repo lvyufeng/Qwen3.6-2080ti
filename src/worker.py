@@ -20,6 +20,8 @@ STEP = "STEP"
 STATUS = "STATUS"
 SHUTDOWN = "SHUTDOWN"
 
+DEFAULT_MAX_ACTIVE_REQUESTS = 4
+
 
 class WorkerError(RuntimeError):
     pass
@@ -56,7 +58,27 @@ class WorkerState:
     loaded_model_dir: str | None = None
     should_shutdown: bool = False
     scheduler: RequestScheduler = field(default_factory=RequestScheduler)
-    active_generation: ActiveGeneration | None = None
+    active_generations: dict[str, ActiveGeneration] = field(default_factory=dict)
+    round_robin_index: int = 0
+
+    @property
+    def active_generation(self) -> ActiveGeneration | None:
+        return _primary_active_generation(self)
+
+    @active_generation.setter
+    def active_generation(self, value: ActiveGeneration | None) -> None:
+        self.active_generations.clear()
+        self.round_robin_index = 0
+        if value is not None:
+            self.active_generations[value.request_id] = value
+
+
+def _primary_active_generation(state: WorkerState) -> ActiveGeneration | None:
+    return next(iter(state.active_generations.values()), None)
+
+
+def _active_generation_ids(state: WorkerState) -> list[str]:
+    return list(state.active_generations)
 
 
 def broadcast_command(command: WorkerCommand | None, runtime: TpRuntime, *, src: int = 0) -> WorkerCommand:
@@ -348,12 +370,12 @@ def _execute_submit(state: WorkerState, command: WorkerCommand, runtime: TpRunti
 def _execute_poll(state: WorkerState, command: WorkerCommand, runtime: TpRuntime | None = None) -> WorkerResult:
     session = _require_loaded_session(state, runtime)
     request_id = _payload_str(command, "request_id")
-    active = state.active_generation
-    if active is not None and active.request_id == request_id:
-        data = _step_running_data(state, active, event_type="running")
+    active = state.active_generations.get(request_id)
+    if active is not None:
+        data = _step_running_data(state, active, event_type="running") if active.last_step is not None else _step_started_data(state, active)
         return WorkerResult(POLL, state.launch.rank, True, data)
     scheduled = state.scheduler.result_for(request_id)
-    if scheduled is None and active is None and state.scheduler.is_pending(request_id):
+    if scheduled is None and not state.active_generations and state.scheduler.is_pending(request_id):
         state.scheduler.run_next(lambda request: session.generate(request.prompt, request.max_new_tokens), reraise=False)
         scheduled = state.scheduler.result_for(request_id)
     if scheduled is not None:
@@ -368,42 +390,54 @@ def _execute_poll(state: WorkerState, command: WorkerCommand, runtime: TpRuntime
 
 def _execute_step(state: WorkerState, command: WorkerCommand, runtime: TpRuntime | None = None) -> WorkerResult:
     session = _require_loaded_session(state, runtime)
-    snapshot = state.scheduler.snapshot()
-    active = state.active_generation
+    request_id = _payload_optional_str(command, "request_id")
+    activation_failure = _activate_pending_requests(state, session, target_request_id=request_id)
+    if activation_failure is not None:
+        return activation_failure
+    active = _select_active_generation(state, request_id)
     if active is None:
+        if request_id is not None and state.scheduler.is_pending(request_id):
+            data = _step_pending_data(state, request_id)
+            return WorkerResult(STEP, state.launch.rank, True, data)
+        if request_id is not None:
+            scheduled = state.scheduler.result_for(request_id)
+            if scheduled is not None:
+                data = _poll_terminal_data(request_id, scheduled)
+                data["scheduler"] = _scheduler_snapshot_data(state.scheduler.snapshot())
+                return WorkerResult(STEP, state.launch.rank, True, data)
+            data = _poll_unknown_data(request_id)
+            data["progress"] = None
+            data["timings"] = None
+            data["scheduler"] = _scheduler_snapshot_data(state.scheduler.snapshot())
+            return WorkerResult(STEP, state.launch.rank, True, data)
+        return _step_idle_response(state)
+    return _step_active_generation(state, session, active)
+
+
+
+def _activate_pending_requests(
+    state: WorkerState,
+    session: TpModelSession,
+    *,
+    target_request_id: str | None,
+) -> WorkerResult | None:
+    if (
+        target_request_id is not None
+        and target_request_id not in state.active_generations
+        and not state.scheduler.is_pending(target_request_id)
+    ):
+        return None
+    while len(state.active_generations) < DEFAULT_MAX_ACTIVE_REQUESTS:
         try:
-            request = state.scheduler.begin_next()
+            request = state.scheduler.begin_next_running()
         except SchedulerError as exc:
             if "no pending request" not in str(exc):
                 raise
-            return WorkerResult(
-                STEP,
-                state.launch.rank,
-                True,
-                {
-                    "request_id": None,
-                    "found": False,
-                    "status": None,
-                    "result": None,
-                    "error": None,
-                    "progress": None,
-                    "timings": None,
-                    "event": _event_data(
-                        request_id=None,
-                        type="idle",
-                        status=None,
-                        sequence=None,
-                        token_ids=[],
-                        is_terminal=False,
-                    ),
-                    "scheduler": _scheduler_snapshot_data(snapshot),
-                },
-            )
+            return None
         try:
             generation_state = session.start_generation(request.prompt, request.max_new_tokens)
         except Exception as exc:
-            state.scheduler.fail_running(exc)
-            state.active_generation = None
+            state.scheduler.fail_request(request.request_id, exc)
             return _step_failed_response(
                 state,
                 request.request_id,
@@ -411,48 +445,125 @@ def _execute_step(state: WorkerState, command: WorkerCommand, runtime: TpRuntime
                 max_new_tokens=request.max_new_tokens,
                 generated_tokens=0,
             )
-        active = ActiveGeneration(request.request_id, generation_state)
-        state.active_generation = active
+        state.active_generations[request.request_id] = ActiveGeneration(request.request_id, generation_state)
+    return None
+
+
+def _select_active_generation(state: WorkerState, request_id: str | None) -> ActiveGeneration | None:
+    if request_id is not None:
+        return state.active_generations.get(request_id)
+    ids = _active_generation_ids(state)
+    if not ids:
+        return None
+    index = state.round_robin_index % len(ids)
+    state.round_robin_index = (index + 1) % len(ids)
+    return state.active_generations[ids[index]]
+
+
+def _step_active_generation(state: WorkerState, session: TpModelSession, active: ActiveGeneration) -> WorkerResult:
     try:
         step = session.step_generation(active.state)
         active.last_step = step
         if step.is_complete:
             result = session.finish_generation(active.state)
-            scheduled = state.scheduler.complete_running(result)
+            scheduled = state.scheduler.complete_request(active.request_id, result)
             data = _step_completed_data(state, active, result, scheduled)
-            state.active_generation = None
+            _remove_active_generation(state, active.request_id)
             return WorkerResult(STEP, state.launch.rank, True, data)
         data = _step_running_data(state, active, event_type="token")
         return WorkerResult(STEP, state.launch.rank, True, data)
     except Exception as exc:
-        max_new_tokens = active.state.max_new_tokens if active is not None else None
-        generated_tokens = len(active.state.generated_token_ids) if active is not None else 0
-        if active is not None:
-            active.state.decode_state.release()
-        if state.scheduler.running_request() is not None:
-            state.scheduler.fail_running(exc)
-        state.active_generation = None
+        max_new_tokens = active.state.max_new_tokens
+        generated_tokens = len(active.state.generated_token_ids)
+        active.state.decode_state.release()
+        if state.scheduler.running_request(active.request_id) is not None:
+            state.scheduler.fail_request(active.request_id, exc)
+        _remove_active_generation(state, active.request_id)
         return _step_failed_response(
             state,
-            active.request_id if active is not None else "unknown",
+            active.request_id,
             exc,
             max_new_tokens=max_new_tokens,
             generated_tokens=generated_tokens,
         )
 
 
-def _execute_status(state: WorkerState) -> WorkerResult:
-    active = state.active_generation
-    active_data = None
-    if active is not None:
-        latest = active.last_step
-        active_data = {
-            "request_id": active.request_id,
+def _remove_active_generation(state: WorkerState, request_id: str) -> None:
+    state.active_generations.pop(request_id, None)
+    if state.active_generations:
+        state.round_robin_index %= len(state.active_generations)
+    else:
+        state.round_robin_index = 0
+
+
+def _step_idle_response(state: WorkerState) -> WorkerResult:
+    return WorkerResult(
+        STEP,
+        state.launch.rank,
+        True,
+        {
+            "request_id": None,
+            "found": False,
+            "status": None,
+            "result": None,
+            "error": None,
+            "progress": None,
+            "timings": None,
+            "event": _event_data(
+                request_id=None,
+                type="idle",
+                status=None,
+                sequence=None,
+                token_ids=[],
+                is_terminal=False,
+            ),
+            "scheduler": _scheduler_snapshot_data(state.scheduler.snapshot()),
+        },
+    )
+
+
+def _step_pending_data(state: WorkerState, request_id: str) -> dict[str, Any]:
+    data = _poll_pending_data(request_id)
+    data["progress"] = None
+    data["timings"] = None
+    data["scheduler"] = _scheduler_snapshot_data(state.scheduler.snapshot())
+    return data
+
+
+def _step_started_data(state: WorkerState, active: ActiveGeneration) -> dict[str, Any]:
+    return {
+        "request_id": active.request_id,
+        "found": True,
+        "status": RequestStatus.RUNNING.value,
+        "result": None,
+        "error": None,
+        "progress": {
             "generated_tokens": len(active.state.generated_token_ids),
             "max_new_tokens": active.state.max_new_tokens,
-            "latest_token_id": latest.token_id if latest is not None else None,
-            "latest_token_index": latest.index if latest is not None else None,
-        }
+            "latest_token_id": None,
+            "latest_token_index": None,
+            "is_complete": active.state.completed,
+        },
+        "timings": {
+            "prefill_seconds": active.state.prefill_seconds,
+            "decode_seconds": active.state.decode_seconds,
+            "total_seconds": active.state.prefill_seconds,
+        },
+        "event": _event_data(
+            request_id=active.request_id,
+            type="running",
+            status=RequestStatus.RUNNING.value,
+            sequence=len(active.state.generated_token_ids),
+            token_ids=[],
+            is_terminal=False,
+        ),
+        "scheduler": _scheduler_snapshot_data(state.scheduler.snapshot()),
+    }
+
+
+def _execute_status(state: WorkerState) -> WorkerResult:
+    active = state.active_generation
+    active_data = None if active is None else _active_generation_data(active)
     return WorkerResult(
         STATUS,
         state.launch.rank,
@@ -462,9 +573,21 @@ def _execute_status(state: WorkerState) -> WorkerResult:
             "loaded_model_dir": state.loaded_model_dir,
             "should_shutdown": state.should_shutdown,
             "active_generation": active_data,
+            "active_generations": [_active_generation_data(item) for item in state.active_generations.values()],
             "scheduler": _scheduler_snapshot_data(state.scheduler.snapshot()),
         },
     )
+
+
+def _active_generation_data(active: ActiveGeneration) -> dict[str, Any]:
+    latest = active.last_step
+    return {
+        "request_id": active.request_id,
+        "generated_tokens": len(active.state.generated_token_ids),
+        "max_new_tokens": active.state.max_new_tokens,
+        "latest_token_id": latest.token_id if latest is not None else None,
+        "latest_token_index": latest.index if latest is not None else None,
+    }
 
 
 def _generate_result_data(result: GenerateResult) -> dict[str, Any]:
@@ -759,6 +882,8 @@ def _scheduler_snapshot_data(snapshot: SchedulerSnapshot) -> dict[str, Any]:
     return {
         "pending": snapshot.pending,
         "running": snapshot.running,
+        "running_count": snapshot.running_count,
+        "running_ids": list(snapshot.running_ids),
         "completed": snapshot.completed,
         "failed": snapshot.failed,
         "total_submitted": snapshot.total_submitted,
@@ -787,15 +912,16 @@ def _event_data(
 
 
 def _close_worker_state(state: WorkerState) -> None:
-    if state.active_generation is not None:
-        state.active_generation.state.decode_state.release()
+    for active in state.active_generations.values():
+        active.state.decode_state.release()
+    state.active_generations.clear()
+    state.round_robin_index = 0
     if state.session is not None:
         state.session.close()
     state.session = None
     state.manifest = None
     state.runtime_config = None
     state.loaded_model_dir = None
-    state.active_generation = None
     state.scheduler.clear()
 
 
