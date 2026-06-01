@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <tuple>
 
 namespace {
 
@@ -189,6 +190,77 @@ __global__ void fp8_moe_down_kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) output[static_cast<size_t>(batch) * hidden_size + row] = scratch[0];
+}
+
+__global__ void linear_attention_recurrent_core_kernel(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const float* __restrict__ initial_state,
+    float* __restrict__ output,
+    float* __restrict__ final_state,
+    int heads,
+    int seq_len,
+    int key_dim,
+    int value_dim) {
+    const int lane = blockIdx.x;
+    const int value_idx = blockIdx.y;
+    const int batch_idx = lane / heads;
+    const int head_idx = lane - batch_idx * heads;
+    const int state_base = ((batch_idx * heads + head_idx) * key_dim) * value_dim + value_idx;
+    const int token_base = ((batch_idx * heads + head_idx) * seq_len);
+
+    for (int key_idx = threadIdx.x; key_idx < key_dim; key_idx += blockDim.x) {
+        const size_t state_idx = static_cast<size_t>(state_base) + static_cast<size_t>(key_idx) * value_dim;
+        final_state[state_idx] = initial_state[state_idx];
+    }
+    __syncthreads();
+
+    extern __shared__ float scratch[];
+    for (int token = 0; token < seq_len; ++token) {
+        const int token_offset = token_base + token;
+        const float decay = expf(g[token_offset]);
+        const float beta_value = beta[token_offset];
+        const float* token_key = key + static_cast<size_t>(token_offset) * key_dim;
+        const float* token_query = query + static_cast<size_t>(token_offset) * key_dim;
+
+        float kv_sum = 0.0f;
+        for (int key_idx = threadIdx.x; key_idx < key_dim; key_idx += blockDim.x) {
+            const size_t state_idx = static_cast<size_t>(state_base) + static_cast<size_t>(key_idx) * value_dim;
+            const float state_value = final_state[state_idx] * decay;
+            final_state[state_idx] = state_value;
+            kv_sum += state_value * token_key[key_idx];
+        }
+        scratch[threadIdx.x] = kv_sum;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+            __syncthreads();
+        }
+        const float kv_mem = scratch[0];
+        const float token_value = value[(static_cast<size_t>(token_offset) * value_dim) + value_idx];
+        const float delta = (token_value - kv_mem) * beta_value;
+
+        float out_sum = 0.0f;
+        for (int key_idx = threadIdx.x; key_idx < key_dim; key_idx += blockDim.x) {
+            const size_t state_idx = static_cast<size_t>(state_base) + static_cast<size_t>(key_idx) * value_dim;
+            const float updated = final_state[state_idx] + token_key[key_idx] * delta;
+            final_state[state_idx] = updated;
+            out_sum += updated * token_query[key_idx];
+        }
+        scratch[threadIdx.x] = out_sum;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            output[(static_cast<size_t>(token_offset) * value_dim) + value_idx] = scratch[0];
+        }
+        __syncthreads();
+    }
 }
 
 struct Fp8Workspace {
@@ -433,4 +505,88 @@ torch::Tensor fp8_e4m3_bf16_moe_expert(
         down_scale_cols);
     check_cuda(cudaGetLastError(), "fp8_moe_down_kernel");
     return output;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> linear_attention_recurrent_core(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor g,
+    torch::Tensor beta,
+    torch::Tensor initial_state) {
+    TORCH_CHECK(query.is_cuda(), "query must be CUDA");
+    TORCH_CHECK(key.is_cuda(), "key must be CUDA");
+    TORCH_CHECK(value.is_cuda(), "value must be CUDA");
+    TORCH_CHECK(g.is_cuda(), "g must be CUDA");
+    TORCH_CHECK(beta.is_cuda(), "beta must be CUDA");
+    TORCH_CHECK(initial_state.is_cuda(), "initial_state must be CUDA");
+    TORCH_CHECK(query.is_contiguous(), "query must be contiguous");
+    TORCH_CHECK(key.is_contiguous(), "key must be contiguous");
+    TORCH_CHECK(value.is_contiguous(), "value must be contiguous");
+    TORCH_CHECK(g.is_contiguous(), "g must be contiguous");
+    TORCH_CHECK(beta.is_contiguous(), "beta must be contiguous");
+    TORCH_CHECK(initial_state.is_contiguous(), "initial_state must be contiguous");
+    TORCH_CHECK(query.scalar_type() == at::kFloat, "query must be float32");
+    TORCH_CHECK(key.scalar_type() == at::kFloat, "key must be float32");
+    TORCH_CHECK(value.scalar_type() == at::kFloat, "value must be float32");
+    TORCH_CHECK(g.scalar_type() == at::kFloat, "g must be float32");
+    TORCH_CHECK(beta.scalar_type() == at::kFloat, "beta must be float32");
+    TORCH_CHECK(initial_state.scalar_type() == at::kFloat, "initial_state must be float32");
+    TORCH_CHECK(query.dim() == 4, "query must have shape [batch, heads, seq_len, key_dim]");
+    TORCH_CHECK(key.dim() == 4, "key must have shape [batch, heads, seq_len, key_dim]");
+    TORCH_CHECK(value.dim() == 4, "value must have shape [batch, heads, seq_len, value_dim]");
+    TORCH_CHECK(g.dim() == 3, "g must have shape [batch, heads, seq_len]");
+    TORCH_CHECK(beta.dim() == 3, "beta must have shape [batch, heads, seq_len]");
+    TORCH_CHECK(initial_state.dim() == 4, "initial_state must have shape [batch, heads, key_dim, value_dim]");
+
+    const auto batch64 = query.size(0);
+    const auto heads64 = query.size(1);
+    const auto seq64 = query.size(2);
+    const auto key_dim64 = query.size(3);
+    const auto value_dim64 = value.size(3);
+    TORCH_CHECK(batch64 > 0 && batch64 <= INT_MAX, "batch must be positive and fit int32");
+    TORCH_CHECK(heads64 > 0 && heads64 <= INT_MAX, "heads must be positive and fit int32");
+    TORCH_CHECK(seq64 > 0 && seq64 <= INT_MAX, "seq_len must be positive and fit int32");
+    TORCH_CHECK(key_dim64 > 0 && key_dim64 <= INT_MAX, "key_dim must be positive and fit int32");
+    TORCH_CHECK(value_dim64 > 0 && value_dim64 <= INT_MAX, "value_dim must be positive and fit int32");
+    TORCH_CHECK(key.sizes() == query.sizes(), "key shape must match query shape");
+    TORCH_CHECK(value.size(0) == batch64 && value.size(1) == heads64 && value.size(2) == seq64, "value batch/head/seq must match query");
+    TORCH_CHECK(g.size(0) == batch64 && g.size(1) == heads64 && g.size(2) == seq64, "g shape must match [batch, heads, seq_len]");
+    TORCH_CHECK(beta.size(0) == batch64 && beta.size(1) == heads64 && beta.size(2) == seq64, "beta shape must match [batch, heads, seq_len]");
+    TORCH_CHECK(initial_state.size(0) == batch64 && initial_state.size(1) == heads64, "initial_state batch/head must match query");
+    TORCH_CHECK(initial_state.size(2) == key_dim64 && initial_state.size(3) == value_dim64, "initial_state key/value dims must match query/value");
+
+    c10::cuda::CUDAGuard device_guard(query.device());
+    TORCH_CHECK(key.device() == query.device(), "key must be on same CUDA device as query");
+    TORCH_CHECK(value.device() == query.device(), "value must be on same CUDA device as query");
+    TORCH_CHECK(g.device() == query.device(), "g must be on same CUDA device as query");
+    TORCH_CHECK(beta.device() == query.device(), "beta must be on same CUDA device as query");
+    TORCH_CHECK(initial_state.device() == query.device(), "initial_state must be on same CUDA device as query");
+
+    const int batch = static_cast<int>(batch64);
+    const int heads = static_cast<int>(heads64);
+    const int seq_len = static_cast<int>(seq64);
+    const int key_dim = static_cast<int>(key_dim64);
+    const int value_dim = static_cast<int>(value_dim64);
+    auto output = torch::empty({batch, heads, seq_len, value_dim}, query.options());
+    auto final_state = torch::empty({batch, heads, key_dim, value_dim}, initial_state.options());
+    auto stream = at::cuda::getCurrentCUDAStream(query.device().index()).stream();
+    const int threads = 256;
+    const dim3 grid(batch * heads, value_dim);
+
+    linear_attention_recurrent_core_kernel<<<grid, threads, threads * sizeof(float), stream>>>(
+        query.data_ptr<float>(),
+        key.data_ptr<float>(),
+        value.data_ptr<float>(),
+        g.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        initial_state.data_ptr<float>(),
+        output.data_ptr<float>(),
+        final_state.data_ptr<float>(),
+        heads,
+        seq_len,
+        key_dim,
+        value_dim);
+    check_cuda(cudaGetLastError(), "linear_attention_recurrent_core_kernel");
+    return std::make_tuple(output, final_state);
 }

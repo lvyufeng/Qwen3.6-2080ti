@@ -27,3 +27,14 @@ def fp8_e4m3_bf16_moe_expert(
         down_weight.contiguous(),
         down_scale.contiguous(),
     )
+
+
+def linear_attention_recurrent_core(query: Any, key: Any, value: Any, g: Any, beta: Any, initial_state: Any) -> Any:
+    return load_fp8_extension().linear_attention_recurrent_core(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        g.contiguous(),
+        beta.contiguous(),
+        initial_state.contiguous(),
+    )

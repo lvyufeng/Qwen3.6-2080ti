@@ -1017,21 +1017,23 @@ def _repeat_kv(hidden_states: Any, repeats: int) -> Any:
 
 
 def _recurrent_gated_delta_rule(query: Any, key: Any, value: Any, g: Any, beta: Any, *, initial_state: Any = None, return_state: bool = False) -> Any:
+    if getattr(query, "is_cuda", False):
+        try:
+            return _recurrent_gated_delta_rule_native(
+                query, key, value, g, beta, initial_state=initial_state, return_state=return_state
+            )
+        except RuntimeError:
+            pass
+    return _recurrent_gated_delta_rule_torch(query, key, value, g, beta, initial_state=initial_state, return_state=return_state)
+
+
+def _recurrent_gated_delta_rule_torch(query: Any, key: Any, value: Any, g: Any, beta: Any, *, initial_state: Any = None, return_state: bool = False) -> Any:
     import torch
 
     initial_dtype = query.dtype
-    query = l2_norm(query).transpose(1, 2).float()
-    key = l2_norm(key).transpose(1, 2).float()
-    value = value.transpose(1, 2).float()
-    beta = beta.transpose(1, 2).float()
-    g = g.transpose(1, 2).float()
-    batch, heads, seq_len, key_dim = key.shape
+    query, key, value, g, beta, state = _prepare_recurrent_gated_delta_inputs(query, key, value, g, beta, initial_state)
+    batch, heads, seq_len, _ = key.shape
     value_dim = value.shape[-1]
-    query = query * (key_dim**-0.5)
-    if initial_state is None:
-        state = torch.zeros(batch, heads, key_dim, value_dim, device=query.device, dtype=torch.float32)
-    else:
-        state = initial_state.to(device=query.device, dtype=torch.float32)
     output = torch.zeros(batch, heads, seq_len, value_dim, device=query.device, dtype=torch.float32)
     for index in range(seq_len):
         q_t = query[:, :, index]
@@ -1046,3 +1048,33 @@ def _recurrent_gated_delta_rule(query: Any, key: Any, value: Any, g: Any, beta: 
     if return_state:
         return out, state
     return out
+
+
+def _recurrent_gated_delta_rule_native(query: Any, key: Any, value: Any, g: Any, beta: Any, *, initial_state: Any = None, return_state: bool = False) -> Any:
+    initial_dtype = query.dtype
+    query, key, value, g, beta, state = _prepare_recurrent_gated_delta_inputs(query, key, value, g, beta, initial_state)
+    from fp8_cuda import linear_attention_recurrent_core
+
+    output, final_state = linear_attention_recurrent_core(query, key, value, g, beta, state)
+    out = output.transpose(1, 2).contiguous().to(initial_dtype)
+    if return_state:
+        return out, final_state
+    return out
+
+
+def _prepare_recurrent_gated_delta_inputs(query: Any, key: Any, value: Any, g: Any, beta: Any, initial_state: Any = None) -> tuple[Any, Any, Any, Any, Any, Any]:
+    import torch
+
+    query = l2_norm(query).transpose(1, 2).float().contiguous()
+    key = l2_norm(key).transpose(1, 2).float().contiguous()
+    value = value.transpose(1, 2).float().contiguous()
+    beta = beta.transpose(1, 2).float().contiguous()
+    g = g.transpose(1, 2).float().contiguous()
+    batch, heads, _, key_dim = key.shape
+    value_dim = value.shape[-1]
+    query = (query * (key_dim**-0.5)).contiguous()
+    if initial_state is None:
+        state = torch.zeros(batch, heads, key_dim, value_dim, device=query.device, dtype=torch.float32)
+    else:
+        state = initial_state.to(device=query.device, dtype=torch.float32).contiguous()
+    return query, key, value, g, beta, state

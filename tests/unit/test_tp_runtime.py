@@ -23,6 +23,7 @@ from tp_runtime import (
     tp_greedy_next_token,
     tp_language_model,
     tp_moe,
+    _recurrent_gated_delta_rule,
 )
 from loader import TensorLoader
 from weight_mapping import (
@@ -86,6 +87,23 @@ def test_runtime_profile_records_single_rank_collective_bytes() -> None:
     stats = runtime.profile_stats.scopes["collective.all_reduce_sum"]
     assert stats.calls == 1
     assert stats.bytes == tensor.numel() * tensor.element_size()
+
+
+def test_recurrent_gated_delta_rule_cpu_fallback_preserves_shape_and_state() -> None:
+    torch.manual_seed(0)
+    query = torch.randn((2, 3, 4, 5), dtype=torch.float32)
+    key = torch.randn((2, 3, 4, 5), dtype=torch.float32)
+    value = torch.randn((2, 3, 4, 6), dtype=torch.float32)
+    g = -torch.rand((2, 3, 4), dtype=torch.float32)
+    beta = torch.rand((2, 3, 4), dtype=torch.float32)
+    initial_state = torch.randn((2, 4, 5, 6), dtype=torch.float32)
+
+    out, state = _recurrent_gated_delta_rule(query, key, value, g, beta, initial_state=initial_state, return_state=True)
+
+    assert out.shape == (2, 3, 4, 6)
+    assert out.dtype == query.dtype
+    assert state.shape == (2, 4, 5, 6)
+    assert state.dtype == torch.float32
 
 
 def test_mapped_tensor_bytes_counts_local_expert_shard() -> None:
