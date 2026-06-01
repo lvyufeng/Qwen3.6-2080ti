@@ -9,7 +9,7 @@ from loader import TensorLoader
 from reference_ops import LinearDispatchStats
 from runtime_config import RuntimeConfig
 from tensor_parallel import TensorParallel
-from tp_runtime import RuntimeProfileConfig, RuntimeProfileStats, TpLaunchConfig, TpRuntime, mapped_tensor_bytes, tp_decode_step_batch, tp_decode_step_local_logits, tp_greedy_next_token
+from tp_runtime import PagedAttentionDispatchStats, RuntimeProfileConfig, RuntimeProfileStats, TpLaunchConfig, TpRuntime, mapped_tensor_bytes, tp_decode_step_batch, tp_decode_step_local_logits, tp_greedy_next_token
 from tp_weights import MappedWeightStats, MappedWeights
 from weight_mapping import build_language_model_mapping
 
@@ -47,6 +47,7 @@ class GenerateResult:
     decode_tokens_per_second: float
     total_tokens_per_second: float
     dispatch_stats: LinearDispatchStats
+    paged_attention_stats: PagedAttentionDispatchStats
     all_finite: bool
     cuda_memory: CudaMemoryStats
     profile: RuntimeProfileStats
@@ -352,6 +353,7 @@ class TpModelSession:
             decode_tokens_per_second=state.max_new_tokens / state.decode_seconds if state.decode_seconds > 0 else float("inf"),
             total_tokens_per_second=state.max_new_tokens / total_seconds if total_seconds > 0 else float("inf"),
             dispatch_stats=weights.dispatch_stats,
+            paged_attention_stats=runtime.paged_attention_stats.snapshot(),
             all_finite=all(state.step_all_finite),
             cuda_memory=_cuda_memory_stats(runtime.device),
             profile=profile,

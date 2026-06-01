@@ -85,6 +85,29 @@ class PagedKVBlockPool:
 
 
 @dataclass(frozen=True)
+class FullAttentionPageTable:
+    block_table: Any
+    sequence_length: int
+    block_size: int
+    logical_blocks: int
+    capacity_tokens: int
+    key_blocks: Any
+    value_blocks: Any
+
+
+@dataclass(frozen=True)
+class BatchedFullAttentionPageTables:
+    block_tables: Any
+    sequence_lengths: Any
+    valid_mask: Any
+    block_size: int
+    max_blocks: int
+    max_sequence_length: int
+    key_blocks: tuple[Any, ...]
+    value_blocks: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
 class FullAttentionCacheStats:
     block_size: int
     valid_tokens: int
@@ -100,6 +123,10 @@ class FullAttentionCacheStats:
     contiguous_view_calls: int
     gather_view_calls: int
     gather_copied_tokens: int
+    page_table_tensor_calls: int
+    page_metadata_calls: int
+    batched_page_table_calls: int
+    page_table_entries_total: int
     non_contiguous: bool
     estimated_key_bytes: int
     estimated_value_bytes: int
@@ -121,6 +148,10 @@ class FullAttentionCacheStats:
             "contiguous_view_calls": self.contiguous_view_calls,
             "gather_view_calls": self.gather_view_calls,
             "gather_copied_tokens": self.gather_copied_tokens,
+            "page_table_tensor_calls": self.page_table_tensor_calls,
+            "page_metadata_calls": self.page_metadata_calls,
+            "batched_page_table_calls": self.batched_page_table_calls,
+            "page_table_entries_total": self.page_table_entries_total,
             "non_contiguous": self.non_contiguous,
             "estimated_key_bytes": self.estimated_key_bytes,
             "estimated_value_bytes": self.estimated_value_bytes,
@@ -145,6 +176,10 @@ class KVCacheStats:
     contiguous_view_calls_total: int
     gather_view_calls_total: int
     gather_copied_tokens_total: int
+    page_table_tensor_calls_total: int
+    page_metadata_calls_total: int
+    batched_page_table_calls_total: int
+    page_table_entries_total: int
     non_contiguous_layers: int
     estimated_total_bytes: int
     max_valid_tokens: int
@@ -167,6 +202,10 @@ class KVCacheStats:
             "contiguous_view_calls_total": self.contiguous_view_calls_total,
             "gather_view_calls_total": self.gather_view_calls_total,
             "gather_copied_tokens_total": self.gather_copied_tokens_total,
+            "page_table_tensor_calls_total": self.page_table_tensor_calls_total,
+            "page_metadata_calls_total": self.page_metadata_calls_total,
+            "batched_page_table_calls_total": self.batched_page_table_calls_total,
+            "page_table_entries_total": self.page_table_entries_total,
             "non_contiguous_layers": self.non_contiguous_layers,
             "estimated_total_bytes": self.estimated_total_bytes,
             "max_valid_tokens": self.max_valid_tokens,
@@ -199,6 +238,10 @@ class FullAttentionCache:
     contiguous_view_calls: int = 0
     gather_view_calls: int = 0
     gather_copied_tokens: int = 0
+    page_table_tensor_calls: int = 0
+    page_metadata_calls: int = 0
+    batched_page_table_calls: int = 0
+    page_table_entries_total: int = 0
 
     def __post_init__(self) -> None:
         if self.block_size <= 0:
@@ -255,6 +298,31 @@ class FullAttentionCache:
         self.gather_copied_tokens += self.valid
         return self._gather_blocks(self.pool.key_blocks), self._gather_blocks(self.pool.value_blocks)
 
+    def page_table_tensor(self, *, device: Any | None = None) -> Any:
+        import torch
+
+        resolved_device = device
+        if resolved_device is None and self.pool.key_blocks is not None:
+            resolved_device = self.pool.key_blocks.device
+        self.page_table_tensor_calls += 1
+        return torch.tensor(self.block_table, dtype=torch.long, device=resolved_device)
+
+    def page_metadata(self) -> FullAttentionPageTable:
+        if self.pool.key_blocks is None or self.pool.value_blocks is None:
+            raise ValueError("FullAttentionCache page metadata requires allocated block storage")
+        block_table = self.page_table_tensor(device=self.pool.key_blocks.device)
+        self.page_metadata_calls += 1
+        self.page_table_entries_total += len(self.block_table)
+        return FullAttentionPageTable(
+            block_table=block_table,
+            sequence_length=self.valid,
+            block_size=self.block_size,
+            logical_blocks=len(self.block_table),
+            capacity_tokens=self.capacity,
+            key_blocks=self.pool.key_blocks,
+            value_blocks=self.pool.value_blocks,
+        )
+
     def release(self) -> None:
         self.release_calls += 1
         self.released_blocks += len(self.block_table)
@@ -280,6 +348,10 @@ class FullAttentionCache:
             contiguous_view_calls=self.contiguous_view_calls,
             gather_view_calls=self.gather_view_calls,
             gather_copied_tokens=self.gather_copied_tokens,
+            page_table_tensor_calls=self.page_table_tensor_calls,
+            page_metadata_calls=self.page_metadata_calls,
+            batched_page_table_calls=self.batched_page_table_calls,
+            page_table_entries_total=self.page_table_entries_total,
             non_contiguous=not self._is_contiguous_table(),
             estimated_key_bytes=key_bytes,
             estimated_value_bytes=value_bytes,
@@ -411,6 +483,10 @@ class DecodeState:
             contiguous_view_calls_total=sum(stats.contiguous_view_calls for stats in full_stats),
             gather_view_calls_total=sum(stats.gather_view_calls for stats in full_stats),
             gather_copied_tokens_total=sum(stats.gather_copied_tokens for stats in full_stats),
+            page_table_tensor_calls_total=sum(stats.page_table_tensor_calls for stats in full_stats),
+            page_metadata_calls_total=sum(stats.page_metadata_calls for stats in full_stats),
+            batched_page_table_calls_total=sum(stats.batched_page_table_calls for stats in full_stats),
+            page_table_entries_total=sum(stats.page_table_entries_total for stats in full_stats),
             non_contiguous_layers=sum(1 for stats in full_stats if stats.non_contiguous),
             estimated_total_bytes=sum(stats.estimated_total_bytes for stats in full_stats),
             max_valid_tokens=max((stats.valid_tokens for stats in full_stats), default=0),
@@ -460,3 +536,64 @@ def batch_kv_tensors(caches: Sequence[FullAttentionCache]) -> tuple[Any, Any, An
         valid_mask[i, :v] = True
 
     return keys, values, valid_mask
+
+
+def batch_page_tables(caches: Sequence[FullAttentionCache]) -> BatchedFullAttentionPageTables:
+    """Stack per-request full-attention page tables with -1 padding.
+
+    The returned metadata mirrors ``batch_kv_tensors`` validity semantics without
+    materializing dense K/V. Phase X keeps per-request pools, so storage references remain
+    tuples ordered like ``caches``.
+    """
+    import torch
+
+    if not caches:
+        raise ValueError("batch_page_tables requires at least one cache")
+    block_sizes = {cache.block_size for cache in caches}
+    if len(block_sizes) != 1:
+        raise ValueError("batch_page_tables requires matching block sizes")
+    if not any(cache.valid > 0 for cache in caches):
+        raise ValueError("batch_page_tables requires at least one non-empty cache")
+
+    storage_cache = next(
+        (cache for cache in caches if cache.valid > 0 and cache.key_blocks is not None and cache.value_blocks is not None),
+        None,
+    )
+    if storage_cache is None:
+        raise ValueError("batch_page_tables requires allocated block storage")
+
+    block_size = next(iter(block_sizes))
+    max_blocks = max(len(cache.block_table) for cache in caches)
+    max_sequence_length = max(cache.valid for cache in caches)
+    device = storage_cache.key_blocks.device
+    batch = len(caches)
+
+    block_tables = torch.full((batch, max_blocks), -1, dtype=torch.long, device=device)
+    sequence_lengths = torch.tensor([cache.valid for cache in caches], dtype=torch.long, device=device)
+    valid_mask = torch.zeros(batch, max_sequence_length, dtype=torch.bool, device=device)
+    key_blocks: list[Any] = []
+    value_blocks: list[Any] = []
+
+    for index, cache in enumerate(caches):
+        if cache.valid > 0 and (cache.key_blocks is None or cache.value_blocks is None):
+            raise ValueError("batch_page_tables requires allocated block storage for non-empty caches")
+        key_blocks.append(cache.key_blocks)
+        value_blocks.append(cache.value_blocks)
+        cache.batched_page_table_calls += 1
+        cache.page_table_entries_total += len(cache.block_table)
+        page_table = cache.page_table_tensor(device=device)
+        if page_table.numel() > 0:
+            block_tables[index, : page_table.numel()] = page_table
+        if cache.valid:
+            valid_mask[index, : cache.valid] = True
+
+    return BatchedFullAttentionPageTables(
+        block_tables=block_tables,
+        sequence_lengths=sequence_lengths,
+        valid_mask=valid_mask,
+        block_size=block_size,
+        max_blocks=max_blocks,
+        max_sequence_length=max_sequence_length,
+        key_blocks=tuple(key_blocks),
+        value_blocks=tuple(value_blocks),
+    )

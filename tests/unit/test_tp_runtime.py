@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,6 +24,7 @@ from tp_runtime import (
     tp_greedy_next_token,
     tp_language_model,
     tp_moe,
+    _record_paged_attention_dispatch,
     _recurrent_gated_delta_rule,
 )
 from loader import TensorLoader
@@ -261,6 +263,92 @@ def test_two_rank_safetensors_tp_decode_matches_prefill(tmp_path: Path) -> None:
     )
 
 
+def test_paged_attention_dispatch_records_disabled_fallback() -> None:
+    config = _config_with_experts_per_token(1, packed=True)
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        _record_paged_attention_dispatch(
+            runtime,
+            config,
+            torch.zeros((1, 1, 1, 1)),
+            torch.zeros((1, 1, 1, 1)),
+            torch.zeros((1, 1, 1, 1)),
+            seq_len=1,
+            batched=False,
+        )
+
+    stats = runtime.paged_attention_stats
+    assert stats.calls == 1
+    assert stats.dense_fallbacks == 1
+    assert stats.fallback_disabled == 1
+    assert stats.eligible == 0
+    assert stats.native_hits == 0
+
+
+def test_paged_attention_dispatch_records_cpu_fallback_when_enabled() -> None:
+    config = parse_runtime_config(_config())
+    config = replace(config, full_attention=replace(config.full_attention, paged_kv_metadata=True, native_paged_attention=True))
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        _record_paged_attention_dispatch(
+            runtime,
+            config,
+            torch.zeros((1, 1, 1, 1)),
+            torch.zeros((1, 1, 1, 1)),
+            torch.zeros((1, 1, 1, 1)),
+            seq_len=1,
+            batched=False,
+        )
+
+    stats = runtime.paged_attention_stats
+    assert stats.calls == 1
+    assert stats.dense_fallbacks == 1
+    assert stats.fallback_cpu == 1
+    assert stats.eligible == 0
+    assert stats.native_hits == 0
+
+
+def test_paged_attention_dispatch_records_prefill_or_multitoken_fallback_when_enabled() -> None:
+    config = parse_runtime_config(_config())
+    config = replace(config, full_attention=replace(config.full_attention, paged_kv_metadata=True, native_paged_attention=True))
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        _record_paged_attention_dispatch(
+            runtime,
+            config,
+            _fake_cuda_tensor((1, 1, 2, 1)),
+            _fake_cuda_tensor((1, 1, 2, 1)),
+            _fake_cuda_tensor((1, 1, 2, 1)),
+            seq_len=2,
+            batched=False,
+        )
+
+    stats = runtime.paged_attention_stats
+    assert stats.calls == 1
+    assert stats.dense_fallbacks == 1
+    assert stats.fallback_prefill_or_multitoken == 1
+    assert stats.eligible == 0
+    assert stats.native_hits == 0
+
+
+def test_paged_attention_dispatch_records_per_request_pool_fallback_for_batches() -> None:
+    config = parse_runtime_config(_config())
+    config = replace(config, full_attention=replace(config.full_attention, paged_kv_metadata=True, native_paged_attention=True))
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        _record_paged_attention_dispatch(
+            runtime,
+            config,
+            _fake_cuda_tensor((2, 1, 1, 1)),
+            _fake_cuda_tensor((2, 1, 1, 1)),
+            _fake_cuda_tensor((2, 1, 1, 1)),
+            seq_len=1,
+            batched=True,
+        )
+
+    stats = runtime.paged_attention_stats
+    assert stats.calls == 1
+    assert stats.dense_fallbacks == 1
+    assert stats.fallback_per_request_pools == 1
+    assert stats.eligible == 0
+    assert stats.native_hits == 0
+
 def test_two_rank_tp_greedy_next_token_matches_full_gather_argmax(tmp_path: Path) -> None:
     torch.multiprocessing.spawn(
         _tp_greedy_next_token_worker,
@@ -356,6 +444,9 @@ def _config_with_experts_per_token(experts_per_token: int, *, packed: bool, nati
         ),
     )
 
+
+def _fake_cuda_tensor(shape: tuple[int, ...]) -> SimpleNamespace:
+    return SimpleNamespace(shape=shape, is_cuda=True)
 
 def _tp_decode_worker(rank: int, tmp_path: Path) -> None:
     save_file = pytest.importorskip("safetensors.torch").save_file

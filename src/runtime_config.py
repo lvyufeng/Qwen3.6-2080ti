@@ -35,6 +35,8 @@ class FullAttentionConfig:
     num_key_value_heads: int
     head_dim: int
     output_gate: bool
+    paged_kv_metadata: bool = True
+    native_paged_attention: bool = False
 
     @property
     def attn_dim(self) -> int:
@@ -111,6 +113,8 @@ def parse_runtime_config(config: dict[str, Any]) -> RuntimeConfig:
             num_key_value_heads=_required_int(text_config, "num_key_value_heads"),
             head_dim=_required_int(text_config, "head_dim"),
             output_gate=_required_bool(text_config, "attn_output_gate"),
+            paged_kv_metadata=_optional_bool(text_config, "paged_kv_metadata", default=True),
+            native_paged_attention=_optional_bool(text_config, "native_paged_attention", default=False),
         ),
         moe=MoEConfig(
             num_experts=_required_int(text_config, "num_experts"),

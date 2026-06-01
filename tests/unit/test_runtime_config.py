@@ -24,6 +24,8 @@ def test_parse_runtime_config_derives_runtime_dimensions() -> None:
     assert config.moe.experts_per_token == 1
     assert config.moe.packed_expert_dispatch is True
     assert config.moe.native_fused_expert_dispatch is True
+    assert config.full_attention.paged_kv_metadata is True
+    assert config.full_attention.native_paged_attention is False
     assert config.fp8_scale_shape((257, 255)) == (3, 2)
 
 
@@ -58,6 +60,31 @@ def test_parse_runtime_config_rejects_bad_native_fused_expert_dispatch_type() ->
     raw["text_config"]["native_fused_expert_dispatch"] = "yes"
 
     with pytest.raises(ConfigError, match="native_fused_expert_dispatch"):
+        parse_runtime_config(raw)
+
+
+def test_parse_runtime_config_can_toggle_paged_attention_flags() -> None:
+    raw = _config()
+    raw["text_config"]["paged_kv_metadata"] = False
+    raw["text_config"]["native_paged_attention"] = True
+
+    config = parse_runtime_config(raw)
+
+    assert config.full_attention.paged_kv_metadata is False
+    assert config.full_attention.native_paged_attention is True
+
+
+def test_parse_runtime_config_rejects_bad_paged_attention_flag_type() -> None:
+    raw = _config()
+    raw["text_config"]["paged_kv_metadata"] = "yes"
+
+    with pytest.raises(ConfigError, match="paged_kv_metadata"):
+        parse_runtime_config(raw)
+
+    raw = _config()
+    raw["text_config"]["native_paged_attention"] = "yes"
+
+    with pytest.raises(ConfigError, match="native_paged_attention"):
         parse_runtime_config(raw)
 
 

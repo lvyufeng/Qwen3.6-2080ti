@@ -2,9 +2,17 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from decode_state import DEFAULT_KV_BLOCK_SIZE, DecodeState, FullAttentionCache, LinearAttentionCache, batch_kv_tensors
+from decode_state import (
+    DEFAULT_KV_BLOCK_SIZE,
+    DecodeState,
+    FullAttentionCache,
+    LinearAttentionCache,
+    batch_kv_tensors,
+    batch_page_tables,
+)
 
 
 def _kv(step: int, *, batch: int = 1, heads: int = 2, seq: int = 1, head_dim: int = 4) -> tuple[torch.Tensor, torch.Tensor]:
@@ -320,3 +328,86 @@ def test_batch_kv_tensors_single_cache() -> None:
     expected_k, expected_v = cache.as_tensors()
     torch.testing.assert_close(keys[0:1], expected_k)
     torch.testing.assert_close(values[0:1], expected_v)
+
+
+    cache = FullAttentionCache(capacity_hint=4, block_size=2)
+    cache.append(*_kv(0, seq=3))
+
+    metadata = cache.page_metadata()
+
+    torch.testing.assert_close(metadata.block_table.cpu(), torch.tensor(cache.block_table, dtype=torch.long))
+    assert metadata.sequence_length == 3
+    assert metadata.block_size == 2
+    assert metadata.logical_blocks == 2
+    assert metadata.capacity_tokens == 4
+    assert metadata.key_blocks is cache.key_blocks
+    assert metadata.value_blocks is cache.value_blocks
+    stats = cache.stats()
+    assert stats.page_table_tensor_calls == 1
+    assert stats.page_metadata_calls == 1
+    assert stats.page_table_entries_total == 2
+
+
+def test_page_table_tensor_preserves_non_contiguous_logical_order() -> None:
+    cache = FullAttentionCache(capacity_hint=6, block_size=2)
+    cache.append(*_kv(0, seq=6))
+    cache.block_table = [2, 0, 1]
+
+    table = cache.page_table_tensor()
+
+    assert table.tolist() == [2, 0, 1]
+    assert cache.stats().page_table_tensor_calls == 1
+
+
+def test_batch_page_tables_pads_and_masks_different_valid_lengths() -> None:
+    cache_a = FullAttentionCache(block_size=2)
+    cache_b = FullAttentionCache(block_size=2)
+    cache_a.append(*_kv(0, seq=3))
+    cache_b.append(*_kv(1, seq=5))
+
+    metadata = batch_page_tables([cache_a, cache_b])
+
+    assert metadata.block_size == 2
+    assert metadata.max_blocks == 3
+    assert metadata.max_sequence_length == 5
+    assert metadata.block_tables.shape == (2, 3)
+    assert metadata.block_tables[0].tolist() == [0, 1, -1]
+    assert metadata.block_tables[1].tolist() == [0, 1, 2]
+    assert metadata.sequence_lengths.tolist() == [3, 5]
+    assert metadata.valid_mask.tolist() == [
+        [True, True, True, False, False],
+        [True, True, True, True, True],
+    ]
+    assert metadata.key_blocks == (cache_a.key_blocks, cache_b.key_blocks)
+    assert metadata.value_blocks == (cache_a.value_blocks, cache_b.value_blocks)
+    assert cache_a.stats().batched_page_table_calls == 1
+    assert cache_b.stats().batched_page_table_calls == 1
+    assert cache_a.stats().page_table_entries_total == 2
+    assert cache_b.stats().page_table_entries_total == 3
+
+
+def test_batch_page_tables_rejects_mixed_block_sizes() -> None:
+    cache_a = FullAttentionCache(block_size=2)
+    cache_b = FullAttentionCache(block_size=4)
+    cache_a.append(*_kv(0, seq=1))
+    cache_b.append(*_kv(1, seq=1))
+
+    with pytest.raises(ValueError, match="matching block sizes"):
+        batch_page_tables([cache_a, cache_b])
+
+
+def test_decode_state_kv_stats_aggregates_page_metadata_counters() -> None:
+    mapping = _mapping(("full_attention", "full_attention"))
+    state = DecodeState.empty(mapping, None, max_seq_len=4, kv_block_size=2)
+    full_caches = [layer for layer in state.layers if isinstance(layer, FullAttentionCache)]
+    for index, cache in enumerate(full_caches):
+        cache.append(*_kv(index, seq=2))
+        cache.page_metadata()
+    batch_page_tables(full_caches)
+
+    stats = state.kv_stats()
+
+    assert stats.page_table_tensor_calls_total == 4
+    assert stats.page_metadata_calls_total == 2
+    assert stats.batched_page_table_calls_total == 2
+    assert stats.page_table_entries_total == 8

@@ -18,7 +18,7 @@ from reference_ops import (
     silu_mul,
     topk_route,
 )
-from decode_state import DecodeState, FullAttentionCache, LinearAttentionCache, batch_kv_tensors
+from decode_state import DecodeState, FullAttentionCache, LinearAttentionCache, batch_kv_tensors, batch_page_tables
 from runtime_config import RuntimeConfig
 from weight_mapping import LanguageModelMapping, LayerMapping, LinearTensor, MoEMapping, ShardedTensor
 
@@ -70,6 +70,26 @@ class ProfileScopeStats:
             "output_tokens": self.output_tokens,
             "bytes": self.bytes,
         }
+
+
+@dataclass
+class PagedAttentionDispatchStats:
+    calls: int = 0
+    eligible: int = 0
+    dense_fallbacks: int = 0
+    native_hits: int = 0
+    fallback_disabled: int = 0
+    fallback_no_kernel: int = 0
+    fallback_prefill_or_multitoken: int = 0
+    fallback_cpu: int = 0
+    fallback_per_request_pools: int = 0
+    fallback_shape: int = 0
+
+    def snapshot(self) -> PagedAttentionDispatchStats:
+        return PagedAttentionDispatchStats(**vars(self))
+
+    def to_dict(self) -> dict[str, int]:
+        return dict(vars(self))
 
 
 @dataclass
@@ -163,6 +183,7 @@ class TpRuntime:
         self._owns_process_group = False
         self.profile_config = RuntimeProfileConfig()
         self.profile_stats = RuntimeProfileStats()
+        self.paged_attention_stats = PagedAttentionDispatchStats()
 
     def __enter__(self) -> TpRuntime:
         import torch
@@ -207,12 +228,14 @@ class TpRuntime:
             enabled=self.profile_config.enabled,
             sync_cuda=self.profile_config.sync_cuda,
         )
+        self.paged_attention_stats = PagedAttentionDispatchStats()
 
     def reset_profile(self) -> None:
         self.profile_stats = RuntimeProfileStats(
             enabled=self.profile_config.enabled,
             sync_cuda=self.profile_config.sync_cuda,
         )
+        self.paged_attention_stats = PagedAttentionDispatchStats()
 
     @contextmanager
     def profile_scope(
@@ -481,6 +504,93 @@ def tp_full_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig, w
     if cache is not None:
         with runtime.profile_scope("full_attention.cache_append"):
             key, value = cache.append(key, value)
+        return _tp_full_attention_paged_or_dense(
+            query,
+            gate,
+            key,
+            value,
+            hidden_states,
+            mapping,
+            config,
+            weights,
+            runtime,
+            cache=cache,
+            position_offset=position_offset,
+        )
+    return _tp_full_attention_dense_from_kv(
+        query,
+        gate,
+        key,
+        value,
+        hidden_states,
+        mapping,
+        config,
+        weights,
+        runtime,
+        position_offset=position_offset,
+    )
+
+
+def _tp_full_attention_paged_or_dense(
+    query: Any,
+    gate: Any,
+    key: Any,
+    value: Any,
+    hidden_states: Any,
+    mapping: Any,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    *,
+    cache: FullAttentionCache,
+    position_offset: int,
+) -> Any:
+    if config.full_attention.paged_kv_metadata:
+        with runtime.profile_scope("full_attention.page_metadata"):
+            cache.page_metadata()
+    with runtime.profile_scope("full_attention.paged_dispatch"):
+        _record_paged_attention_dispatch(
+            runtime,
+            config,
+            query,
+            key,
+            value,
+            seq_len=int(query.shape[2]),
+            batched=False,
+        )
+    with runtime.profile_scope("full_attention.dense_fallback"):
+        return _tp_full_attention_dense_from_kv(
+            query,
+            gate,
+            key,
+            value,
+            hidden_states,
+            mapping,
+            config,
+            weights,
+            runtime,
+            position_offset=position_offset,
+        )
+
+
+def _tp_full_attention_dense_from_kv(
+    query: Any,
+    gate: Any,
+    key: Any,
+    value: Any,
+    hidden_states: Any,
+    mapping: Any,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    *,
+    position_offset: int,
+) -> Any:
+    import torch
+
+    batch, seq_len, _ = hidden_states.shape
+    full = config.full_attention
+    local_heads = full.num_heads // runtime.config.world_size
     with runtime.profile_scope("full_attention.scores"):
         scores = torch.matmul(query.float(), key.float().transpose(2, 3)) * (full.head_dim**-0.5)
         key_positions = torch.arange(key.shape[2], device=hidden_states.device)
@@ -496,6 +606,64 @@ def tp_full_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig, w
         partial = weights.linear(out, mapping.o_proj).to(hidden_states.dtype)
     with runtime.profile_scope("full_attention.all_reduce"):
         return runtime.all_reduce_sum(partial)
+
+
+def _record_paged_attention_dispatch(
+    runtime: TpRuntime,
+    config: RuntimeConfig,
+    query: Any,
+    key: Any,
+    value: Any,
+    *,
+    seq_len: int,
+    batched: bool,
+) -> None:
+    stats = runtime.paged_attention_stats
+    stats.calls += 1
+    reason = _paged_attention_fallback_reason(config, query, key, value, seq_len=seq_len, batched=batched)
+    if reason == "no_kernel":
+        stats.eligible += 1
+    stats.dense_fallbacks += 1
+    if reason == "disabled":
+        stats.fallback_disabled += 1
+    elif reason == "cpu":
+        stats.fallback_cpu += 1
+    elif reason == "prefill_or_multitoken":
+        stats.fallback_prefill_or_multitoken += 1
+    elif reason == "per_request_pools":
+        stats.fallback_per_request_pools += 1
+    elif reason == "shape":
+        stats.fallback_shape += 1
+    else:
+        stats.fallback_no_kernel += 1
+
+
+def _paged_attention_fallback_reason(
+    config: RuntimeConfig,
+    query: Any,
+    key: Any,
+    value: Any,
+    *,
+    seq_len: int,
+    batched: bool,
+) -> str:
+    if not config.full_attention.paged_kv_metadata or not config.full_attention.native_paged_attention:
+        return "disabled"
+    if not getattr(query, "is_cuda", False) or not getattr(key, "is_cuda", False) or not getattr(value, "is_cuda", False):
+        return "cpu"
+    if seq_len != 1:
+        return "prefill_or_multitoken"
+    if batched:
+        return "per_request_pools"
+    if len(getattr(query, "shape", ())) != 4 or len(getattr(key, "shape", ())) != 4 or len(getattr(value, "shape", ())) != 4:
+        return "shape"
+    if int(query.shape[0]) != int(key.shape[0]) or int(query.shape[0]) != int(value.shape[0]):
+        return "shape"
+    if int(query.shape[1]) != int(key.shape[1]) or int(query.shape[1]) != int(value.shape[1]):
+        return "shape"
+    if int(query.shape[3]) != int(key.shape[3]) or int(query.shape[3]) != int(value.shape[3]):
+        return "shape"
+    return "no_kernel"
 
 
 def tp_linear_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig, weights: ReferenceWeights, runtime: TpRuntime, *, cache: LinearAttentionCache | None = None) -> Any:
@@ -1010,9 +1178,85 @@ def _tp_full_attention_batch(
         for r in range(batch):
             caches[r].append(key[r: r + 1], value[r: r + 1])
 
+    return _tp_full_attention_batch_paged_or_dense(
+        query,
+        gate,
+        hidden_states,
+        mapping,
+        config,
+        weights,
+        runtime,
+        caches=caches,
+        position_offsets=position_offsets,
+    )
+
+
+def _tp_full_attention_batch_paged_or_dense(
+    query: Any,
+    gate: Any,
+    hidden_states: Any,
+    mapping: Any,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    *,
+    caches: list[FullAttentionCache],
+    position_offsets: Any,
+) -> Any:
+    page_tables = None
+    if config.full_attention.paged_kv_metadata:
+        with runtime.profile_scope("batch.full_attention.page_metadata"):
+            page_tables = batch_page_tables(caches)
+    with runtime.profile_scope("batch.full_attention.paged_dispatch"):
+        first_cache = next(cache for cache in caches if cache.key_blocks is not None and cache.value_blocks is not None)
+        _record_paged_attention_dispatch(
+            runtime,
+            config,
+            query,
+            first_cache.key_blocks,
+            first_cache.value_blocks,
+            seq_len=int(query.shape[2]),
+            batched=True,
+        )
+    with runtime.profile_scope("batch.full_attention.dense_fallback"):
+        return _tp_full_attention_batch_dense_from_kv(
+            query,
+            gate,
+            hidden_states,
+            mapping,
+            config,
+            weights,
+            runtime,
+            caches=caches,
+            position_offsets=position_offsets,
+            valid_mask=None if page_tables is None else page_tables.valid_mask,
+        )
+
+
+def _tp_full_attention_batch_dense_from_kv(
+    query: Any,
+    gate: Any,
+    hidden_states: Any,
+    mapping: Any,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    *,
+    caches: list[FullAttentionCache],
+    position_offsets: Any,
+    valid_mask: Any | None = None,
+) -> Any:
+    import torch
+
+    batch, seq_len, _ = hidden_states.shape
+    full = config.full_attention
+    local_heads = full.num_heads // runtime.config.world_size
+
     # Gather KV across requests with padding
     with runtime.profile_scope("batch.full_attention.batch_kv_tensors"):
-        batched_keys, batched_values, valid_mask = batch_kv_tensors(caches)
+        batched_keys, batched_values, dense_valid_mask = batch_kv_tensors(caches)
+    if valid_mask is None:
+        valid_mask = dense_valid_mask
     # batched_keys: (B, local_heads, max_valid, head_dim)
     # valid_mask: (B, max_valid)
 
@@ -1041,6 +1285,7 @@ def _tp_full_attention_batch(
         partial = weights.linear(out, mapping.o_proj).to(hidden_states.dtype)
     with runtime.profile_scope("batch.full_attention.all_reduce"):
         return runtime.all_reduce_sum(partial)
+
 
 
 def _tp_linear_attention_batch(

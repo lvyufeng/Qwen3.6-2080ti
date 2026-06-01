@@ -240,11 +240,14 @@ def test_worker_load_then_generate_single_rank(tmp_path: Path, monkeypatch: pyte
     assert generate_result.data["dispatch"]["calls"] >= 0
     assert "moe_packed_single_scatter_calls" in generate_result.data["dispatch"]
     assert "moe_native_assignment_hits" in generate_result.data["dispatch"]
+    assert generate_result.data["paged_attention"]["calls"] >= 1
+    assert generate_result.data["paged_attention"]["dense_fallbacks"] >= 1
+    assert generate_result.data["paged_attention"]["native_hits"] == 0
     assert generate_result.data["memory"]["available"] is False
     assert generate_result.data["profile"]["enabled"] is False
     assert generate_result.data["profile"]["scopes"] == {}
-    assert generate_result.data["kv_cache"]["full_attention_layers"] == 1
-    assert generate_result.data["kv_cache"]["capacity_tokens_total"] >= generate_result.data["kv_cache"]["valid_tokens_total"]
+    assert generate_result.data["kv_cache"]["page_metadata_calls_total"] >= 1
+    assert "page_table_entries_total" in generate_result.data["kv_cache"]
 
 
 def test_worker_profile_enabled_result_has_scopes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

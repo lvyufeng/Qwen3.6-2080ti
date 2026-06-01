@@ -803,6 +803,7 @@ def _generate_result_data(result: GenerateResult) -> dict[str, Any]:
         "timings": _timings_data(result),
         "throughput": _throughput_data(result),
         "dispatch": _dispatch_stats_data(result),
+        "paged_attention": result.paged_attention_stats.to_dict(),
         "memory": _cuda_memory_data(result),
         "profile": _profile_data(result),
         "kv_cache": _kv_cache_data(result),
