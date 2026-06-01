@@ -10,7 +10,7 @@ import torch
 
 import engine
 from test_engine import _patch_tokenizer, _write_tiny_model
-from tp_runtime import TpLaunchConfig, TpRuntime
+from tp_runtime import RuntimeProfileConfig, TpLaunchConfig, TpRuntime
 from worker import (
     GENERATE,
     LOAD,
@@ -239,6 +239,25 @@ def test_worker_load_then_generate_single_rank(tmp_path: Path, monkeypatch: pyte
     assert generate_result.data["throughput"]["total_tokens_per_second"] > 0
     assert generate_result.data["dispatch"]["calls"] >= 0
     assert generate_result.data["memory"]["available"] is False
+    assert generate_result.data["profile"]["enabled"] is False
+    assert generate_result.data["profile"]["scopes"] == {}
+    assert generate_result.data["kv_cache"]["full_attention_layers"] == 1
+    assert generate_result.data["kv_cache"]["capacity_tokens_total"] >= generate_result.data["kv_cache"]["valid_tokens_total"]
+
+
+def test_worker_profile_enabled_result_has_scopes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    launch = TpLaunchConfig(backend="gloo", device="cpu")
+    state = WorkerState(launch, profile_config=RuntimeProfileConfig(enabled=True))
+
+    assert execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)})).ok is True
+    generate_result = execute_command(state, WorkerCommand(GENERATE, {"prompt": "hello", "max_new_tokens": 1}))
+
+    assert generate_result.ok is True
+    assert generate_result.data["profile"]["enabled"] is True
+    assert "embedding" in generate_result.data["profile"]["scopes"]
+
 
 
 def test_worker_generate_routes_through_scheduler(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1591,6 +1610,10 @@ def test_worker_status_reports_serving_controls(tmp_path: Path, monkeypatch: pyt
         "active_count": 0,
         "pending_event_requests": 0,
         "pending_event_count": 0,
+        "active_kv_estimated_total_bytes": 0,
+        "active_kv_valid_tokens_total": 0,
+        "active_kv_capacity_tokens_total": 0,
+        "active_kv_allocated_blocks_total": 0,
     }
 
 

@@ -13,6 +13,7 @@ from runtime_config import parse_runtime_config
 from tensor_parallel import TensorParallel
 from decode_state import DecodeState
 from tp_runtime import (
+    RuntimeProfileConfig,
     TpLaunchConfig,
     TpRuntime,
     TpRuntimeError,
@@ -50,6 +51,41 @@ def test_single_rank_runtime_all_reduce_is_noop_cpu() -> None:
 
     assert out is tensor
     torch.testing.assert_close(tensor, torch.tensor([1.0, 2.0]))
+
+
+def test_runtime_profile_disabled_is_noop() -> None:
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        with runtime.profile_scope("example"):
+            pass
+
+    assert runtime.profile_stats.enabled is False
+    assert runtime.profile_stats.scopes == {}
+
+
+def test_runtime_profile_records_scope_cpu() -> None:
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        runtime.configure_profiling(RuntimeProfileConfig(enabled=True))
+        with runtime.profile_scope("example", input_tokens=2, bytes=4):
+            torch.tensor([1.0, 2.0]).sum()
+
+    stats = runtime.profile_stats.scopes["example"]
+    assert stats.calls == 1
+    assert stats.total_seconds >= 0
+    assert stats.max_seconds >= 0
+    assert stats.input_tokens == 2
+    assert stats.bytes == 4
+
+
+def test_runtime_profile_records_single_rank_collective_bytes() -> None:
+    tensor = torch.tensor([1.0, 2.0])
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        runtime.configure_profiling(RuntimeProfileConfig(enabled=True))
+        runtime.all_reduce_sum(tensor)
+
+    stats = runtime.profile_stats.scopes["collective.all_reduce_sum"]
+    assert stats.calls == 1
+    assert stats.bytes == tensor.numel() * tensor.element_size()
 
 
 def test_mapped_tensor_bytes_counts_local_expert_shard() -> None:

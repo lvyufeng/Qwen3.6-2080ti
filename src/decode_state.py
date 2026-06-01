@@ -84,6 +84,96 @@ class PagedKVBlockPool:
         self.free_blocks.sort()
 
 
+@dataclass(frozen=True)
+class FullAttentionCacheStats:
+    block_size: int
+    valid_tokens: int
+    capacity_tokens: int
+    logical_blocks: int
+    allocated_blocks: int
+    free_blocks: int
+    append_calls: int
+    appended_tokens: int
+    growth_events: int
+    release_calls: int
+    released_blocks: int
+    contiguous_view_calls: int
+    gather_view_calls: int
+    gather_copied_tokens: int
+    non_contiguous: bool
+    estimated_key_bytes: int
+    estimated_value_bytes: int
+    estimated_total_bytes: int
+
+    def to_dict(self) -> dict[str, int | bool]:
+        return {
+            "block_size": self.block_size,
+            "valid_tokens": self.valid_tokens,
+            "capacity_tokens": self.capacity_tokens,
+            "logical_blocks": self.logical_blocks,
+            "allocated_blocks": self.allocated_blocks,
+            "free_blocks": self.free_blocks,
+            "append_calls": self.append_calls,
+            "appended_tokens": self.appended_tokens,
+            "growth_events": self.growth_events,
+            "release_calls": self.release_calls,
+            "released_blocks": self.released_blocks,
+            "contiguous_view_calls": self.contiguous_view_calls,
+            "gather_view_calls": self.gather_view_calls,
+            "gather_copied_tokens": self.gather_copied_tokens,
+            "non_contiguous": self.non_contiguous,
+            "estimated_key_bytes": self.estimated_key_bytes,
+            "estimated_value_bytes": self.estimated_value_bytes,
+            "estimated_total_bytes": self.estimated_total_bytes,
+        }
+
+
+@dataclass(frozen=True)
+class KVCacheStats:
+    full_attention_layers: int
+    block_size: int | None
+    valid_tokens_total: int
+    capacity_tokens_total: int
+    logical_blocks_total: int
+    allocated_blocks_total: int
+    free_blocks_total: int
+    append_calls_total: int
+    appended_tokens_total: int
+    growth_events_total: int
+    release_calls_total: int
+    released_blocks_total: int
+    contiguous_view_calls_total: int
+    gather_view_calls_total: int
+    gather_copied_tokens_total: int
+    non_contiguous_layers: int
+    estimated_total_bytes: int
+    max_valid_tokens: int
+    max_capacity_tokens: int
+
+    def to_dict(self) -> dict[str, int | None]:
+        return {
+            "full_attention_layers": self.full_attention_layers,
+            "block_size": self.block_size,
+            "valid_tokens_total": self.valid_tokens_total,
+            "capacity_tokens_total": self.capacity_tokens_total,
+            "logical_blocks_total": self.logical_blocks_total,
+            "allocated_blocks_total": self.allocated_blocks_total,
+            "free_blocks_total": self.free_blocks_total,
+            "append_calls_total": self.append_calls_total,
+            "appended_tokens_total": self.appended_tokens_total,
+            "growth_events_total": self.growth_events_total,
+            "release_calls_total": self.release_calls_total,
+            "released_blocks_total": self.released_blocks_total,
+            "contiguous_view_calls_total": self.contiguous_view_calls_total,
+            "gather_view_calls_total": self.gather_view_calls_total,
+            "gather_copied_tokens_total": self.gather_copied_tokens_total,
+            "non_contiguous_layers": self.non_contiguous_layers,
+            "estimated_total_bytes": self.estimated_total_bytes,
+            "max_valid_tokens": self.max_valid_tokens,
+            "max_capacity_tokens": self.max_capacity_tokens,
+        }
+
+
 @dataclass
 class FullAttentionCache:
     """Paged per-layer KV cache for full attention.
@@ -101,6 +191,14 @@ class FullAttentionCache:
     valid: int = 0
     block_table: list[int] = field(default_factory=list)
     pool: PagedKVBlockPool = field(init=False)
+    append_calls: int = 0
+    appended_tokens: int = 0
+    growth_events: int = 0
+    release_calls: int = 0
+    released_blocks: int = 0
+    contiguous_view_calls: int = 0
+    gather_view_calls: int = 0
+    gather_copied_tokens: int = 0
 
     def __post_init__(self) -> None:
         if self.block_size <= 0:
@@ -125,6 +223,8 @@ class FullAttentionCache:
 
     def append(self, key: Any, value: Any) -> tuple[Any, Any]:
         batch, heads, seq, head_dim = key.shape
+        self.append_calls += 1
+        self.appended_tokens += int(seq)
         needed = self.valid + seq
         self._ensure_logical_capacity(needed, key, value)
         source_offset = 0
@@ -149,13 +249,42 @@ class FullAttentionCache:
         if self.valid == 0:
             raise ValueError("FullAttentionCache has no valid tokens")
         if self._is_contiguous_table():
+            self.contiguous_view_calls += 1
             return self._contiguous_view(self.pool.key_blocks), self._contiguous_view(self.pool.value_blocks)
+        self.gather_view_calls += 1
+        self.gather_copied_tokens += self.valid
         return self._gather_blocks(self.pool.key_blocks), self._gather_blocks(self.pool.value_blocks)
 
     def release(self) -> None:
+        self.release_calls += 1
+        self.released_blocks += len(self.block_table)
         self.pool.release(self.block_table)
         self.block_table.clear()
         self.valid = 0
+
+    def stats(self) -> FullAttentionCacheStats:
+        key_bytes = _tensor_nbytes(self.pool.key_blocks)
+        value_bytes = _tensor_nbytes(self.pool.value_blocks)
+        return FullAttentionCacheStats(
+            block_size=self.block_size,
+            valid_tokens=self.valid,
+            capacity_tokens=self.capacity,
+            logical_blocks=len(self.block_table),
+            allocated_blocks=self.pool.block_count,
+            free_blocks=len(self.pool.free_blocks),
+            append_calls=self.append_calls,
+            appended_tokens=self.appended_tokens,
+            growth_events=self.growth_events,
+            release_calls=self.release_calls,
+            released_blocks=self.released_blocks,
+            contiguous_view_calls=self.contiguous_view_calls,
+            gather_view_calls=self.gather_view_calls,
+            gather_copied_tokens=self.gather_copied_tokens,
+            non_contiguous=not self._is_contiguous_table(),
+            estimated_key_bytes=key_bytes,
+            estimated_value_bytes=value_bytes,
+            estimated_total_bytes=key_bytes + value_bytes,
+        )
 
     def _ensure_logical_capacity(self, needed: int, key: Any, value: Any) -> None:
         if needed <= self.capacity:
@@ -165,6 +294,7 @@ class FullAttentionCache:
         missing = target_blocks - len(self.block_table)
         if missing <= 0:
             return
+        self.growth_events += 1
         self.block_table.extend(self.pool.allocate(missing, key, value))
 
     def _is_contiguous_table(self) -> bool:
@@ -200,6 +330,15 @@ class FullAttentionCache:
 
 def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+def _tensor_nbytes(tensor: Any | None) -> int:
+    if tensor is None:
+        return 0
+    nbytes = getattr(tensor, "nbytes", None)
+    if isinstance(nbytes, int):
+        return nbytes
+    return int(tensor.numel() * tensor.element_size())
 
 
 @dataclass
@@ -251,6 +390,32 @@ class DecodeState:
         for layer in self.layers:
             if isinstance(layer, FullAttentionCache):
                 layer.release()
+
+    def kv_stats(self) -> KVCacheStats:
+        full_stats = [layer.stats() for layer in self.layers if isinstance(layer, FullAttentionCache)]
+        block_sizes = {stats.block_size for stats in full_stats}
+        block_size = next(iter(block_sizes)) if len(block_sizes) == 1 else None
+        return KVCacheStats(
+            full_attention_layers=len(full_stats),
+            block_size=block_size,
+            valid_tokens_total=sum(stats.valid_tokens for stats in full_stats),
+            capacity_tokens_total=sum(stats.capacity_tokens for stats in full_stats),
+            logical_blocks_total=sum(stats.logical_blocks for stats in full_stats),
+            allocated_blocks_total=sum(stats.allocated_blocks for stats in full_stats),
+            free_blocks_total=sum(stats.free_blocks for stats in full_stats),
+            append_calls_total=sum(stats.append_calls for stats in full_stats),
+            appended_tokens_total=sum(stats.appended_tokens for stats in full_stats),
+            growth_events_total=sum(stats.growth_events for stats in full_stats),
+            release_calls_total=sum(stats.release_calls for stats in full_stats),
+            released_blocks_total=sum(stats.released_blocks for stats in full_stats),
+            contiguous_view_calls_total=sum(stats.contiguous_view_calls for stats in full_stats),
+            gather_view_calls_total=sum(stats.gather_view_calls for stats in full_stats),
+            gather_copied_tokens_total=sum(stats.gather_copied_tokens for stats in full_stats),
+            non_contiguous_layers=sum(1 for stats in full_stats if stats.non_contiguous),
+            estimated_total_bytes=sum(stats.estimated_total_bytes for stats in full_stats),
+            max_valid_tokens=max((stats.valid_tokens for stats in full_stats), default=0),
+            max_capacity_tokens=max((stats.capacity_tokens for stats in full_stats), default=0),
+        )
 
 
 def batch_kv_tensors(caches: Sequence[FullAttentionCache]) -> tuple[Any, Any, Any]:

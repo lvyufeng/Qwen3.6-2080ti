@@ -11,7 +11,7 @@ from decode_state import FullAttentionCache
 from engine import EngineError, TpModelRunner, TpModelSession
 import engine
 from runtime_config import parse_runtime_config
-from tp_runtime import TpLaunchConfig
+from tp_runtime import RuntimeProfileConfig, TpLaunchConfig
 from test_cli import _runtime_config
 from test_weight_mapping import add_full_attention_layer, add_moe, write_safetensors
 
@@ -46,6 +46,31 @@ def test_tp_model_runner_generate_single_rank_cpu_gloo(tmp_path: Path, monkeypat
     assert len(result.generated_token_ids) == 2
     assert result.text == "decoded:" + ",".join(str(token) for token in result.generated_token_ids)
     assert result.cuda_memory.available is False
+    assert result.profile.enabled is False
+    assert result.profile.scopes == {}
+    assert result.kv_cache.full_attention_layers == 1
+    assert result.kv_cache.valid_tokens_total > 0
+    assert result.kv_cache.capacity_tokens_total >= result.kv_cache.valid_tokens_total
+
+
+def test_tp_model_session_profile_enabled_records_scopes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    manifest = build_manifest(tmp_path)
+
+    with TpModelSession(
+        manifest,
+        parse_runtime_config(manifest.config),
+        TpLaunchConfig(backend="gloo", device="cpu"),
+        profile_config=RuntimeProfileConfig(enabled=True),
+    ) as session:
+        result = session.generate("hello", max_new_tokens=1)
+
+    assert result.profile.enabled is True
+    assert "embedding" in result.profile.scopes
+    assert "layers_total" in result.profile.scopes
+    assert "lm_head" in result.profile.scopes
+
 
 
 def test_tp_model_session_reuses_loaded_weights(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -273,10 +298,13 @@ def test_step_generations_batch_produces_same_tokens_as_sequential(tmp_path: Pat
         for _ in range(3):
             steps = session.step_generations_batch([state_a_batch, state_b_batch])
             assert len(steps) == 2
+        result = session.finish_generation(state_a_batch)
 
     # Both paths should produce the same tokens (deterministic greedy decode)
     assert state_a_batch.generated_token_ids == state_a_seq.generated_token_ids
     assert state_b_batch.generated_token_ids == state_b_seq.generated_token_ids
+    assert result.kv_cache.full_attention_layers == 1
+    assert result.kv_cache.valid_tokens_total > 0
 
 
 def test_step_generations_batch_single_request_delegates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

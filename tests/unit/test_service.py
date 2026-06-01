@@ -49,6 +49,8 @@ def test_worker_service_load_and_generate(tmp_path: Path, monkeypatch: pytest.Mo
     assert generated["data"]["status"] == "COMPLETED"
     assert generated["data"]["event"]["type"] == "completed"
     assert generated["data"]["text"].startswith("decoded:")
+    assert generated["data"]["profile"]["enabled"] is False
+    assert generated["data"]["kv_cache"]["full_attention_layers"] == 1
 
 
 def test_worker_service_stream_generate_emits_queued_token_and_completed_events(
@@ -258,6 +260,8 @@ def test_worker_http_stream_generate_sends_sse_events(tmp_path: Path, monkeypatc
     assert [payload["data"]["event"]["type"] for payload in payloads] == ["queued", "token", "completed"]
     assert payloads[-1]["id"] == "job-1"
     assert payloads[-1]["data"]["result"]["text"].startswith("decoded:")
+    assert payloads[-1]["data"]["result"]["profile"]["enabled"] is False
+    assert payloads[-1]["data"]["result"]["kv_cache"]["full_attention_layers"] == 1
 
 
 def test_worker_http_reports_client_errors() -> None:

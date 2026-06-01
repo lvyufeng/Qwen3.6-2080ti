@@ -4,12 +4,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from checkpoint import Manifest
-from decode_state import DecodeState
+from decode_state import DecodeState, KVCacheStats
 from loader import TensorLoader
 from reference_ops import LinearDispatchStats
 from runtime_config import RuntimeConfig
 from tensor_parallel import TensorParallel
-from tp_runtime import TpLaunchConfig, TpRuntime, mapped_tensor_bytes, tp_decode_step_batch, tp_decode_step_local_logits, tp_greedy_next_token
+from tp_runtime import RuntimeProfileConfig, RuntimeProfileStats, TpLaunchConfig, TpRuntime, mapped_tensor_bytes, tp_decode_step_batch, tp_decode_step_local_logits, tp_greedy_next_token
 from tp_weights import MappedWeightStats, MappedWeights
 from weight_mapping import build_language_model_mapping
 
@@ -49,6 +49,8 @@ class GenerateResult:
     dispatch_stats: LinearDispatchStats
     all_finite: bool
     cuda_memory: CudaMemoryStats
+    profile: RuntimeProfileStats
+    kv_cache: KVCacheStats
     generated_token_ids: list[int]
     text: str | None
 
@@ -83,10 +85,18 @@ class GenerationRequestState:
 
 
 class TpModelSession:
-    def __init__(self, manifest: Manifest, runtime_config: RuntimeConfig, launch: TpLaunchConfig) -> None:
+    def __init__(
+        self,
+        manifest: Manifest,
+        runtime_config: RuntimeConfig,
+        launch: TpLaunchConfig,
+        *,
+        profile_config: RuntimeProfileConfig | None = None,
+    ) -> None:
         self.manifest = manifest
         self.runtime_config = runtime_config
         self.launch = launch
+        self.profile_config = profile_config or RuntimeProfileConfig()
         self.tp = TensorParallel(world_size=launch.world_size, rank=launch.rank)
         self.mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=self.tp)
         self.runtime: TpRuntime | None = None
@@ -110,6 +120,7 @@ class TpModelSession:
         try:
             runtime = TpRuntime(self.launch)
             runtime.__enter__()
+            runtime.configure_profiling(self.profile_config)
             self.runtime = runtime
             self.tokenizer = AutoTokenizer.from_pretrained(self.manifest.model_dir, local_files_only=True, trust_remote_code=True)
             loader = TensorLoader(self.manifest)
@@ -151,6 +162,7 @@ class TpModelSession:
         if input_ids.shape[1] == 0:
             raise EngineError("TP generation requires at least one prompt token")
         weights.dispatch_stats = LinearDispatchStats()
+        runtime.reset_profile()
         # Final cache length is prompt_tokens + max_new_tokens - 1; this upper bound lets the
         # full-attention buffers allocate once so the decode loop never reallocates.
         max_seq_len = input_ids.shape[1] + max_new_tokens
@@ -319,6 +331,8 @@ class TpModelSession:
         total_end = time.perf_counter()
         total_seconds = _elapsed_seconds(state.total_start, total_end)
         state.result_built = True
+        profile = runtime.profile_stats.snapshot()
+        kv_cache = state.decode_state.kv_stats()
         result = GenerateResult(
             backend=self.launch.backend,
             world_size=self.launch.world_size,
@@ -340,6 +354,8 @@ class TpModelSession:
             dispatch_stats=weights.dispatch_stats,
             all_finite=all(state.step_all_finite),
             cuda_memory=_cuda_memory_stats(runtime.device),
+            profile=profile,
+            kv_cache=kv_cache,
             generated_token_ids=state.generated_token_ids if self.launch.rank == 0 else [],
             text=self.tokenizer.decode(state.generated_token_ids, skip_special_tokens=False) if self.launch.rank == 0 else None,
         )
@@ -385,15 +401,23 @@ class TpModelSession:
 
 
 class TpModelRunner:
-    def __init__(self, manifest: Manifest, runtime_config: RuntimeConfig, launch: TpLaunchConfig) -> None:
+    def __init__(
+        self,
+        manifest: Manifest,
+        runtime_config: RuntimeConfig,
+        launch: TpLaunchConfig,
+        *,
+        profile_config: RuntimeProfileConfig | None = None,
+    ) -> None:
         self.manifest = manifest
         self.runtime_config = runtime_config
         self.launch = launch
+        self.profile_config = profile_config or RuntimeProfileConfig()
         self.tp = TensorParallel(world_size=launch.world_size, rank=launch.rank)
         self.mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=self.tp)
 
     def generate(self, prompt: str, max_new_tokens: int) -> GenerateResult:
-        with TpModelSession(self.manifest, self.runtime_config, self.launch) as session:
+        with TpModelSession(self.manifest, self.runtime_config, self.launch, profile_config=self.profile_config) as session:
             return session.generate(prompt, max_new_tokens)
 
 

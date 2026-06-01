@@ -11,7 +11,7 @@ from checkpoint import Manifest, build_manifest
 from engine import GenerationRequestState, GenerationStep, GenerateResult, TpModelSession
 from runtime_config import RuntimeConfig, parse_runtime_config
 from scheduler import RequestScheduler, RequestStatus, ScheduledResult, SchedulerError, SchedulerSnapshot
-from tp_runtime import TpLaunchConfig, TpRuntime
+from tp_runtime import RuntimeProfileConfig, TpLaunchConfig, TpRuntime
 
 LOAD = "LOAD"
 GENERATE = "GENERATE"
@@ -68,6 +68,7 @@ class WorkerState:
     max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS
     max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS
     batch_step_mode: str = STEP_MODE_LEGACY
+    profile_config: RuntimeProfileConfig = field(default_factory=RuntimeProfileConfig)
 
     @property
     def active_generation(self) -> ActiveGeneration | None:
@@ -297,7 +298,7 @@ def _execute_load(state: WorkerState, command: WorkerCommand) -> WorkerResult:
     _close_worker_state(state)
     manifest = build_manifest(Path(model_dir))
     runtime_config = parse_runtime_config(manifest.config)
-    session = TpModelSession(manifest, runtime_config, state.launch)
+    session = TpModelSession(manifest, runtime_config, state.launch, profile_config=state.profile_config)
     session.load()
     state.manifest = manifest
     state.runtime_config = runtime_config
@@ -803,6 +804,8 @@ def _generate_result_data(result: GenerateResult) -> dict[str, Any]:
         "throughput": _throughput_data(result),
         "dispatch": _dispatch_stats_data(result),
         "memory": _cuda_memory_data(result),
+        "profile": _profile_data(result),
+        "kv_cache": _kv_cache_data(result),
     }
 
 
@@ -897,6 +900,14 @@ def _cuda_memory_data(result: GenerateResult) -> dict[str, Any]:
         "max_allocated": memory.max_allocated,
         "max_reserved": memory.max_reserved,
     }
+
+
+def _profile_data(result: GenerateResult) -> dict[str, Any]:
+    return result.profile.to_dict()
+
+
+def _kv_cache_data(result: GenerateResult) -> dict[str, Any]:
+    return result.kv_cache.to_dict()
 
 
 def _scheduled_result_data(result: ScheduledResult[GenerateResult]) -> dict[str, Any]:
@@ -1103,6 +1114,7 @@ def _scheduler_snapshot_data(snapshot: SchedulerSnapshot) -> dict[str, Any]:
 
 
 def _serving_state_data(state: WorkerState) -> dict[str, Any]:
+    active_kv = [active.state.decode_state.kv_stats() for active in state.active_generations.values()]
     return {
         "max_active_requests": state.max_active_requests,
         "max_pending_requests": state.max_pending_requests,
@@ -1110,6 +1122,10 @@ def _serving_state_data(state: WorkerState) -> dict[str, Any]:
         "active_count": len(state.active_generations),
         "pending_event_requests": len(state.pending_events),
         "pending_event_count": sum(len(queue) for queue in state.pending_events.values()),
+        "active_kv_estimated_total_bytes": sum(stats.estimated_total_bytes for stats in active_kv),
+        "active_kv_valid_tokens_total": sum(stats.valid_tokens_total for stats in active_kv),
+        "active_kv_capacity_tokens_total": sum(stats.capacity_tokens_total for stats in active_kv),
+        "active_kv_allocated_blocks_total": sum(stats.allocated_blocks_total for stats in active_kv),
     }
 
 

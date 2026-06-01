@@ -5,14 +5,14 @@ from pathlib import Path
 
 from checkpoint import CheckpointError, Manifest, build_manifest
 from decode_state import DecodeState
-from engine import EngineError, GenerateResult, TpModelRunner
+from engine import EngineError, GenerateResult, TpModelRunner, TpModelSession
 from fp8_smoke import Fp8SmokeReport, inspect_fp8_checkpoint
 from loader import LoaderError, TensorLoader
 from reference_ops import ReferenceWeights, decode_step, decoder_layer, embedding, language_model
 from runtime_config import ConfigError, RuntimeConfig, parse_runtime_config
 from service import ServiceConfig, serve_worker_http
 from tensor_parallel import TensorParallel
-from tp_runtime import TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_decode_step, tp_language_model
+from tp_runtime import RuntimeProfileConfig, TpLaunchConfig, TpRuntime, TpRuntimeError, mapped_tensor_bytes, tp_decode_step, tp_language_model
 from tp_weights import MappedWeights
 from weight_mapping import LanguageModelMapping, MappingError, build_language_model_mapping
 from worker import (
@@ -284,9 +284,10 @@ def _summarize_tp_generate(
     backend: str,
     init_method: str | None,
     device: str | None,
+    profile_config: RuntimeProfileConfig | None = None,
 ) -> list[str]:
     launch = _tp_launch_from_args(world_size, rank, local_rank, backend, init_method, device)
-    runner = TpModelRunner(manifest, runtime_config, launch)
+    runner = TpModelRunner(manifest, runtime_config, launch, profile_config=profile_config)
     return _format_tp_generate_result(runner.generate(prompt, max_new_tokens))
 
 
@@ -347,6 +348,8 @@ def _format_tp_generate_result(result: GenerateResult) -> list[str]:
         f"tp_generate_dispatch_moe_native_expert_max_group_tokens: {dispatch.moe_native_expert_max_group_tokens}",
         f"tp_generate_all_finite: {result.all_finite}",
     ]
+    lines.extend(_format_kv_cache_lines("tp_generate", result.kv_cache.to_dict()))
+    lines.extend(_format_profile_lines("tp_generate", result.profile.to_dict()))
     memory = result.cuda_memory
     if memory.available:
         lines.extend(
@@ -369,8 +372,175 @@ def _format_tp_generate_result(result: GenerateResult) -> list[str]:
     return lines
 
 
+def _format_kv_cache_lines(prefix: str, kv_cache: dict[str, object]) -> list[str]:
+    keys = [
+        "full_attention_layers",
+        "block_size",
+        "valid_tokens_total",
+        "capacity_tokens_total",
+        "logical_blocks_total",
+        "allocated_blocks_total",
+        "free_blocks_total",
+        "append_calls_total",
+        "appended_tokens_total",
+        "growth_events_total",
+        "release_calls_total",
+        "released_blocks_total",
+        "contiguous_view_calls_total",
+        "gather_view_calls_total",
+        "gather_copied_tokens_total",
+        "non_contiguous_layers",
+        "estimated_total_bytes",
+        "max_valid_tokens",
+        "max_capacity_tokens",
+    ]
+    return [f"{prefix}_kv_{key}: {kv_cache.get(key)}" for key in keys]
+
+
+def _format_profile_lines(prefix: str, profile: dict[str, object], *, top_n: int = 20) -> list[str]:
+    enabled = bool(profile.get("enabled", False))
+    sync_cuda = bool(profile.get("sync_cuda", False))
+    lines = [
+        f"{prefix}_profile_enabled: {enabled}",
+        f"{prefix}_profile_sync_cuda: {sync_cuda}",
+    ]
+    scopes = profile.get("scopes", {})
+    if not enabled or not isinstance(scopes, dict):
+        return lines
+    ranked = sorted(
+        ((str(name), data) for name, data in scopes.items() if isinstance(data, dict)),
+        key=lambda item: float(item[1].get("total_seconds", 0.0)),
+        reverse=True,
+    )
+    for index, (name, data) in enumerate(ranked[:top_n]):
+        lines.extend(
+            [
+                f"{prefix}_profile_scope_{index}_name: {name}",
+                f"{prefix}_profile_scope_{index}_calls: {data.get('calls')}",
+                f"{prefix}_profile_scope_{index}_total_seconds: {float(data.get('total_seconds', 0.0)):.6f}",
+                f"{prefix}_profile_scope_{index}_avg_seconds: {float(data.get('avg_seconds', 0.0)):.6f}",
+                f"{prefix}_profile_scope_{index}_max_seconds: {float(data.get('max_seconds', 0.0)):.6f}",
+                f"{prefix}_profile_scope_{index}_bytes: {data.get('bytes')}",
+            ]
+        )
+    return lines
+
+
+def _profile_config_from_args(args: argparse.Namespace) -> RuntimeProfileConfig:
+    mode = getattr(args, "tp_profile", "off")
+    return RuntimeProfileConfig(
+        enabled=mode != "off",
+        sync_cuda=mode == "sync",
+        layer_detail=bool(getattr(args, "tp_profile_layer_detail", False)),
+    )
+
+
+def _benchmark_prompt_from_args(manifest: Manifest, args: argparse.Namespace) -> str:
+    target = args.tp_benchmark_prompt_tokens
+    if target is None:
+        return args.prompt
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(manifest.model_dir, local_files_only=True, trust_remote_code=True)
+    prompt = args.prompt or " "
+    tokenized = tokenizer(prompt, add_special_tokens=True)
+    token_ids = tokenized["input_ids"]
+    if hasattr(token_ids, "tolist"):
+        token_ids = token_ids.tolist()
+    if token_ids and isinstance(token_ids[0], list):
+        token_ids = token_ids[0]
+    token_ids = list(token_ids)
+    if not token_ids:
+        token_ids = [0]
+    repeated = (token_ids * ((target + len(token_ids) - 1) // len(token_ids)))[:target]
+    return tokenizer.decode(repeated, skip_special_tokens=False)
+
+
 def _format_tp_benchmark_result(result: GenerateResult) -> list[str]:
     return ["tp_benchmark_iterations: 1", *_format_tp_generate_result(result)]
+
+
+def _format_tp_benchmark_results(
+    results: list[GenerateResult],
+    *,
+    warmup_iterations: int,
+    prompt_target_tokens: int | None,
+    print_runs: bool,
+) -> list[str]:
+    if not results:
+        raise CliError("benchmark requires at least one measured result")
+    lines = [
+        f"tp_benchmark_warmup_iterations: {warmup_iterations}",
+        f"tp_benchmark_iterations: {len(results)}",
+        f"tp_benchmark_prompt_target_tokens: {prompt_target_tokens}",
+        f"tp_benchmark_prompt_tokens_min: {min(result.prompt_tokens for result in results)}",
+        f"tp_benchmark_prompt_tokens_max: {max(result.prompt_tokens for result in results)}",
+        f"tp_benchmark_max_new_tokens: {results[0].max_new_tokens}",
+        f"tp_benchmark_prefill_seconds_avg: {_avg(result.prefill_seconds for result in results):.6f}",
+        f"tp_benchmark_prefill_seconds_min: {min(result.prefill_seconds for result in results):.6f}",
+        f"tp_benchmark_prefill_seconds_max: {max(result.prefill_seconds for result in results):.6f}",
+        f"tp_benchmark_decode_seconds_avg: {_avg(result.decode_seconds for result in results):.6f}",
+        f"tp_benchmark_decode_seconds_min: {min(result.decode_seconds for result in results):.6f}",
+        f"tp_benchmark_decode_seconds_max: {max(result.decode_seconds for result in results):.6f}",
+        f"tp_benchmark_total_seconds_avg: {_avg(result.total_seconds for result in results):.6f}",
+        f"tp_benchmark_decode_tokens_per_second_avg: {_avg(result.decode_tokens_per_second for result in results):.6f}",
+        f"tp_benchmark_total_tokens_per_second_avg: {_avg(result.total_tokens_per_second for result in results):.6f}",
+        f"tp_benchmark_kv_estimated_total_bytes_max: {max(result.kv_cache.estimated_total_bytes for result in results)}",
+        f"tp_benchmark_cuda_max_allocated_max: {max((result.cuda_memory.max_allocated or 0) for result in results)}",
+        f"tp_benchmark_cuda_max_reserved_max: {max((result.cuda_memory.max_reserved or 0) for result in results)}",
+    ]
+    lines.extend(_format_profile_lines("tp_benchmark", _merge_profile_results(results), top_n=10))
+    if print_runs:
+        for index, result in enumerate(results):
+            lines.extend(
+                [
+                    f"tp_benchmark_run_{index}_prefill_seconds: {result.prefill_seconds:.6f}",
+                    f"tp_benchmark_run_{index}_decode_seconds: {result.decode_seconds:.6f}",
+                    f"tp_benchmark_run_{index}_total_seconds: {result.total_seconds:.6f}",
+                    f"tp_benchmark_run_{index}_decode_tokens_per_second: {result.decode_tokens_per_second:.6f}",
+                    f"tp_benchmark_run_{index}_kv_estimated_total_bytes: {result.kv_cache.estimated_total_bytes}",
+                ]
+            )
+    lines.extend(_format_tp_generate_result(results[-1]))
+    return lines
+
+
+def _merge_profile_results(results: list[GenerateResult]) -> dict[str, object]:
+    enabled = any(result.profile.enabled for result in results)
+    sync_cuda = any(result.profile.sync_cuda for result in results)
+    totals: dict[str, dict[str, float | int | None]] = {}
+    for result in results:
+        for name, data in result.profile.to_dict()["scopes"].items():
+            scope = totals.setdefault(
+                name,
+                {
+                    "calls": 0,
+                    "total_seconds": 0.0,
+                    "max_seconds": 0.0,
+                    "min_seconds": None,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "bytes": 0,
+                },
+            )
+            scope["calls"] = int(scope["calls"] or 0) + int(data["calls"])
+            scope["total_seconds"] = float(scope["total_seconds"] or 0.0) + float(data["total_seconds"])
+            scope["max_seconds"] = max(float(scope["max_seconds"] or 0.0), float(data["max_seconds"] or 0.0))
+            min_seconds = data.get("min_seconds")
+            if min_seconds is not None:
+                scope["min_seconds"] = float(min_seconds) if scope["min_seconds"] is None else min(float(scope["min_seconds"]), float(min_seconds))
+            scope["input_tokens"] = int(scope["input_tokens"] or 0) + int(data.get("input_tokens", 0))
+            scope["output_tokens"] = int(scope["output_tokens"] or 0) + int(data.get("output_tokens", 0))
+            scope["bytes"] = int(scope["bytes"] or 0) + int(data.get("bytes", 0))
+    for scope in totals.values():
+        calls = int(scope["calls"] or 0)
+        scope["avg_seconds"] = float(scope["total_seconds"] or 0.0) / calls if calls else 0.0
+    return {"enabled": enabled, "sync_cuda": sync_cuda, "scopes": totals}
+
+
+def _avg(values) -> float:
+    items = list(values)
+    return sum(items) / len(items) if items else 0.0
 
 
 
@@ -582,7 +752,7 @@ def _run_tp_worker(args: argparse.Namespace) -> int:
     )
     try:
         with TpRuntime(launch) as runtime:
-            run_worker_protocol_loop(WorkerState(launch), runtime)
+            run_worker_protocol_loop(WorkerState(launch, profile_config=_profile_config_from_args(args)), runtime)
     except TpRuntimeError as exc:
         raise CliError(str(exc)) from exc
     return 0
@@ -613,6 +783,7 @@ def _run_tp_service(args: argparse.Namespace, model_dir: Path) -> int:
                     max_active_requests=args.tp_service_max_active,
                     max_pending_requests=args.tp_service_max_pending,
                     batch_step_mode=args.tp_service_batch_step_mode,
+                    profile_config=_profile_config_from_args(args),
                 ),
                 runtime,
                 config,
@@ -763,6 +934,7 @@ def run(args: argparse.Namespace) -> int:
                 args.tp_backend,
                 args.tp_init_method,
                 args.tp_device,
+                _profile_config_from_args(args),
             ):
                 print(line)
         except (ConfigError, EngineError, MappingError, LoaderError, TpRuntimeError, CliError) as exc:
@@ -782,8 +954,19 @@ def run(args: argparse.Namespace) -> int:
                 args.tp_init_method,
                 args.tp_device,
             )
-            runner = TpModelRunner(manifest, runtime_config, launch)
-            for line in _format_tp_benchmark_result(runner.generate(args.prompt, args.max_new_tokens)):
+            benchmark_prompt = _benchmark_prompt_from_args(manifest, args)
+            results: list[GenerateResult] = []
+            with TpModelSession(manifest, runtime_config, launch, profile_config=_profile_config_from_args(args)) as session:
+                for _ in range(args.tp_benchmark_warmup):
+                    session.generate(benchmark_prompt, args.max_new_tokens)
+                for _ in range(args.tp_benchmark_iterations):
+                    results.append(session.generate(benchmark_prompt, args.max_new_tokens))
+            for line in _format_tp_benchmark_results(
+                results,
+                warmup_iterations=args.tp_benchmark_warmup,
+                prompt_target_tokens=args.tp_benchmark_prompt_tokens,
+                print_runs=args.tp_benchmark_print_runs,
+            ):
                 print(line)
         except (ConfigError, EngineError, MappingError, LoaderError, TpRuntimeError, CliError) as exc:
             raise CliError(str(exc)) from exc
@@ -922,6 +1105,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run resident tensor-parallel generation and print baseline timing/throughput metrics.",
     )
     parser.add_argument(
+        "--tp-profile",
+        choices=("off", "cpu", "sync"),
+        default="off",
+        help="Enable TP profiling: off, CPU-side scope timing, or synchronized CUDA scope timing.",
+    )
+    parser.add_argument(
+        "--tp-profile-layer-detail",
+        action="store_true",
+        help="Include per-layer profile scope names when --tp-profile is enabled.",
+    )
+    parser.add_argument(
+        "--tp-benchmark-iterations",
+        type=int,
+        default=1,
+        help="Measured resident benchmark iterations for --tp-benchmark.",
+    )
+    parser.add_argument(
+        "--tp-benchmark-warmup",
+        type=int,
+        default=0,
+        help="Warmup generations to run before measured --tp-benchmark iterations.",
+    )
+    parser.add_argument(
+        "--tp-benchmark-prompt-tokens",
+        type=int,
+        help="Approximate prompt token target for --tp-benchmark by repeating/truncating the prompt.",
+    )
+    parser.add_argument(
+        "--tp-benchmark-print-runs",
+        action="store_true",
+        help="Print per-run benchmark timing lines in addition to aggregate metrics.",
+    )
+    parser.add_argument(
         "--tp-worker",
         action="store_true",
         help="Run a resident tensor-parallel worker that reads JSONL commands on rank 0.",
@@ -1011,6 +1227,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--tp-service-max-active must be positive")
     if args.tp_service_max_pending <= 0:
         parser.error("--tp-service-max-pending must be positive")
+    if args.tp_benchmark_iterations <= 0:
+        parser.error("--tp-benchmark-iterations must be positive")
+    if args.tp_benchmark_warmup < 0:
+        parser.error("--tp-benchmark-warmup must be non-negative")
+    if args.tp_benchmark_prompt_tokens is not None and args.tp_benchmark_prompt_tokens <= 0:
+        parser.error("--tp-benchmark-prompt-tokens must be positive")
     if args.inspect_tp is not None and args.inspect_tp <= 0:
         parser.error("--inspect-tp must be positive")
     try:

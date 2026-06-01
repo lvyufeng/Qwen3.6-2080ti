@@ -139,6 +139,24 @@ def test_release_clears_logical_state_and_reuses_blocks() -> None:
     torch.testing.assert_close(out_key, _kv(1, seq=2)[0])
 
 
+def test_full_attention_cache_stats_track_append_and_contiguous_views() -> None:
+    cache = FullAttentionCache(capacity_hint=4, block_size=2)
+
+    cache.append(*_kv(0, seq=3))
+    cache.as_tensors()
+
+    stats = cache.stats()
+    assert stats.append_calls == 1
+    assert stats.appended_tokens == 3
+    assert stats.growth_events == 1
+    assert stats.contiguous_view_calls == 2
+    assert stats.gather_view_calls == 0
+    assert stats.valid_tokens == 3
+    assert stats.capacity_tokens == 4
+    assert stats.estimated_total_bytes > 0
+
+
+
 def test_non_contiguous_block_table_gather_matches_logical_order() -> None:
     cache = FullAttentionCache(capacity_hint=6, block_size=2)
     first_key, first_value = _kv(0, seq=2)
@@ -160,6 +178,10 @@ def test_non_contiguous_block_table_gather_matches_logical_order() -> None:
 
     torch.testing.assert_close(out_key, torch.cat([first_key, second_key, third_key], dim=2))
     torch.testing.assert_close(out_value, torch.cat([first_value, second_value, third_value], dim=2))
+    stats = cache.stats()
+    assert stats.gather_view_calls == 1
+    assert stats.gather_copied_tokens == 6
+    assert stats.non_contiguous is True
 
 
 def test_append_preserves_dtype_and_device() -> None:
@@ -198,6 +220,26 @@ def test_decode_state_empty_without_hint_leaves_pool_unallocated() -> None:
     assert full_cache.capacity_hint is None
     assert full_cache.block_size == DEFAULT_KV_BLOCK_SIZE
     assert full_cache.key_blocks is None
+
+
+def test_decode_state_kv_stats_aggregates_full_attention_layers() -> None:
+    mapping = _mapping(("full_attention", "linear_attention", "full_attention"))
+    state = DecodeState.empty(mapping, None, max_seq_len=4, kv_block_size=2)
+    for layer in state.layers:
+        if isinstance(layer, FullAttentionCache):
+            layer.append(*_kv(layer.block_size, seq=2))
+
+    stats = state.kv_stats()
+
+    assert stats.full_attention_layers == 2
+    assert stats.block_size == 2
+    assert stats.valid_tokens_total == 4
+    assert stats.capacity_tokens_total == 8
+    assert stats.append_calls_total == 2
+    assert stats.contiguous_view_calls_total == 2
+    assert stats.estimated_total_bytes > 0
+    assert stats.max_valid_tokens == 2
+
 
 
 def test_decode_state_release_releases_full_attention_caches_only() -> None:
