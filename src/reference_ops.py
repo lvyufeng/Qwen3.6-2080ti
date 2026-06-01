@@ -64,6 +64,18 @@ class LinearDispatchStats:
     moe_native_assignment_fallback_dtype: int = 0
     moe_native_assignment_fallback_shape: int = 0
     moe_native_assignment_fallback_exception: int = 0
+    moe_native_assignment_offsets_calls: int = 0
+    moe_native_assignment_offsets_eligible: int = 0
+    moe_native_assignment_offsets_hits: int = 0
+    moe_native_assignment_offsets_fallbacks: int = 0
+    moe_native_assignment_offsets_fallback_disabled: int = 0
+    moe_native_assignment_offsets_fallback_small: int = 0
+    moe_native_assignment_offsets_fallback_capacity: int = 0
+    moe_native_assignment_offsets_fallback_device: int = 0
+    moe_native_assignment_offsets_fallback_dtype: int = 0
+    moe_native_assignment_offsets_fallback_shape: int = 0
+    moe_native_assignment_offsets_fallback_exception: int = 0
+    moe_native_assignment_offsets_capacity: int = 0
     moe_native_expert_calls: int = 0
     moe_native_expert_eligible: int = 0
     moe_native_expert_hits: int = 0
@@ -95,6 +107,16 @@ class LinearDispatchStats:
     moe_native_grouped_dispatch_fallback_shape: int = 0
     moe_native_grouped_dispatch_fallback_missing_scale: int = 0
     moe_native_grouped_dispatch_fallback_exception: int = 0
+    moe_native_grouped_dispatch_offsets_calls: int = 0
+    moe_native_grouped_dispatch_offsets_eligible: int = 0
+    moe_native_grouped_dispatch_offsets_hits: int = 0
+    moe_native_grouped_dispatch_offsets_fallbacks: int = 0
+    moe_native_grouped_dispatch_offsets_fallback_disabled: int = 0
+    moe_native_grouped_dispatch_offsets_fallback_device: int = 0
+    moe_native_grouped_dispatch_offsets_fallback_dtype: int = 0
+    moe_native_grouped_dispatch_offsets_fallback_shape: int = 0
+    moe_native_grouped_dispatch_offsets_fallback_missing_scale: int = 0
+    moe_native_grouped_dispatch_offsets_fallback_exception: int = 0
 
 
 def embedding(input_ids: Any, weight: Any) -> Any:

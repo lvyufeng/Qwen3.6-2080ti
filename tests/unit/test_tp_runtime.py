@@ -27,7 +27,9 @@ from tp_runtime import (
     tp_moe,
     _record_paged_attention_dispatch,
     _recurrent_gated_delta_rule,
+    _try_native_moe_assignment_offsets,
     _try_native_moe_grouped_dispatch,
+    _try_native_moe_grouped_dispatch_offsets,
 )
 from loader import TensorLoader
 from weight_mapping import (
@@ -153,6 +155,11 @@ def test_packed_tp_moe_matches_loop_and_records_stats() -> None:
     assert stats.moe_group_size_1 == 0
     assert stats.moe_group_size_2_to_4 == 2
     assert stats.moe_group_size_5_to_8 == 0
+    assert stats.moe_native_assignment_offsets_calls == 1
+    assert stats.moe_native_assignment_offsets_hits == 0
+    assert stats.moe_native_assignment_offsets_fallbacks == 1
+    assert stats.moe_native_assignment_offsets_fallback_device == 1
+    assert stats.moe_native_grouped_dispatch_offsets_calls == 0
     assert stats.moe_native_assignment_calls == 1
     assert stats.moe_native_assignment_hits == 0
     assert stats.moe_native_assignment_fallbacks == 1
@@ -189,6 +196,12 @@ def test_packed_tp_moe_records_native_disabled_fallback() -> None:
     torch.testing.assert_close(actual, expected)
     assert weights.dispatch_stats.moe_packed_index_add_calls == 1
     assert weights.dispatch_stats.moe_packed_single_scatter_calls == 1
+    assert weights.dispatch_stats.moe_native_assignment_offsets_calls == 1
+    assert weights.dispatch_stats.moe_native_assignment_offsets_hits == 0
+    assert weights.dispatch_stats.moe_native_assignment_offsets_fallback_disabled == 1
+    assert weights.dispatch_stats.moe_native_grouped_dispatch_offsets_calls == 1
+    assert weights.dispatch_stats.moe_native_grouped_dispatch_offsets_hits == 0
+    assert weights.dispatch_stats.moe_native_grouped_dispatch_offsets_fallback_disabled == 1
     assert weights.dispatch_stats.moe_native_assignment_calls == 1
     assert weights.dispatch_stats.moe_native_assignment_hits == 0
     assert weights.dispatch_stats.moe_native_assignment_fallback_device == 1
@@ -254,6 +267,54 @@ def test_native_grouped_dispatch_records_disabled_fallback_without_scatter() -> 
     assert stats.moe_native_scatter_calls == 0
 
 
+def test_native_assignment_offsets_records_cpu_fallback() -> None:
+    stats = LinearDispatchStats()
+    routing = SimpleNamespace(
+        indices=torch.zeros((2, 2), dtype=torch.long),
+        scores=torch.ones((2, 2), dtype=torch.float32),
+    )
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        plan = _try_native_moe_assignment_offsets(routing, mapping, runtime, stats)
+
+    assert plan is None
+    assert stats.moe_native_assignment_offsets_calls == 1
+    assert stats.moe_native_assignment_offsets_eligible == 0
+    assert stats.moe_native_assignment_offsets_hits == 0
+    assert stats.moe_native_assignment_offsets_fallbacks == 1
+    assert stats.moe_native_assignment_offsets_fallback_device == 1
+
+
+def test_native_grouped_dispatch_offsets_records_cpu_fallback() -> None:
+    stats = LinearDispatchStats()
+    loader = _FakeLoader(_moe_test_tensors())
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    config = _config_with_experts_per_token(2, packed=True)
+    weights = ReferenceWeights(loader)
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        routed = _try_native_moe_grouped_dispatch_offsets(
+            torch.zeros((2, 2), dtype=torch.float32),
+            torch.zeros((4,), dtype=torch.long),
+            torch.ones((4,), dtype=torch.float32),
+            torch.ones((2,), dtype=torch.long),
+            torch.tensor([0, 2], dtype=torch.long),
+            mapping,
+            config,
+            weights,
+            runtime,
+            stats,
+            token_count=2,
+        )
+
+    assert routed is None
+    assert stats.moe_native_grouped_dispatch_offsets_calls == 1
+    assert stats.moe_native_grouped_dispatch_offsets_eligible == 0
+    assert stats.moe_native_grouped_dispatch_offsets_hits == 0
+    assert stats.moe_native_grouped_dispatch_offsets_fallbacks == 1
+    assert stats.moe_native_grouped_dispatch_offsets_fallback_device == 1
+
 
 def test_packed_tp_moe_accumulates_duplicate_token_assignments_with_single_scatter() -> None:
     hidden = torch.tensor([[[1.0, 0.0]]])
@@ -274,6 +335,8 @@ def test_packed_tp_moe_accumulates_duplicate_token_assignments_with_single_scatt
     assert weights.dispatch_stats.moe_packed_index_add_calls == 1
     assert weights.dispatch_stats.moe_packed_single_scatter_calls == 1
     assert weights.dispatch_stats.moe_group_size_1 == 2
+    assert weights.dispatch_stats.moe_native_assignment_offsets_calls == 1
+    assert weights.dispatch_stats.moe_native_assignment_offsets_fallback_device == 1
     assert weights.dispatch_stats.moe_native_scatter_calls == 1
     assert weights.dispatch_stats.moe_native_scatter_hits == 0
     assert weights.dispatch_stats.moe_native_scatter_fallback_small == 1
@@ -405,6 +468,7 @@ def test_paged_attention_dispatch_records_per_request_pool_fallback_for_batches(
     assert stats.eligible == 0
     assert stats.native_hits == 0
 
+
 def test_tp_greedy_next_tokens_single_rank_batch_matches_argmax() -> None:
     runtime = TpRuntime(TpLaunchConfig(world_size=1, rank=0, local_rank=0, backend="gloo", device="cpu"))
     tp = TensorParallel(world_size=1, rank=0)
@@ -466,6 +530,8 @@ def _tp_moe_worker(rank: int, tmp_path: Path) -> None:
     assert weights.dispatch_stats.moe_packed_index_add_calls == 1
     assert weights.dispatch_stats.moe_packed_single_scatter_calls == 1
     assert weights.dispatch_stats.moe_group_size_2_to_4 == 1
+    assert weights.dispatch_stats.moe_native_assignment_offsets_calls == 1
+    assert weights.dispatch_stats.moe_native_assignment_offsets_fallback_device == 1
     assert weights.dispatch_stats.moe_native_expert_calls == 1
     assert weights.dispatch_stats.moe_native_expert_hits == 0
     assert weights.dispatch_stats.moe_native_expert_fallbacks == 1

@@ -31,6 +31,11 @@ _NATIVE_MOE_EXPERT_MAX_GROUP_TOKENS = int(os.environ.get("QWEN36_NATIVE_MOE_EXPE
 _NATIVE_MOE_ASSIGNMENT_MIN_ASSIGNMENTS = int(os.environ.get("QWEN36_NATIVE_MOE_ASSIGNMENT_MIN_ASSIGNMENTS", "4096"))
 _NATIVE_MOE_SCATTER_MIN_ASSIGNMENTS = int(os.environ.get("QWEN36_NATIVE_MOE_SCATTER_MIN_ASSIGNMENTS", "16"))
 _NATIVE_MOE_GROUPED_DISPATCH_MIN_ASSIGNMENTS = int(os.environ.get("QWEN36_NATIVE_MOE_GROUPED_DISPATCH_MIN_ASSIGNMENTS", "32"))
+_NATIVE_MOE_OFFSET_ASSIGNMENT_ENABLED = os.environ.get("QWEN36_NATIVE_MOE_OFFSET_ASSIGNMENT", "1") != "0"
+_NATIVE_MOE_OFFSET_ASSIGNMENT_MIN_ASSIGNMENTS = int(os.environ.get("QWEN36_NATIVE_MOE_OFFSET_ASSIGNMENT_MIN_ASSIGNMENTS", "1"))
+_NATIVE_MOE_OFFSET_ASSIGNMENT_MAX_CAPACITY = int(os.environ.get("QWEN36_NATIVE_MOE_OFFSET_ASSIGNMENT_MAX_CAPACITY", "16384"))
+_NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_ENABLED = os.environ.get("QWEN36_NATIVE_MOE_GROUPED_DISPATCH_OFFSETS", "1") != "0"
+_NATIVE_MOE_EXACT_OFFSET_STATS = os.environ.get("QWEN36_NATIVE_MOE_EXACT_OFFSET_STATS", "0") == "1"
 
 
 @dataclass(frozen=True)
@@ -774,8 +779,19 @@ def _tp_moe_per_expert_loop(flat: Any, routing: TopKRouting, mapping: MoEMapping
 def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMapping, config: RuntimeConfig, weights: ReferenceWeights, runtime: TpRuntime) -> Any:
     import torch
 
-    routed = torch.zeros_like(flat.float())
     stats = getattr(weights, "dispatch_stats", None)
+    offset_routed = _try_native_moe_offsets_fast_path(
+        flat,
+        routing,
+        mapping,
+        config,
+        weights,
+        runtime,
+        stats,
+    )
+    if offset_routed is not None:
+        return offset_routed
+    routed = torch.zeros_like(flat.float())
     local_assignment_count, packed_tokens, packed_scores, unique_experts, counts = _tp_moe_packed_assignment_plan(
         routing,
         mapping,
@@ -849,6 +865,292 @@ def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMa
                 stats.moe_packed_index_add_calls += 1
                 stats.moe_packed_single_scatter_calls += 1
     return routed
+
+
+_NATIVE_MOE_ASSIGNMENT_OFFSETS_FN: Any = None
+_NATIVE_MOE_ASSIGNMENT_OFFSETS_IMPORT_FAILED = False
+_NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_FN: Any = None
+_NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_IMPORT_FAILED = False
+
+
+def _native_moe_assignment_offsets_fn() -> Any:
+    global _NATIVE_MOE_ASSIGNMENT_OFFSETS_FN, _NATIVE_MOE_ASSIGNMENT_OFFSETS_IMPORT_FAILED
+    if _NATIVE_MOE_ASSIGNMENT_OFFSETS_FN is not None:
+        return _NATIVE_MOE_ASSIGNMENT_OFFSETS_FN
+    if _NATIVE_MOE_ASSIGNMENT_OFFSETS_IMPORT_FAILED:
+        return None
+    try:
+        from fp8_cuda import moe_packed_local_assignment_offsets
+    except Exception:
+        _NATIVE_MOE_ASSIGNMENT_OFFSETS_IMPORT_FAILED = True
+        return None
+    _NATIVE_MOE_ASSIGNMENT_OFFSETS_FN = moe_packed_local_assignment_offsets
+    return _NATIVE_MOE_ASSIGNMENT_OFFSETS_FN
+
+
+def _native_moe_grouped_dispatch_offsets_fn() -> Any:
+    global _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_FN, _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_IMPORT_FAILED
+    if _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_FN is not None:
+        return _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_FN
+    if _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_IMPORT_FAILED:
+        return None
+    try:
+        from fp8_cuda import moe_grouped_dispatch_offsets_fp8_e4m3_bf16
+    except Exception:
+        _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_IMPORT_FAILED = True
+        return None
+    _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_FN = moe_grouped_dispatch_offsets_fp8_e4m3_bf16
+    return _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_FN
+
+
+def _try_native_moe_offsets_fast_path(
+    flat: Any,
+    routing: TopKRouting,
+    mapping: MoEMapping,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    stats: Any,
+) -> Any | None:
+    if not config.moe.native_fused_expert_dispatch:
+        _record_native_assignment_offsets_call(stats, eligible=False)
+        _record_native_assignment_offsets_fallback(stats, "disabled")
+        _record_native_grouped_dispatch_offsets_call(stats, eligible=False)
+        _record_native_grouped_dispatch_offsets_fallback(stats, "disabled")
+        return None
+    assignment_plan = _try_native_moe_assignment_offsets(routing, mapping, runtime, stats)
+    if assignment_plan is None:
+        return None
+    packed_tokens, packed_scores, _unique_experts, counts, offsets = assignment_plan
+    return _try_native_moe_grouped_dispatch_offsets(
+        flat,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        mapping,
+        config,
+        weights,
+        runtime,
+        stats,
+        token_count=int(flat.shape[0]),
+    )
+
+
+def _try_native_moe_assignment_offsets(
+    routing: TopKRouting,
+    mapping: MoEMapping,
+    runtime: TpRuntime,
+    stats: Any,
+) -> tuple[Any, Any, Any, Any, Any] | None:
+    _record_native_assignment_offsets_call(stats, eligible=False)
+    eligible, reason = _tp_moe_offset_assignment_eligibility(routing, mapping)
+    if not eligible:
+        _record_native_assignment_offsets_fallback(stats, reason)
+        return None
+    if stats is not None:
+        stats.moe_native_assignment_offsets_eligible += 1
+        stats.moe_native_assignment_offsets_capacity += int(routing.indices.numel())
+    native_fn = _native_moe_assignment_offsets_fn()
+    if native_fn is None:
+        _record_native_assignment_offsets_fallback(stats, "exception")
+        return None
+    try:
+        with runtime.profile_scope("moe.packed.local_plan_offsets"):
+            packed_tokens, packed_scores, unique_experts, counts, offsets = native_fn(
+                routing.indices,
+                routing.scores,
+                mapping.expert_start,
+                mapping.expert_end,
+            )
+    except Exception:
+        _record_native_assignment_offsets_fallback(stats, "exception")
+        return None
+    if stats is not None:
+        stats.moe_native_assignment_offsets_hits += 1
+    return packed_tokens, packed_scores, unique_experts, counts, offsets
+
+
+def _tp_moe_offset_assignment_eligibility(routing: TopKRouting, mapping: MoEMapping) -> tuple[bool, str]:
+    import torch
+
+    if not _NATIVE_MOE_OFFSET_ASSIGNMENT_ENABLED:
+        return False, "disabled"
+    indices = routing.indices
+    scores = routing.scores
+    if not getattr(indices, "is_cuda", False) or not getattr(scores, "is_cuda", False):
+        return False, "device"
+    if getattr(indices, "dtype", None) != torch.long or getattr(scores, "dtype", None) != torch.float32:
+        return False, "dtype"
+    if len(getattr(indices, "shape", ())) != 2 or len(getattr(scores, "shape", ())) != 2:
+        return False, "shape"
+    if tuple(indices.shape) != tuple(scores.shape):
+        return False, "shape"
+    if int(mapping.expert_end) <= int(mapping.expert_start) or not mapping.experts:
+        return False, "shape"
+    capacity = int(indices.numel())
+    if capacity < _NATIVE_MOE_OFFSET_ASSIGNMENT_MIN_ASSIGNMENTS:
+        return False, "small"
+    if _NATIVE_MOE_OFFSET_ASSIGNMENT_MAX_CAPACITY > 0 and capacity > _NATIVE_MOE_OFFSET_ASSIGNMENT_MAX_CAPACITY:
+        return False, "capacity"
+    return True, ""
+
+
+def _try_native_moe_grouped_dispatch_offsets(
+    flat: Any,
+    packed_tokens: Any,
+    packed_scores: Any,
+    counts: Any,
+    offsets: Any,
+    mapping: MoEMapping,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    stats: Any,
+    *,
+    token_count: int,
+) -> Any | None:
+    import torch
+
+    _record_native_grouped_dispatch_offsets_call(stats, eligible=False)
+    if not _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_ENABLED or not config.moe.native_fused_expert_dispatch:
+        _record_native_grouped_dispatch_offsets_fallback(stats, "disabled")
+        return None
+    flat_native = flat
+    if getattr(flat, "is_cuda", False) and getattr(flat, "dtype", None) in (torch.float16, torch.bfloat16):
+        with runtime.profile_scope("moe.packed.grouped_native_offsets_cast"):
+            flat_native = flat.float()
+    eligible, reason, tensor_lists = _tp_moe_grouped_dispatch_offsets_eligibility(
+        flat_native,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        mapping,
+        weights,
+    )
+    if not eligible:
+        _record_native_grouped_dispatch_offsets_fallback(stats, reason)
+        return None
+    if stats is not None:
+        stats.moe_native_grouped_dispatch_offsets_eligible += 1
+    native_fn = _native_moe_grouped_dispatch_offsets_fn()
+    if native_fn is None:
+        _record_native_grouped_dispatch_offsets_fallback(stats, "exception")
+        return None
+    try:
+        with runtime.profile_scope("moe.packed.grouped_native_offsets_dispatch"):
+            routed = native_fn(
+                flat_native,
+                packed_tokens,
+                packed_scores,
+                counts,
+                offsets,
+                mapping.expert_start,
+                *tensor_lists,
+                token_count,
+            )
+    except Exception:
+        _record_native_grouped_dispatch_offsets_fallback(stats, "exception")
+        with runtime.profile_scope("moe.packed.grouped_native_offsets_fallback"):
+            return None
+    if stats is not None:
+        stats.moe_native_grouped_dispatch_offsets_hits += 1
+        if _NATIVE_MOE_EXACT_OFFSET_STATS:
+            with runtime.profile_scope("moe.packed.offset_exact_stats"):
+                local_assignment_count = int(counts.sum().item())
+            stats.moe_local_assignments += local_assignment_count
+            if local_assignment_count == 0:
+                stats.moe_empty_local_dispatches += 1
+    return routed
+
+
+def _tp_moe_grouped_dispatch_offsets_eligibility(
+    flat: Any,
+    packed_tokens: Any,
+    packed_scores: Any,
+    counts: Any,
+    offsets: Any,
+    mapping: MoEMapping,
+    weights: ReferenceWeights,
+) -> tuple[bool, str, tuple[list[Any], list[Any], list[Any], list[Any], list[Any], list[Any]]]:
+    import torch
+
+    empty: tuple[list[Any], list[Any], list[Any], list[Any], list[Any], list[Any]] = ([], [], [], [], [], [])
+    tensors = (flat, packed_tokens, packed_scores, counts, offsets)
+    if not all(getattr(tensor, "is_cuda", False) for tensor in tensors):
+        return False, "device", empty
+    if getattr(flat, "dtype", None) != torch.float32 or getattr(packed_scores, "dtype", None) != torch.float32:
+        return False, "dtype", empty
+    if any(getattr(tensor, "dtype", None) != torch.long for tensor in (packed_tokens, counts, offsets)):
+        return False, "dtype", empty
+    if len(getattr(flat, "shape", ())) != 2:
+        return False, "shape", empty
+    if any(len(getattr(tensor, "shape", ())) != 1 for tensor in (packed_tokens, packed_scores, counts, offsets)):
+        return False, "shape", empty
+    capacity = int(packed_tokens.shape[0])
+    if int(packed_scores.shape[0]) != capacity:
+        return False, "shape", empty
+    local_experts = int(mapping.expert_end) - int(mapping.expert_start)
+    if local_experts <= 0 or int(counts.shape[0]) != local_experts or int(offsets.shape[0]) != local_experts:
+        return False, "shape", empty
+    if int(flat.shape[0]) <= 0 or int(flat.shape[1]) <= 0:
+        return False, "shape", empty
+    return _tp_moe_local_expert_tensor_lists(flat, mapping, weights)
+
+
+def _record_native_assignment_offsets_call(stats: Any, *, eligible: bool) -> None:
+    if stats is None:
+        return
+    stats.moe_native_assignment_offsets_calls += 1
+    if eligible:
+        stats.moe_native_assignment_offsets_eligible += 1
+
+
+def _record_native_assignment_offsets_fallback(stats: Any, reason: str) -> None:
+    if stats is None:
+        return
+    stats.moe_native_assignment_offsets_fallbacks += 1
+    if reason == "disabled":
+        stats.moe_native_assignment_offsets_fallback_disabled += 1
+    elif reason == "small":
+        stats.moe_native_assignment_offsets_fallback_small += 1
+    elif reason == "capacity":
+        stats.moe_native_assignment_offsets_fallback_capacity += 1
+    elif reason == "device":
+        stats.moe_native_assignment_offsets_fallback_device += 1
+    elif reason == "dtype":
+        stats.moe_native_assignment_offsets_fallback_dtype += 1
+    elif reason == "exception":
+        stats.moe_native_assignment_offsets_fallback_exception += 1
+    else:
+        stats.moe_native_assignment_offsets_fallback_shape += 1
+
+
+def _record_native_grouped_dispatch_offsets_call(stats: Any, *, eligible: bool) -> None:
+    if stats is None:
+        return
+    stats.moe_native_grouped_dispatch_offsets_calls += 1
+    if eligible:
+        stats.moe_native_grouped_dispatch_offsets_eligible += 1
+
+
+def _record_native_grouped_dispatch_offsets_fallback(stats: Any, reason: str) -> None:
+    if stats is None:
+        return
+    stats.moe_native_grouped_dispatch_offsets_fallbacks += 1
+    if reason == "disabled":
+        stats.moe_native_grouped_dispatch_offsets_fallback_disabled += 1
+    elif reason == "missing_scale":
+        stats.moe_native_grouped_dispatch_offsets_fallback_missing_scale += 1
+    elif reason == "device":
+        stats.moe_native_grouped_dispatch_offsets_fallback_device += 1
+    elif reason == "dtype":
+        stats.moe_native_grouped_dispatch_offsets_fallback_dtype += 1
+    elif reason == "exception":
+        stats.moe_native_grouped_dispatch_offsets_fallback_exception += 1
+    else:
+        stats.moe_native_grouped_dispatch_offsets_fallback_shape += 1
 
 
 _NATIVE_MOE_GROUPED_DISPATCH_FN: Any = None

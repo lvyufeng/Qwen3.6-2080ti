@@ -90,6 +90,37 @@ def test_moe_packed_local_assignments_handles_empty_local_dispatch() -> None:
     assert counts.numel() == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the assignment offset planner extension")
+def test_moe_packed_local_assignment_offsets_matches_reference() -> None:
+    try:
+        from fp8_cuda import moe_packed_local_assignment_offsets
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(13)
+    cases = [
+        (torch.tensor([[3, 4], [5, 6], [7, 8]], device=device, dtype=torch.long), torch.rand((3, 2), device=device, dtype=torch.float32), 4, 8),
+        (torch.tensor([[4, 4], [5, 6], [7, 7]], device=device, dtype=torch.long), torch.rand((3, 2), device=device, dtype=torch.float32), 4, 8),
+        (torch.tensor([[0, 1], [2, 3]], device=device, dtype=torch.long), torch.rand((2, 2), device=device, dtype=torch.float32), 4, 8),
+        (torch.tensor([[5, 4, 5], [7, 6, 4], [3, 8, 9], [4, 4, 4]], device=device, dtype=torch.long), torch.rand((4, 3), device=device, dtype=torch.float32), 4, 8),
+    ]
+    for indices, scores, expert_start, expert_end in cases:
+        packed_tokens, packed_scores, unique_experts, counts, offsets = moe_packed_local_assignment_offsets(indices, scores, expert_start, expert_end)
+        ref_tokens, ref_scores, ref_unique_experts, ref_counts = _reference_packed_assignments(indices, scores, expert_start, expert_end)
+        expected_counts = torch.zeros((expert_end - expert_start,), device=device, dtype=torch.long)
+        expected_counts[ref_unique_experts - expert_start] = ref_counts
+        expected_offsets = torch.cumsum(expected_counts, dim=0) - expected_counts
+        expected_unique = torch.arange(expert_start, expert_end, device=device, dtype=torch.long)
+
+        torch.testing.assert_close(unique_experts, expected_unique)
+        torch.testing.assert_close(counts, expected_counts)
+        torch.testing.assert_close(offsets, expected_offsets)
+        assert packed_tokens.numel() == indices.numel()
+        assert packed_scores.numel() == scores.numel()
+        _assert_assignment_offset_groups_match(packed_tokens, packed_scores, ref_tokens, ref_scores, counts, offsets)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the scatter extension")
 def test_moe_packed_score_scatter_add_matches_index_add_reference() -> None:
     try:
@@ -191,6 +222,106 @@ def test_moe_grouped_dispatch_fp8_e4m3_bf16_matches_reference() -> None:
         offset = end
 
     torch.testing.assert_close(routed, ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the grouped MoE offset dispatch extension")
+def test_moe_grouped_dispatch_offsets_fp8_e4m3_bf16_matches_reference() -> None:
+    try:
+        from fp8_cuda import moe_grouped_dispatch_offsets_fp8_e4m3_bf16
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(15)
+    hidden_size = 256
+    intermediate_size = 384
+    gate_weights = []
+    gate_scales = []
+    up_weights = []
+    up_scales = []
+    down_weights = []
+    down_scales = []
+    for seed in (21, 22, 23, 24):
+        torch.manual_seed(seed)
+        gate_weights.append((torch.randn((intermediate_size, hidden_size), device=device, dtype=torch.float32) * 0.04).to(torch.float8_e4m3fn))
+        up_weights.append((torch.randn((intermediate_size, hidden_size), device=device, dtype=torch.float32) * 0.04).to(torch.float8_e4m3fn))
+        down_weights.append((torch.randn((hidden_size, intermediate_size), device=device, dtype=torch.float32) * 0.04).to(torch.float8_e4m3fn))
+        gate_scales.append(torch.full((3, 2), 0.25, device=device, dtype=torch.bfloat16))
+        up_scales.append(torch.full((3, 2), 0.25, device=device, dtype=torch.bfloat16))
+        down_scales.append(torch.full((2, 3), 0.25, device=device, dtype=torch.bfloat16))
+
+    flat_hidden = torch.randn((4, hidden_size), device=device, dtype=torch.float32)
+    packed_tokens = torch.tensor([2, 0, 0, 0, 2, 1, 1, 3], device=device, dtype=torch.long)
+    packed_scores = torch.tensor([0.5, 1.25, 0.0, 0.0, -0.25, 0.75, 0.5, -0.5], device=device, dtype=torch.float32)
+    counts = torch.tensor([2, 0, 1, 3], device=device, dtype=torch.long)
+    offsets = torch.tensor([0, 2, 4, 5], device=device, dtype=torch.long)
+    expert_start = 4
+    token_count = 4
+
+    routed = moe_grouped_dispatch_offsets_fp8_e4m3_bf16(
+        flat_hidden,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        expert_start,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        down_weights,
+        down_scales,
+        token_count,
+    )
+
+    ref = torch.zeros((token_count, hidden_size), device=device, dtype=torch.float32)
+    for local, count in enumerate(counts.tolist()):
+        if count == 0:
+            continue
+        offset = int(offsets[local].item())
+        end = offset + count
+        token_slice = packed_tokens[offset:end]
+        hidden = flat_hidden.index_select(0, token_slice)
+        gate = linear(hidden, gate_weights[local], gate_scales[local], use_cuda_kernel=False)
+        up = linear(hidden, up_weights[local], up_scales[local], use_cuda_kernel=False)
+        out = linear(silu_mul(gate, up), down_weights[local], down_scales[local], use_cuda_kernel=False)
+        ref.index_add_(0, token_slice, out.float() * packed_scores[offset:end, None])
+
+    torch.testing.assert_close(routed, ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the grouped MoE offset dispatch extension")
+def test_moe_grouped_dispatch_offsets_fp8_e4m3_bf16_handles_empty_dispatch() -> None:
+    try:
+        from fp8_cuda import moe_grouped_dispatch_offsets_fp8_e4m3_bf16
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    hidden_size = 256
+    intermediate_size = 384
+    weight = torch.zeros((intermediate_size, hidden_size), device=device, dtype=torch.float8_e4m3fn)
+    down = torch.zeros((hidden_size, intermediate_size), device=device, dtype=torch.float8_e4m3fn)
+    scale = torch.ones((3, 2), device=device, dtype=torch.bfloat16)
+    down_scale = torch.ones((2, 3), device=device, dtype=torch.bfloat16)
+
+    routed = moe_grouped_dispatch_offsets_fp8_e4m3_bf16(
+        torch.empty((3, hidden_size), device=device, dtype=torch.float32),
+        torch.empty((0,), device=device, dtype=torch.long),
+        torch.empty((0,), device=device, dtype=torch.float32),
+        torch.zeros((1,), device=device, dtype=torch.long),
+        torch.zeros((1,), device=device, dtype=torch.long),
+        0,
+        [weight],
+        [scale],
+        [weight],
+        [scale],
+        [down],
+        [down_scale],
+        3,
+    )
+
+    torch.testing.assert_close(routed, torch.zeros((3, hidden_size), device=device, dtype=torch.float32))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the grouped MoE dispatch extension")
@@ -329,6 +460,25 @@ def _assert_assignment_groups_match(
         assert got == ref
         offset = end
     assert offset == int(packed_tokens.numel())
+
+
+def _assert_assignment_offset_groups_match(
+    packed_tokens: torch.Tensor,
+    packed_scores: torch.Tensor,
+    ref_tokens: torch.Tensor,
+    ref_scores: torch.Tensor,
+    counts: torch.Tensor,
+    offsets: torch.Tensor,
+) -> None:
+    ref_offset = 0
+    for count, offset in zip(counts.tolist(), offsets.tolist(), strict=True):
+        end = offset + count
+        ref_end = ref_offset + count
+        got = sorted(zip(packed_tokens[offset:end].tolist(), [round(s, 6) for s in packed_scores[offset:end].tolist()]))
+        ref = sorted(zip(ref_tokens[ref_offset:ref_end].tolist(), [round(s, 6) for s in ref_scores[ref_offset:ref_end].tolist()]))
+        assert got == ref
+        ref_offset = ref_end
+    assert ref_offset == int(ref_tokens.numel())
 
 
 def _prepare_recurrent_inputs(
