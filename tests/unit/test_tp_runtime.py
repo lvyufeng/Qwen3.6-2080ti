@@ -27,6 +27,7 @@ from tp_runtime import (
     tp_moe,
     _record_paged_attention_dispatch,
     _recurrent_gated_delta_rule,
+    _try_native_moe_grouped_dispatch,
 )
 from loader import TensorLoader
 from weight_mapping import (
@@ -161,6 +162,15 @@ def test_packed_tp_moe_matches_loop_and_records_stats() -> None:
     assert stats.moe_native_expert_fallbacks == 2
     assert stats.moe_native_expert_fallback_device == 2
     assert stats.moe_native_expert_max_group_tokens == 3
+    assert stats.moe_native_scatter_calls == 1
+    assert stats.moe_native_scatter_hits == 0
+    assert stats.moe_native_scatter_fallbacks == 1
+    assert stats.moe_native_scatter_fallback_small == 1
+    assert stats.moe_native_grouped_dispatch_calls == 1
+    assert stats.moe_native_grouped_dispatch_eligible == 0
+    assert stats.moe_native_grouped_dispatch_hits == 0
+    assert stats.moe_native_grouped_dispatch_fallbacks == 1
+    assert stats.moe_native_grouped_dispatch_fallback_small == 1
 
 
 def test_packed_tp_moe_records_native_disabled_fallback() -> None:
@@ -186,6 +196,12 @@ def test_packed_tp_moe_records_native_disabled_fallback() -> None:
     assert weights.dispatch_stats.moe_native_expert_hits == 0
     assert weights.dispatch_stats.moe_native_expert_fallbacks == 2
     assert weights.dispatch_stats.moe_native_expert_fallback_disabled == 2
+    assert weights.dispatch_stats.moe_native_scatter_calls == 1
+    assert weights.dispatch_stats.moe_native_scatter_hits == 0
+    assert weights.dispatch_stats.moe_native_scatter_fallback_small == 1
+    assert weights.dispatch_stats.moe_native_grouped_dispatch_calls == 1
+    assert weights.dispatch_stats.moe_native_grouped_dispatch_hits == 0
+    assert weights.dispatch_stats.moe_native_grouped_dispatch_fallback_disabled == 1
 
 
 def test_loop_tp_moe_records_loop_stats() -> None:
@@ -204,6 +220,39 @@ def test_loop_tp_moe_records_loop_stats() -> None:
     assert weights.dispatch_stats.moe_loop_calls == 1
     assert weights.dispatch_stats.moe_assignments == 2
     assert weights.dispatch_stats.moe_local_assignments == 0
+
+
+def test_native_grouped_dispatch_records_disabled_fallback_without_scatter() -> None:
+    stats = LinearDispatchStats()
+    loader = _FakeLoader(_moe_test_tensors())
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    config = _config_with_experts_per_token(2, packed=True, native=False)
+    weights = ReferenceWeights(loader)
+    weights.dispatch_stats = stats
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        routed = _try_native_moe_grouped_dispatch(
+            torch.zeros((1, 2), dtype=torch.float32),
+            torch.zeros((1,), dtype=torch.long),
+            torch.ones((1,), dtype=torch.float32),
+            torch.zeros((1,), dtype=torch.long),
+            torch.ones((1,), dtype=torch.long),
+            mapping,
+            config,
+            weights,
+            runtime,
+            stats,
+            token_count=1,
+        )
+
+    assert routed is None
+    assert stats.moe_native_grouped_dispatch_calls == 1
+    assert stats.moe_native_grouped_dispatch_eligible == 0
+    assert stats.moe_native_grouped_dispatch_hits == 0
+    assert stats.moe_native_grouped_dispatch_fallbacks == 1
+    assert stats.moe_native_grouped_dispatch_fallback_disabled == 1
+    assert stats.moe_native_scatter_calls == 0
+
 
 
 def test_packed_tp_moe_accumulates_duplicate_token_assignments_with_single_scatter() -> None:
@@ -225,6 +274,12 @@ def test_packed_tp_moe_accumulates_duplicate_token_assignments_with_single_scatt
     assert weights.dispatch_stats.moe_packed_index_add_calls == 1
     assert weights.dispatch_stats.moe_packed_single_scatter_calls == 1
     assert weights.dispatch_stats.moe_group_size_1 == 2
+    assert weights.dispatch_stats.moe_native_scatter_calls == 1
+    assert weights.dispatch_stats.moe_native_scatter_hits == 0
+    assert weights.dispatch_stats.moe_native_scatter_fallback_small == 1
+    assert weights.dispatch_stats.moe_native_grouped_dispatch_calls == 1
+    assert weights.dispatch_stats.moe_native_grouped_dispatch_hits == 0
+    assert weights.dispatch_stats.moe_native_grouped_dispatch_fallback_small == 1
 
 
 def test_two_rank_packed_tp_moe_matches_loop(tmp_path: Path) -> None:
@@ -415,6 +470,10 @@ def _tp_moe_worker(rank: int, tmp_path: Path) -> None:
     assert weights.dispatch_stats.moe_native_expert_hits == 0
     assert weights.dispatch_stats.moe_native_expert_fallbacks == 1
     assert weights.dispatch_stats.moe_native_expert_fallback_device == 1
+    assert weights.dispatch_stats.moe_native_scatter_calls == 1
+    assert weights.dispatch_stats.moe_native_scatter_hits == 0
+    assert weights.dispatch_stats.moe_native_scatter_fallbacks == 1
+    assert weights.dispatch_stats.moe_native_scatter_fallback_small == 1
 
 
 def _tp_greedy_lm_head(rank: int) -> ShardedTensor:

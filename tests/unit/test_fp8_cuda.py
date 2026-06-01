@@ -41,7 +41,7 @@ def test_fp8_cuda_moe_expert_matches_reference_small_groups() -> None:
     gate_scale = torch.full((3, 2), 0.25, device=device, dtype=torch.bfloat16)
     up_scale = torch.full((3, 2), 0.25, device=device, dtype=torch.bfloat16)
     down_scale = torch.full((2, 3), 0.25, device=device, dtype=torch.bfloat16)
-    for batch in (1, 3, 4, 8):
+    for batch in (1, 3, 4, 8, 16, 32):
         hidden = torch.randn((batch, hidden_size), device=device, dtype=torch.float32)
         out = fp8_e4m3_bf16_moe_expert(hidden, gate_weight, gate_scale, up_weight, up_scale, down_weight, down_scale)
         gate = linear(hidden, gate_weight, gate_scale, use_cuda_kernel=False)
@@ -88,6 +88,162 @@ def test_moe_packed_local_assignments_handles_empty_local_dispatch() -> None:
     assert packed_scores.numel() == 0
     assert unique_experts.numel() == 0
     assert counts.numel() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the scatter extension")
+def test_moe_packed_score_scatter_add_matches_index_add_reference() -> None:
+    try:
+        from fp8_cuda import moe_packed_score_scatter_add
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(4)
+    cases = [
+        (
+            torch.tensor([[1.0, -2.0, 3.0], [0.5, 1.5, -1.0], [2.0, 0.0, 1.0]], device=device),
+            torch.tensor([0, 1, 2], device=device, dtype=torch.long),
+            torch.tensor([0.25, 0.5, -1.0], device=device),
+            3,
+        ),
+        (
+            torch.tensor([[1.0, 2.0, 0.0], [3.0, -1.0, 2.0], [0.5, 0.5, 0.5]], device=device),
+            torch.tensor([1, 1, 0], device=device, dtype=torch.long),
+            torch.tensor([0.5, -0.25, 2.0], device=device),
+            2,
+        ),
+        (
+            torch.randn((31, 17), device=device, dtype=torch.float32),
+            torch.randint(0, 7, (31,), device=device, dtype=torch.long),
+            torch.randn((31,), device=device, dtype=torch.float32),
+            7,
+        ),
+    ]
+    for packed_output, packed_tokens, packed_scores, token_count in cases:
+        routed = torch.zeros((token_count, packed_output.shape[1]), device=device, dtype=torch.float32)
+        ref = torch.zeros_like(routed)
+        ref.index_add_(0, packed_tokens, packed_output * packed_scores[:, None])
+
+        moe_packed_score_scatter_add(routed, packed_output, packed_tokens, packed_scores)
+
+        torch.testing.assert_close(routed, ref, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the grouped MoE dispatch extension")
+def test_moe_grouped_dispatch_fp8_e4m3_bf16_matches_reference() -> None:
+    try:
+        from fp8_cuda import moe_grouped_dispatch_fp8_e4m3_bf16
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(5)
+    hidden_size = 256
+    intermediate_size = 384
+    gate_weights = []
+    gate_scales = []
+    up_weights = []
+    up_scales = []
+    down_weights = []
+    down_scales = []
+    for seed in (11, 12, 13):
+        torch.manual_seed(seed)
+        gate_weights.append((torch.randn((intermediate_size, hidden_size), device=device, dtype=torch.float32) * 0.04).to(torch.float8_e4m3fn))
+        up_weights.append((torch.randn((intermediate_size, hidden_size), device=device, dtype=torch.float32) * 0.04).to(torch.float8_e4m3fn))
+        down_weights.append((torch.randn((hidden_size, intermediate_size), device=device, dtype=torch.float32) * 0.04).to(torch.float8_e4m3fn))
+        gate_scales.append(torch.full((3, 2), 0.25, device=device, dtype=torch.bfloat16))
+        up_scales.append(torch.full((3, 2), 0.25, device=device, dtype=torch.bfloat16))
+        down_scales.append(torch.full((2, 3), 0.25, device=device, dtype=torch.bfloat16))
+
+    packed_hidden = torch.randn((6, hidden_size), device=device, dtype=torch.float32)
+    packed_tokens = torch.tensor([2, 0, 2, 1, 1, 3], device=device, dtype=torch.long)
+    packed_scores = torch.tensor([0.5, 1.25, -0.25, 0.75, 0.5, -0.5], device=device, dtype=torch.float32)
+    unique_experts = torch.tensor([4, 5, 6], device=device, dtype=torch.long)
+    counts = torch.tensor([2, 1, 3], device=device, dtype=torch.long)
+    expert_start = 4
+    token_count = 4
+
+    routed = moe_grouped_dispatch_fp8_e4m3_bf16(
+        packed_hidden,
+        packed_tokens,
+        packed_scores,
+        unique_experts,
+        counts,
+        expert_start,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        down_weights,
+        down_scales,
+        token_count,
+    )
+
+    ref = torch.zeros((token_count, hidden_size), device=device, dtype=torch.float32)
+    offset = 0
+    for expert_id, count in zip(unique_experts.tolist(), counts.tolist(), strict=True):
+        end = offset + count
+        local = expert_id - expert_start
+        gate = linear(packed_hidden[offset:end], gate_weights[local], gate_scales[local], use_cuda_kernel=False)
+        up = linear(packed_hidden[offset:end], up_weights[local], up_scales[local], use_cuda_kernel=False)
+        out = linear(silu_mul(gate, up), down_weights[local], down_scales[local], use_cuda_kernel=False)
+        ref.index_add_(0, packed_tokens[offset:end], out.float() * packed_scores[offset:end, None])
+        offset = end
+
+    torch.testing.assert_close(routed, ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the grouped MoE dispatch extension")
+def test_moe_grouped_dispatch_fp8_e4m3_bf16_handles_empty_dispatch() -> None:
+    try:
+        from fp8_cuda import moe_grouped_dispatch_fp8_e4m3_bf16
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    hidden_size = 256
+    intermediate_size = 384
+    weight = torch.zeros((intermediate_size, hidden_size), device=device, dtype=torch.float8_e4m3fn)
+    down = torch.zeros((hidden_size, intermediate_size), device=device, dtype=torch.float8_e4m3fn)
+    scale = torch.ones((3, 2), device=device, dtype=torch.bfloat16)
+    down_scale = torch.ones((2, 3), device=device, dtype=torch.bfloat16)
+
+    routed = moe_grouped_dispatch_fp8_e4m3_bf16(
+        torch.empty((0, hidden_size), device=device, dtype=torch.float32),
+        torch.empty((0,), device=device, dtype=torch.long),
+        torch.empty((0,), device=device, dtype=torch.float32),
+        torch.empty((0,), device=device, dtype=torch.long),
+        torch.empty((0,), device=device, dtype=torch.long),
+        0,
+        [weight],
+        [scale],
+        [weight],
+        [scale],
+        [down],
+        [down_scale],
+        3,
+    )
+
+    torch.testing.assert_close(routed, torch.zeros((3, hidden_size), device=device, dtype=torch.float32))
+
+
+def test_moe_packed_score_scatter_add_wrapper_preserves_routed_storage() -> None:
+    if torch.cuda.is_available():
+        pytest.skip("CPU-only wrapper behavior is sufficient for this non-CUDA test")
+    try:
+        from fp8_cuda import moe_packed_score_scatter_add
+    except RuntimeError:
+        pytest.skip("extension unavailable")
+
+    routed = torch.zeros((2, 3), dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="routed must be CUDA"):
+        moe_packed_score_scatter_add(
+            routed,
+            torch.zeros((1, 3), dtype=torch.float32),
+            torch.zeros((1,), dtype=torch.long),
+            torch.ones((1,), dtype=torch.float32),
+        )
+    torch.testing.assert_close(routed, torch.zeros_like(routed))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the recurrent core extension")

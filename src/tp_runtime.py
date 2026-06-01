@@ -27,8 +27,10 @@ class TpRuntimeError(RuntimeError):
     pass
 
 
-_NATIVE_MOE_EXPERT_MAX_GROUP_TOKENS = 8
-_NATIVE_MOE_ASSIGNMENT_MIN_ASSIGNMENTS = 4096
+_NATIVE_MOE_EXPERT_MAX_GROUP_TOKENS = int(os.environ.get("QWEN36_NATIVE_MOE_EXPERT_MAX_GROUP_TOKENS", "8"))
+_NATIVE_MOE_ASSIGNMENT_MIN_ASSIGNMENTS = int(os.environ.get("QWEN36_NATIVE_MOE_ASSIGNMENT_MIN_ASSIGNMENTS", "4096"))
+_NATIVE_MOE_SCATTER_MIN_ASSIGNMENTS = int(os.environ.get("QWEN36_NATIVE_MOE_SCATTER_MIN_ASSIGNMENTS", "16"))
+_NATIVE_MOE_GROUPED_DISPATCH_MIN_ASSIGNMENTS = int(os.environ.get("QWEN36_NATIVE_MOE_GROUPED_DISPATCH_MIN_ASSIGNMENTS", "32"))
 
 
 @dataclass(frozen=True)
@@ -789,6 +791,27 @@ def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMa
 
     with runtime.profile_scope("moe.packed.gather_hidden"):
         packed_hidden = flat.index_select(0, packed_tokens)
+    grouped_routed = None
+    if config.moe.native_fused_expert_dispatch and local_assignment_count < _NATIVE_MOE_GROUPED_DISPATCH_MIN_ASSIGNMENTS:
+        if stats is not None:
+            stats.moe_native_grouped_dispatch_calls += 1
+            _record_native_grouped_dispatch_fallback(stats, "small")
+    else:
+        grouped_routed = _try_native_moe_grouped_dispatch(
+            packed_hidden,
+            packed_tokens,
+            packed_scores,
+            unique_experts,
+            counts,
+            mapping,
+            config,
+            weights,
+            runtime,
+            stats,
+            token_count=int(flat.shape[0]),
+        )
+    if grouped_routed is not None:
+        return grouped_routed
     unique_expert_ids = unique_experts.tolist()
     group_counts = counts.tolist()
     if stats is not None:
@@ -815,17 +838,228 @@ def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMa
                 raise RuntimeError(f"routing selected unmapped local expert {expert_id}") from exc
             end = offset + count
             hidden_chunk = packed_hidden[offset:end]
-            score_chunk = packed_scores[offset:end]
             token_output = _tp_moe_expert_group(hidden_chunk, expert, config, weights, runtime)
             with runtime.profile_scope("moe.packed.score_apply"):
-                packed_output[offset:end] = token_output.float() * score_chunk[:, None]
+                packed_output[offset:end] = token_output.float()
             offset = end
     with runtime.profile_scope("moe.packed.scatter"):
-        routed.index_add_(0, packed_tokens, packed_output)
-    if stats is not None:
-        stats.moe_packed_index_add_calls += 1
-        stats.moe_packed_single_scatter_calls += 1
+        if not _try_native_moe_packed_score_scatter_add(routed, packed_output, packed_tokens, packed_scores, runtime, stats):
+            routed.index_add_(0, packed_tokens, packed_output * packed_scores[:, None])
+            if stats is not None:
+                stats.moe_packed_index_add_calls += 1
+                stats.moe_packed_single_scatter_calls += 1
     return routed
+
+
+_NATIVE_MOE_GROUPED_DISPATCH_FN: Any = None
+_NATIVE_MOE_GROUPED_DISPATCH_IMPORT_FAILED = False
+
+
+def _native_moe_grouped_dispatch_fn() -> Any:
+    global _NATIVE_MOE_GROUPED_DISPATCH_FN, _NATIVE_MOE_GROUPED_DISPATCH_IMPORT_FAILED
+    if _NATIVE_MOE_GROUPED_DISPATCH_FN is not None:
+        return _NATIVE_MOE_GROUPED_DISPATCH_FN
+    if _NATIVE_MOE_GROUPED_DISPATCH_IMPORT_FAILED:
+        return None
+    try:
+        from fp8_cuda import moe_grouped_dispatch_fp8_e4m3_bf16
+    except Exception:
+        _NATIVE_MOE_GROUPED_DISPATCH_IMPORT_FAILED = True
+        return None
+    _NATIVE_MOE_GROUPED_DISPATCH_FN = moe_grouped_dispatch_fp8_e4m3_bf16
+    return _NATIVE_MOE_GROUPED_DISPATCH_FN
+
+
+def _try_native_moe_grouped_dispatch(
+    packed_hidden: Any,
+    packed_tokens: Any,
+    packed_scores: Any,
+    unique_experts: Any,
+    counts: Any,
+    mapping: MoEMapping,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    stats: Any,
+    *,
+    token_count: int,
+) -> Any | None:
+    import torch
+
+    if stats is not None:
+        stats.moe_native_grouped_dispatch_calls += 1
+    if not config.moe.native_fused_expert_dispatch:
+        _record_native_grouped_dispatch_fallback(stats, "disabled")
+        return None
+    if int(packed_hidden.shape[0]) < _NATIVE_MOE_GROUPED_DISPATCH_MIN_ASSIGNMENTS:
+        _record_native_grouped_dispatch_fallback(stats, "small")
+        return None
+    packed_hidden_native = packed_hidden
+    if getattr(packed_hidden, "is_cuda", False) and getattr(packed_hidden, "dtype", None) in (torch.float16, torch.bfloat16):
+        with runtime.profile_scope("moe.packed.grouped_native_cast"):
+            packed_hidden_native = packed_hidden.float()
+    eligible, reason, tensor_lists = _tp_moe_grouped_dispatch_eligibility(
+        packed_hidden_native,
+        packed_tokens,
+        packed_scores,
+        unique_experts,
+        counts,
+        mapping,
+        weights,
+    )
+    if not eligible:
+        _record_native_grouped_dispatch_fallback(stats, reason)
+        return None
+    if stats is not None:
+        stats.moe_native_grouped_dispatch_eligible += 1
+    native_fn = _native_moe_grouped_dispatch_fn()
+    if native_fn is None:
+        _record_native_grouped_dispatch_fallback(stats, "exception")
+        return None
+    try:
+        with runtime.profile_scope("moe.packed.grouped_native_dispatch"):
+            routed = native_fn(
+                packed_hidden_native,
+                packed_tokens,
+                packed_scores,
+                unique_experts,
+                counts,
+                mapping.expert_start,
+                *tensor_lists,
+                token_count,
+            )
+    except RuntimeError:
+        _record_native_grouped_dispatch_fallback(stats, "exception")
+        with runtime.profile_scope("moe.packed.grouped_native_fallback"):
+            return None
+    if stats is not None:
+        stats.moe_native_grouped_dispatch_hits += 1
+    return routed
+
+
+def _tp_moe_grouped_dispatch_eligibility(
+    packed_hidden: Any,
+    packed_tokens: Any,
+    packed_scores: Any,
+    unique_experts: Any,
+    counts: Any,
+    mapping: MoEMapping,
+    weights: ReferenceWeights,
+) -> tuple[bool, str, tuple[list[Any], list[Any], list[Any], list[Any], list[Any], list[Any]]]:
+    import torch
+
+    empty: tuple[list[Any], list[Any], list[Any], list[Any], list[Any], list[Any]] = ([], [], [], [], [], [])
+    tensors = (packed_hidden, packed_tokens, packed_scores, unique_experts, counts)
+    if not all(getattr(tensor, "is_cuda", False) for tensor in tensors):
+        return False, "device", empty
+    if getattr(packed_hidden, "dtype", None) != torch.float32 or getattr(packed_scores, "dtype", None) != torch.float32:
+        return False, "dtype", empty
+    if getattr(packed_tokens, "dtype", None) != torch.long or getattr(unique_experts, "dtype", None) != torch.long or getattr(counts, "dtype", None) != torch.long:
+        return False, "dtype", empty
+    if len(getattr(packed_hidden, "shape", ())) != 2:
+        return False, "shape", empty
+    if any(len(getattr(tensor, "shape", ())) != 1 for tensor in (packed_tokens, packed_scores, unique_experts, counts)):
+        return False, "shape", empty
+    assignments = int(packed_hidden.shape[0])
+    if int(packed_tokens.shape[0]) != assignments or int(packed_scores.shape[0]) != assignments:
+        return False, "shape", empty
+    if int(unique_experts.shape[0]) != int(counts.shape[0]):
+        return False, "shape", empty
+    if assignments == 0:
+        return False, "shape", empty
+    if int(mapping.expert_end) <= int(mapping.expert_start) or not mapping.experts:
+        return False, "shape", empty
+    return _tp_moe_local_expert_tensor_lists(packed_hidden, mapping, weights)
+
+
+def _tp_moe_local_expert_tensor_lists(
+    packed_hidden: Any,
+    mapping: MoEMapping,
+    weights: ReferenceWeights,
+) -> tuple[bool, str, tuple[list[Any], list[Any], list[Any], list[Any], list[Any], list[Any]]]:
+    import torch
+
+    empty: tuple[list[Any], list[Any], list[Any], list[Any], list[Any], list[Any]] = ([], [], [], [], [], [])
+    hidden_size = int(packed_hidden.shape[1])
+    cached = getattr(mapping, "_local_expert_tensor_lists_cache", None)
+    cache_key = (id(weights), str(getattr(packed_hidden, "device", "")), hidden_size)
+    if cached is not None:
+        cached_key, cached_result = cached
+        if cached_key == cache_key:
+            return cached_result
+
+    gate_weights: list[Any] = []
+    gate_scales: list[Any] = []
+    up_weights: list[Any] = []
+    up_scales: list[Any] = []
+    down_weights: list[Any] = []
+    down_scales: list[Any] = []
+    expected_index = int(mapping.expert_start)
+    for expert in mapping.experts:
+        if int(expert.index) != expected_index:
+            return False, "shape", empty
+        expected_index += 1
+        gate_weight, gate_scale = weights.linear_weight(expert.gate_proj)
+        up_weight, up_scale = weights.linear_weight(expert.up_proj)
+        down_weight, down_scale = weights.linear_weight(expert.down_proj)
+        if gate_scale is None or up_scale is None or down_scale is None:
+            return False, "missing_scale", empty
+        tensors = (gate_weight, gate_scale, up_weight, up_scale, down_weight, down_scale)
+        if not all(getattr(tensor, "is_cuda", False) for tensor in tensors):
+            return False, "device", empty
+        if gate_weight.dtype != torch.float8_e4m3fn or up_weight.dtype != torch.float8_e4m3fn or down_weight.dtype != torch.float8_e4m3fn:
+            return False, "dtype", empty
+        if gate_scale.dtype != torch.bfloat16 or up_scale.dtype != torch.bfloat16 or down_scale.dtype != torch.bfloat16:
+            return False, "dtype", empty
+        if len(gate_weight.shape) != 2 or len(up_weight.shape) != 2 or len(down_weight.shape) != 2:
+            return False, "shape", empty
+        intermediate_size = int(gate_weight.shape[0])
+        if int(gate_weight.shape[1]) != hidden_size:
+            return False, "shape", empty
+        if tuple(up_weight.shape) != tuple(gate_weight.shape):
+            return False, "shape", empty
+        if tuple(down_weight.shape) != (hidden_size, intermediate_size):
+            return False, "shape", empty
+        if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+            return False, "shape", empty
+        if tuple(gate_scale.shape) != (intermediate_size // 128, hidden_size // 128):
+            return False, "shape", empty
+        if tuple(up_scale.shape) != (intermediate_size // 128, hidden_size // 128):
+            return False, "shape", empty
+        if tuple(down_scale.shape) != (hidden_size // 128, intermediate_size // 128):
+            return False, "shape", empty
+        gate_weights.append(gate_weight)
+        gate_scales.append(gate_scale)
+        up_weights.append(up_weight)
+        up_scales.append(up_scale)
+        down_weights.append(down_weight)
+        down_scales.append(down_scale)
+    result = (True, "", (gate_weights, gate_scales, up_weights, up_scales, down_weights, down_scales))
+    try:
+        object.__setattr__(mapping, "_local_expert_tensor_lists_cache", (cache_key, result))
+    except (AttributeError, TypeError):
+        pass
+    return result
+
+
+def _record_native_grouped_dispatch_fallback(stats: Any, reason: str) -> None:
+    if stats is None:
+        return
+    stats.moe_native_grouped_dispatch_fallbacks += 1
+    if reason == "disabled":
+        stats.moe_native_grouped_dispatch_fallback_disabled += 1
+    elif reason == "small":
+        stats.moe_native_grouped_dispatch_fallback_small += 1
+    elif reason == "missing_scale":
+        stats.moe_native_grouped_dispatch_fallback_missing_scale += 1
+    elif reason == "device":
+        stats.moe_native_grouped_dispatch_fallback_device += 1
+    elif reason == "dtype":
+        stats.moe_native_grouped_dispatch_fallback_dtype += 1
+    elif reason == "exception":
+        stats.moe_native_grouped_dispatch_fallback_exception += 1
+    else:
+        stats.moe_native_grouped_dispatch_fallback_shape += 1
 
 
 def _tp_moe_packed_assignment_plan(
@@ -938,6 +1172,94 @@ def _tp_moe_expert_by_index(mapping: MoEMapping) -> dict[int, Any]:
     except (AttributeError, TypeError):
         pass
     return expert_by_index
+
+
+_NATIVE_MOE_SCATTER_FN: Any = None
+_NATIVE_MOE_SCATTER_IMPORT_FAILED = False
+
+
+def _native_moe_scatter_fn() -> Any:
+    global _NATIVE_MOE_SCATTER_FN, _NATIVE_MOE_SCATTER_IMPORT_FAILED
+    if _NATIVE_MOE_SCATTER_FN is not None:
+        return _NATIVE_MOE_SCATTER_FN
+    if _NATIVE_MOE_SCATTER_IMPORT_FAILED:
+        return None
+    try:
+        from fp8_cuda import moe_packed_score_scatter_add
+    except Exception:
+        _NATIVE_MOE_SCATTER_IMPORT_FAILED = True
+        return None
+    _NATIVE_MOE_SCATTER_FN = moe_packed_score_scatter_add
+    return _NATIVE_MOE_SCATTER_FN
+
+
+def _native_moe_scatter_eligibility(routed: Any, packed_output: Any, packed_tokens: Any, packed_scores: Any) -> tuple[bool, str]:
+    import torch
+
+    tensors = (routed, packed_output, packed_tokens, packed_scores)
+    if not all(getattr(tensor, "is_cuda", False) for tensor in tensors):
+        return False, "device"
+    if getattr(routed, "dtype", None) != torch.float32 or getattr(packed_output, "dtype", None) != torch.float32:
+        return False, "dtype"
+    if getattr(packed_tokens, "dtype", None) != torch.long or getattr(packed_scores, "dtype", None) != torch.float32:
+        return False, "dtype"
+    if len(getattr(routed, "shape", ())) != 2 or len(getattr(packed_output, "shape", ())) != 2:
+        return False, "shape"
+    if len(getattr(packed_tokens, "shape", ())) != 1 or len(getattr(packed_scores, "shape", ())) != 1:
+        return False, "shape"
+    if int(packed_output.shape[0]) != int(packed_tokens.shape[0]) or int(packed_output.shape[0]) != int(packed_scores.shape[0]):
+        return False, "shape"
+    if int(packed_output.shape[1]) != int(routed.shape[1]):
+        return False, "shape"
+    return True, ""
+
+
+def _record_native_scatter_fallback(stats: Any, reason: str) -> None:
+    if stats is None:
+        return
+    stats.moe_native_scatter_fallbacks += 1
+    if reason == "small":
+        stats.moe_native_scatter_fallback_small += 1
+    elif reason == "device":
+        stats.moe_native_scatter_fallback_device += 1
+    elif reason == "dtype":
+        stats.moe_native_scatter_fallback_dtype += 1
+    elif reason == "exception":
+        stats.moe_native_scatter_fallback_exception += 1
+    else:
+        stats.moe_native_scatter_fallback_shape += 1
+
+
+def _try_native_moe_packed_score_scatter_add(
+    routed: Any,
+    packed_output: Any,
+    packed_tokens: Any,
+    packed_scores: Any,
+    runtime: TpRuntime,
+    stats: Any,
+) -> bool:
+    if stats is not None:
+        stats.moe_native_scatter_calls += 1
+    if int(packed_output.shape[0]) < _NATIVE_MOE_SCATTER_MIN_ASSIGNMENTS:
+        _record_native_scatter_fallback(stats, "small")
+        return False
+    eligible, reason = _native_moe_scatter_eligibility(routed, packed_output, packed_tokens, packed_scores)
+    if not eligible:
+        _record_native_scatter_fallback(stats, reason)
+        return False
+    native_fn = _native_moe_scatter_fn()
+    if native_fn is None:
+        _record_native_scatter_fallback(stats, "exception")
+        return False
+    try:
+        with runtime.profile_scope("moe.packed.native_scatter"):
+            native_fn(routed, packed_output, packed_tokens, packed_scores)
+    except RuntimeError:
+        _record_native_scatter_fallback(stats, "exception")
+        return False
+    if stats is not None:
+        stats.moe_native_scatter_hits += 1
+    return True
 
 
 _NATIVE_MOE_ASSIGNMENT_FN: Any = None

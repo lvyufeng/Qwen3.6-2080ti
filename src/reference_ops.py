@@ -76,6 +76,25 @@ class LinearDispatchStats:
     moe_native_expert_fallback_group_tokens: int = 0
     moe_native_expert_fallback_exception: int = 0
     moe_native_expert_max_group_tokens: int = 0
+    moe_native_scatter_calls: int = 0
+    moe_native_scatter_hits: int = 0
+    moe_native_scatter_fallbacks: int = 0
+    moe_native_scatter_fallback_small: int = 0
+    moe_native_scatter_fallback_device: int = 0
+    moe_native_scatter_fallback_dtype: int = 0
+    moe_native_scatter_fallback_shape: int = 0
+    moe_native_scatter_fallback_exception: int = 0
+    moe_native_grouped_dispatch_calls: int = 0
+    moe_native_grouped_dispatch_eligible: int = 0
+    moe_native_grouped_dispatch_hits: int = 0
+    moe_native_grouped_dispatch_fallbacks: int = 0
+    moe_native_grouped_dispatch_fallback_disabled: int = 0
+    moe_native_grouped_dispatch_fallback_small: int = 0
+    moe_native_grouped_dispatch_fallback_device: int = 0
+    moe_native_grouped_dispatch_fallback_dtype: int = 0
+    moe_native_grouped_dispatch_fallback_shape: int = 0
+    moe_native_grouped_dispatch_fallback_missing_scale: int = 0
+    moe_native_grouped_dispatch_fallback_exception: int = 0
 
 
 def embedding(input_ids: Any, weight: Any) -> Any:
