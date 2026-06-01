@@ -9,8 +9,11 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <tuple>
+#include <vector>
 
 namespace {
 
@@ -191,6 +194,47 @@ __global__ void fp8_moe_down_kernel(
     }
     if (threadIdx.x == 0) output[static_cast<size_t>(batch) * hidden_size + row] = scratch[0];
 }
+
+__global__ void moe_assignment_count_kernel(
+    const int64_t* __restrict__ indices,
+    int64_t* __restrict__ counts,
+    int64_t total_assignments,
+    int top_k,
+    int64_t expert_start,
+    int64_t expert_end) {
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total_assignments;
+         idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int64_t expert = indices[idx];
+        if (expert >= expert_start && expert < expert_end) {
+            atomicAdd(reinterpret_cast<unsigned long long*>(&counts[expert - expert_start]), 1ULL);
+        }
+    }
+}
+
+__global__ void moe_assignment_fill_kernel(
+    const int64_t* __restrict__ indices,
+    const float* __restrict__ scores,
+    int64_t* __restrict__ cursors,
+    int64_t* __restrict__ packed_tokens,
+    float* __restrict__ packed_scores,
+    int64_t total_assignments,
+    int top_k,
+    int64_t expert_start,
+    int64_t expert_end) {
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total_assignments;
+         idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int64_t expert = indices[idx];
+        if (expert >= expert_start && expert < expert_end) {
+            const int64_t local = expert - expert_start;
+            const int64_t out_pos = static_cast<int64_t>(atomicAdd(reinterpret_cast<unsigned long long*>(&cursors[local]), 1ULL));
+            packed_tokens[out_pos] = idx / top_k;
+            packed_scores[out_pos] = scores[idx];
+        }
+    }
+}
+
 
 __global__ void linear_attention_recurrent_core_kernel(
     const float* __restrict__ query,
@@ -506,6 +550,113 @@ torch::Tensor fp8_e4m3_bf16_moe_expert(
     check_cuda(cudaGetLastError(), "fp8_moe_down_kernel");
     return output;
 }
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moe_packed_local_assignments(
+    torch::Tensor indices,
+    torch::Tensor scores,
+    int64_t expert_start,
+    int64_t expert_end) {
+    TORCH_CHECK(indices.is_cuda(), "indices must be CUDA");
+    TORCH_CHECK(scores.is_cuda(), "scores must be CUDA");
+    TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
+    TORCH_CHECK(scores.is_contiguous(), "scores must be contiguous");
+    TORCH_CHECK(indices.scalar_type() == at::kLong, "indices must be int64");
+    TORCH_CHECK(scores.scalar_type() == at::kFloat, "scores must be float32");
+    TORCH_CHECK(indices.dim() == 2, "indices must have shape [tokens, top_k]");
+    TORCH_CHECK(scores.dim() == 2, "scores must have shape [tokens, top_k]");
+    TORCH_CHECK(indices.sizes() == scores.sizes(), "indices and scores shapes must match");
+    TORCH_CHECK(expert_end >= expert_start, "expert_end must be >= expert_start");
+
+    c10::cuda::CUDAGuard device_guard(indices.device());
+    TORCH_CHECK(scores.device() == indices.device(), "scores must be on same CUDA device as indices");
+
+    const auto tokens64 = indices.size(0);
+    const auto top_k64 = indices.size(1);
+    TORCH_CHECK(tokens64 >= 0, "token count must be non-negative");
+    TORCH_CHECK(top_k64 > 0 && top_k64 <= INT_MAX, "top_k must be positive and fit int32");
+    TORCH_CHECK(tokens64 == 0 || tokens64 <= (std::numeric_limits<int64_t>::max() / top_k64), "assignment count overflow");
+    const int top_k = static_cast<int>(top_k64);
+    const int64_t total_assignments = tokens64 * top_k64;
+    const int64_t local_experts64 = expert_end - expert_start;
+    TORCH_CHECK(local_experts64 >= 0 && local_experts64 <= INT_MAX, "local expert count must fit int32");
+
+    auto long_options = indices.options().dtype(at::kLong);
+    auto score_options = scores.options();
+    if (local_experts64 == 0 || total_assignments == 0) {
+        auto packed_tokens = torch::empty({0}, long_options);
+        auto packed_scores = torch::empty({0}, score_options);
+        auto unique_experts = torch::empty({0}, long_options);
+        auto counts = torch::empty({0}, long_options);
+        return std::make_tuple(packed_tokens, packed_scores, unique_experts, counts);
+    }
+
+    auto counts_full = torch::zeros({local_experts64}, long_options);
+    auto stream = at::cuda::getCurrentCUDAStream(indices.device().index()).stream();
+    const int threads = 256;
+    const int blocks = static_cast<int>(std::min<int64_t>((total_assignments + threads - 1) / threads, 65535));
+    moe_assignment_count_kernel<<<blocks, threads, 0, stream>>>(
+        indices.data_ptr<int64_t>(),
+        counts_full.data_ptr<int64_t>(),
+        total_assignments,
+        top_k,
+        expert_start,
+        expert_end);
+    check_cuda(cudaGetLastError(), "moe_assignment_count_kernel");
+
+    auto counts_cpu = counts_full.to(torch::kCPU);
+    const auto* counts_data = counts_cpu.data_ptr<int64_t>();
+    std::vector<int64_t> offsets(static_cast<size_t>(local_experts64), 0);
+    std::vector<int64_t> unique_experts_host;
+    std::vector<int64_t> counts_host;
+    unique_experts_host.reserve(static_cast<size_t>(local_experts64));
+    counts_host.reserve(static_cast<size_t>(local_experts64));
+    int64_t local_assignment_count = 0;
+    for (int64_t local = 0; local < local_experts64; ++local) {
+        const int64_t count = counts_data[local];
+        offsets[static_cast<size_t>(local)] = local_assignment_count;
+        if (count > 0) {
+            unique_experts_host.push_back(expert_start + local);
+            counts_host.push_back(count);
+            local_assignment_count += count;
+        }
+    }
+
+    auto unique_experts_cpu = torch::empty({static_cast<int64_t>(unique_experts_host.size())}, torch::TensorOptions().dtype(at::kLong).device(torch::kCPU));
+    auto counts_compact_cpu = torch::empty({static_cast<int64_t>(counts_host.size())}, torch::TensorOptions().dtype(at::kLong).device(torch::kCPU));
+    if (!unique_experts_host.empty()) {
+        std::memcpy(unique_experts_cpu.data_ptr<int64_t>(), unique_experts_host.data(), unique_experts_host.size() * sizeof(int64_t));
+        std::memcpy(counts_compact_cpu.data_ptr<int64_t>(), counts_host.data(), counts_host.size() * sizeof(int64_t));
+    }
+    auto unique_experts = unique_experts_cpu.to(long_options.device(indices.device()));
+    auto counts = counts_compact_cpu.to(long_options.device(indices.device()));
+
+    if (local_assignment_count == 0) {
+        auto packed_tokens = torch::empty({0}, long_options);
+        auto packed_scores = torch::empty({0}, score_options);
+        return std::make_tuple(packed_tokens, packed_scores, unique_experts, counts);
+    }
+
+    auto offsets_cpu = torch::empty({local_experts64}, torch::TensorOptions().dtype(at::kLong).device(torch::kCPU));
+    std::memcpy(offsets_cpu.data_ptr<int64_t>(), offsets.data(), offsets.size() * sizeof(int64_t));
+    auto offsets_full = offsets_cpu.to(long_options.device(indices.device()));
+    auto cursors = offsets_full.clone();
+    auto packed_tokens = torch::empty({local_assignment_count}, long_options);
+    auto packed_scores = torch::empty({local_assignment_count}, score_options);
+
+    moe_assignment_fill_kernel<<<blocks, threads, 0, stream>>>(
+        indices.data_ptr<int64_t>(),
+        scores.data_ptr<float>(),
+        cursors.data_ptr<int64_t>(),
+        packed_tokens.data_ptr<int64_t>(),
+        packed_scores.data_ptr<float>(),
+        total_assignments,
+        top_k,
+        expert_start,
+        expert_end);
+    check_cuda(cudaGetLastError(), "moe_assignment_fill_kernel");
+    return std::make_tuple(packed_tokens, packed_scores, unique_experts, counts);
+}
+
 
 std::tuple<torch::Tensor, torch::Tensor> linear_attention_recurrent_core(
     torch::Tensor query,

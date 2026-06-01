@@ -50,6 +50,46 @@ def test_fp8_cuda_moe_expert_matches_reference_small_groups() -> None:
         torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the assignment planner extension")
+def test_moe_packed_local_assignments_matches_reference() -> None:
+    try:
+        from fp8_cuda import moe_packed_local_assignments
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(3)
+    cases = [
+        (torch.tensor([[3, 4], [5, 6], [7, 8]], device=device, dtype=torch.long), torch.rand((3, 2), device=device, dtype=torch.float32), 4, 8),
+        (torch.tensor([[4, 4], [5, 6], [7, 7]], device=device, dtype=torch.long), torch.rand((3, 2), device=device, dtype=torch.float32), 4, 8),
+        (torch.tensor([[0, 1], [2, 3]], device=device, dtype=torch.long), torch.rand((2, 2), device=device, dtype=torch.float32), 4, 8),
+        (torch.tensor([[5, 4, 5], [7, 6, 4], [3, 8, 9], [4, 4, 4]], device=device, dtype=torch.long), torch.rand((4, 3), device=device, dtype=torch.float32), 4, 8),
+    ]
+    for indices, scores, expert_start, expert_end in cases:
+        packed_tokens, packed_scores, unique_experts, counts = moe_packed_local_assignments(indices, scores, expert_start, expert_end)
+        ref_tokens, ref_scores, ref_unique_experts, ref_counts = _reference_packed_assignments(indices, scores, expert_start, expert_end)
+        torch.testing.assert_close(unique_experts, ref_unique_experts)
+        torch.testing.assert_close(counts, ref_counts)
+        _assert_assignment_groups_match(packed_tokens, packed_scores, ref_tokens, ref_scores, counts)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the assignment planner extension")
+def test_moe_packed_local_assignments_handles_empty_local_dispatch() -> None:
+    try:
+        from fp8_cuda import moe_packed_local_assignments
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    indices = torch.tensor([[0, 1], [2, 3]], device=device, dtype=torch.long)
+    scores = torch.rand((2, 2), device=device, dtype=torch.float32)
+    packed_tokens, packed_scores, unique_experts, counts = moe_packed_local_assignments(indices, scores, 4, 8)
+    assert packed_tokens.numel() == 0
+    assert packed_scores.numel() == 0
+    assert unique_experts.numel() == 0
+    assert counts.numel() == 0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the recurrent core extension")
 def test_linear_attention_recurrent_core_matches_reference() -> None:
     try:
@@ -91,6 +131,48 @@ def test_fp8_cuda_linear_wrapper_falls_back_for_cpu() -> None:
     out = linear(x, weight, scale)
 
     torch.testing.assert_close(out, torch.tensor([[6.0, 4.0]]))
+
+
+def _reference_packed_assignments(
+    indices: torch.Tensor,
+    scores: torch.Tensor,
+    expert_start: int,
+    expert_end: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    token_count, top_k = indices.shape
+    token_ids = torch.arange(token_count, device=indices.device)
+    assignment_tokens = token_ids[:, None].expand_as(indices).reshape(-1)
+    assignment_experts = indices.reshape(-1)
+    assignment_scores = scores.reshape(-1)
+    local_mask = (assignment_experts >= expert_start) & (assignment_experts < expert_end)
+    local_tokens = assignment_tokens[local_mask]
+    local_experts = assignment_experts[local_mask]
+    local_scores = assignment_scores[local_mask]
+    order = torch.argsort(local_experts)
+    packed_tokens = local_tokens[order]
+    packed_scores = local_scores[order]
+    packed_experts = local_experts[order]
+    unique_experts, counts = torch.unique_consecutive(packed_experts, return_counts=True)
+    return packed_tokens, packed_scores, unique_experts, counts
+
+
+def _assert_assignment_groups_match(
+    packed_tokens: torch.Tensor,
+    packed_scores: torch.Tensor,
+    ref_tokens: torch.Tensor,
+    ref_scores: torch.Tensor,
+    counts: torch.Tensor,
+) -> None:
+    # The native planner groups by expert but does not guarantee a stable order
+    # within a group, so compare each group's (token, score) pairs as a multiset.
+    offset = 0
+    for count in counts.tolist():
+        end = offset + count
+        got = sorted(zip(packed_tokens[offset:end].tolist(), [round(s, 6) for s in packed_scores[offset:end].tolist()]))
+        ref = sorted(zip(ref_tokens[offset:end].tolist(), [round(s, 6) for s in ref_scores[offset:end].tolist()]))
+        assert got == ref
+        offset = end
+    assert offset == int(packed_tokens.numel())
 
 
 def _prepare_recurrent_inputs(

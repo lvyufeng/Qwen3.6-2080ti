@@ -29,6 +29,15 @@ def fp8_e4m3_bf16_moe_expert(
     )
 
 
+def moe_packed_local_assignments(indices: Any, scores: Any, expert_start: int, expert_end: int) -> Any:
+    return load_fp8_extension().moe_packed_local_assignments(
+        indices.contiguous(),
+        scores.contiguous(),
+        int(expert_start),
+        int(expert_end),
+    )
+
+
 def linear_attention_recurrent_core(query: Any, key: Any, value: Any, g: Any, beta: Any, initial_state: Any) -> Any:
     return load_fp8_extension().linear_attention_recurrent_core(
         query.contiguous(),

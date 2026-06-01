@@ -239,6 +239,7 @@ def test_worker_load_then_generate_single_rank(tmp_path: Path, monkeypatch: pyte
     assert generate_result.data["throughput"]["total_tokens_per_second"] > 0
     assert generate_result.data["dispatch"]["calls"] >= 0
     assert "moe_packed_single_scatter_calls" in generate_result.data["dispatch"]
+    assert "moe_native_assignment_hits" in generate_result.data["dispatch"]
     assert generate_result.data["memory"]["available"] is False
     assert generate_result.data["profile"]["enabled"] is False
     assert generate_result.data["profile"]["scopes"] == {}

@@ -28,6 +28,7 @@ class TpRuntimeError(RuntimeError):
 
 
 _NATIVE_MOE_EXPERT_MAX_GROUP_TOKENS = 8
+_NATIVE_MOE_ASSIGNMENT_MIN_ASSIGNMENTS = 4096
 
 
 @dataclass(frozen=True)
@@ -601,16 +602,12 @@ def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMa
 
     routed = torch.zeros_like(flat.float())
     stats = getattr(weights, "dispatch_stats", None)
-    with runtime.profile_scope("moe.packed.assignments"):
-        token_count = int(flat.shape[0])
-        token_ids = torch.arange(token_count, device=flat.device)
-        assignment_tokens = token_ids[:, None].expand_as(routing.indices).reshape(-1)
-        assignment_experts = routing.indices.reshape(-1)
-        assignment_scores = routing.scores.reshape(-1)
-    with runtime.profile_scope("moe.packed.local_filter"):
-        local_mask = (assignment_experts >= mapping.expert_start) & (assignment_experts < mapping.expert_end)
-        local_tokens = assignment_tokens[local_mask]
-        local_assignment_count = int(local_tokens.numel())
+    local_assignment_count, packed_tokens, packed_scores, unique_experts, counts = _tp_moe_packed_assignment_plan(
+        routing,
+        mapping,
+        runtime,
+        stats,
+    )
     if stats is not None:
         stats.moe_local_assignments += local_assignment_count
     if local_assignment_count == 0:
@@ -618,14 +615,6 @@ def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMa
             stats.moe_empty_local_dispatches += 1
         return routed
 
-    local_experts = assignment_experts[local_mask]
-    local_scores = assignment_scores[local_mask]
-    with runtime.profile_scope("moe.packed.sort"):
-        order = torch.argsort(local_experts)
-        packed_tokens = local_tokens[order]
-        packed_experts = local_experts[order]
-        packed_scores = local_scores[order]
-        unique_experts, counts = torch.unique_consecutive(packed_experts, return_counts=True)
     with runtime.profile_scope("moe.packed.gather_hidden"):
         packed_hidden = flat.index_select(0, packed_tokens)
     unique_expert_ids = unique_experts.tolist()
@@ -667,6 +656,106 @@ def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMa
     return routed
 
 
+def _tp_moe_packed_assignment_plan(
+    routing: TopKRouting,
+    mapping: MoEMapping,
+    runtime: TpRuntime,
+    stats: Any,
+) -> tuple[int, Any, Any, Any, Any]:
+    eligible, reason = _tp_moe_native_assignment_eligibility(routing, mapping)
+    if stats is not None:
+        stats.moe_native_assignment_calls += 1
+    if eligible:
+        if stats is not None:
+            stats.moe_native_assignment_eligible += 1
+        native_fn = _native_moe_assignment_fn()
+        if native_fn is not None:
+            try:
+                with runtime.profile_scope("moe.packed.local_plan"):
+                    packed_tokens, packed_scores, unique_experts, counts = native_fn(
+                        routing.indices,
+                        routing.scores,
+                        mapping.expert_start,
+                        mapping.expert_end,
+                    )
+                if stats is not None:
+                    stats.moe_native_assignment_hits += 1
+                return int(packed_tokens.numel()), packed_tokens, packed_scores, unique_experts, counts
+            except RuntimeError:
+                _record_native_assignment_fallback(stats, "exception")
+        else:
+            _record_native_assignment_fallback(stats, "exception")
+    else:
+        _record_native_assignment_fallback(stats, reason)
+    return _tp_moe_packed_assignment_plan_torch(routing, mapping, runtime)
+
+
+def _tp_moe_packed_assignment_plan_torch(routing: TopKRouting, mapping: MoEMapping, runtime: TpRuntime) -> tuple[int, Any, Any, Any, Any]:
+    import torch
+
+    with runtime.profile_scope("moe.packed.assignments"):
+        token_count = int(routing.indices.shape[0])
+        token_ids = torch.arange(token_count, device=routing.indices.device)
+        assignment_tokens = token_ids[:, None].expand_as(routing.indices).reshape(-1)
+        assignment_experts = routing.indices.reshape(-1)
+        assignment_scores = routing.scores.reshape(-1)
+    with runtime.profile_scope("moe.packed.local_filter"):
+        local_mask = (assignment_experts >= mapping.expert_start) & (assignment_experts < mapping.expert_end)
+        local_tokens = assignment_tokens[local_mask]
+        local_assignment_count = int(local_tokens.numel())
+    if local_assignment_count == 0:
+        empty_experts = routing.indices.new_empty((0,))
+        empty_counts = routing.indices.new_empty((0,))
+        empty_scores = routing.scores.new_empty((0,))
+        return 0, local_tokens, empty_scores, empty_experts, empty_counts
+
+    local_experts = assignment_experts[local_mask]
+    local_scores = assignment_scores[local_mask]
+    with runtime.profile_scope("moe.packed.sort"):
+        order = torch.argsort(local_experts)
+        packed_tokens = local_tokens[order]
+        packed_experts = local_experts[order]
+        packed_scores = local_scores[order]
+        unique_experts, counts = torch.unique_consecutive(packed_experts, return_counts=True)
+    return local_assignment_count, packed_tokens, packed_scores, unique_experts, counts
+
+
+def _tp_moe_native_assignment_eligibility(routing: TopKRouting, mapping: MoEMapping) -> tuple[bool, str]:
+    import torch
+
+    indices = routing.indices
+    scores = routing.scores
+    if not getattr(indices, "is_cuda", False) or not getattr(scores, "is_cuda", False):
+        return False, "device"
+    if getattr(indices, "dtype", None) != torch.long or getattr(scores, "dtype", None) != torch.float32:
+        return False, "dtype"
+    if len(getattr(indices, "shape", ())) != 2 or len(getattr(scores, "shape", ())) != 2:
+        return False, "shape"
+    if tuple(indices.shape) != tuple(scores.shape):
+        return False, "shape"
+    if int(mapping.expert_end) <= int(mapping.expert_start):
+        return False, "shape"
+    if int(indices.numel()) < _NATIVE_MOE_ASSIGNMENT_MIN_ASSIGNMENTS:
+        return False, "small"
+    return True, ""
+
+
+def _record_native_assignment_fallback(stats: Any, reason: str) -> None:
+    if stats is None:
+        return
+    stats.moe_native_assignment_fallbacks += 1
+    if reason == "small":
+        stats.moe_native_assignment_fallback_small += 1
+    elif reason == "device":
+        stats.moe_native_assignment_fallback_device += 1
+    elif reason == "dtype":
+        stats.moe_native_assignment_fallback_dtype += 1
+    elif reason == "exception":
+        stats.moe_native_assignment_fallback_exception += 1
+    else:
+        stats.moe_native_assignment_fallback_shape += 1
+
+
 def _tp_moe_expert_by_index(mapping: MoEMapping) -> dict[int, Any]:
     cached = getattr(mapping, "_expert_by_index_cache", None)
     if cached is not None:
@@ -677,6 +766,25 @@ def _tp_moe_expert_by_index(mapping: MoEMapping) -> dict[int, Any]:
     except (AttributeError, TypeError):
         pass
     return expert_by_index
+
+
+_NATIVE_MOE_ASSIGNMENT_FN: Any = None
+_NATIVE_MOE_ASSIGNMENT_IMPORT_FAILED = False
+
+
+def _native_moe_assignment_fn() -> Any:
+    global _NATIVE_MOE_ASSIGNMENT_FN, _NATIVE_MOE_ASSIGNMENT_IMPORT_FAILED
+    if _NATIVE_MOE_ASSIGNMENT_FN is not None:
+        return _NATIVE_MOE_ASSIGNMENT_FN
+    if _NATIVE_MOE_ASSIGNMENT_IMPORT_FAILED:
+        return None
+    try:
+        from fp8_cuda import moe_packed_local_assignments
+    except Exception:
+        _NATIVE_MOE_ASSIGNMENT_IMPORT_FAILED = True
+        return None
+    _NATIVE_MOE_ASSIGNMENT_FN = moe_packed_local_assignments
+    return _NATIVE_MOE_ASSIGNMENT_FN
 
 
 _NATIVE_MOE_EXPERT_FN: Any = None

@@ -302,6 +302,7 @@ def test_cli_tp_generate_single_rank(tmp_path: Path, capsys, monkeypatch: pytest
     assert "tp_generate_total_tokens_per_second:" in out
     assert "tp_generate_dispatch_calls:" in out
     assert "tp_generate_dispatch_moe_packed_single_scatter_calls:" in out
+    assert "tp_generate_dispatch_moe_native_assignment_hits:" in out
     assert "tp_generate_kv_full_attention_layers: 1" in out
     assert "tp_generate_profile_enabled: False" in out
     assert "tp_generate_all_finite: True" in out

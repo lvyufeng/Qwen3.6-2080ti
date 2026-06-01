@@ -149,7 +149,10 @@ def test_packed_tp_moe_matches_loop_and_records_stats() -> None:
     assert stats.moe_group_size_1 == 0
     assert stats.moe_group_size_2_to_4 == 2
     assert stats.moe_group_size_5_to_8 == 0
-    assert stats.moe_group_size_over_8 == 0
+    assert stats.moe_native_assignment_calls == 1
+    assert stats.moe_native_assignment_hits == 0
+    assert stats.moe_native_assignment_fallbacks == 1
+    assert stats.moe_native_assignment_fallback_device == 1
     assert stats.moe_native_expert_calls == 2
     assert stats.moe_native_expert_hits == 0
     assert stats.moe_native_expert_fallbacks == 2
@@ -173,6 +176,9 @@ def test_packed_tp_moe_records_native_disabled_fallback() -> None:
     torch.testing.assert_close(actual, expected)
     assert weights.dispatch_stats.moe_packed_index_add_calls == 1
     assert weights.dispatch_stats.moe_packed_single_scatter_calls == 1
+    assert weights.dispatch_stats.moe_native_assignment_calls == 1
+    assert weights.dispatch_stats.moe_native_assignment_hits == 0
+    assert weights.dispatch_stats.moe_native_assignment_fallback_device == 1
     assert weights.dispatch_stats.moe_native_expert_calls == 2
     assert weights.dispatch_stats.moe_native_expert_hits == 0
     assert weights.dispatch_stats.moe_native_expert_fallbacks == 2

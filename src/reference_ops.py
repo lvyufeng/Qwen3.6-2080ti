@@ -55,6 +55,15 @@ class LinearDispatchStats:
     moe_group_size_2_to_4: int = 0
     moe_group_size_5_to_8: int = 0
     moe_group_size_over_8: int = 0
+    moe_native_assignment_calls: int = 0
+    moe_native_assignment_eligible: int = 0
+    moe_native_assignment_hits: int = 0
+    moe_native_assignment_fallbacks: int = 0
+    moe_native_assignment_fallback_small: int = 0
+    moe_native_assignment_fallback_device: int = 0
+    moe_native_assignment_fallback_dtype: int = 0
+    moe_native_assignment_fallback_shape: int = 0
+    moe_native_assignment_fallback_exception: int = 0
     moe_native_expert_calls: int = 0
     moe_native_expert_eligible: int = 0
     moe_native_expert_hits: int = 0
