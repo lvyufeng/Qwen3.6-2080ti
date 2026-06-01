@@ -601,14 +601,16 @@ def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMa
 
     routed = torch.zeros_like(flat.float())
     stats = getattr(weights, "dispatch_stats", None)
-    token_count = int(flat.shape[0])
-    token_ids = torch.arange(token_count, device=flat.device)
-    assignment_tokens = token_ids[:, None].expand_as(routing.indices).reshape(-1)
-    assignment_experts = routing.indices.reshape(-1)
-    assignment_scores = routing.scores.reshape(-1)
-    local_mask = (assignment_experts >= mapping.expert_start) & (assignment_experts < mapping.expert_end)
-    local_tokens = assignment_tokens[local_mask]
-    local_assignment_count = int(local_tokens.numel())
+    with runtime.profile_scope("moe.packed.assignments"):
+        token_count = int(flat.shape[0])
+        token_ids = torch.arange(token_count, device=flat.device)
+        assignment_tokens = token_ids[:, None].expand_as(routing.indices).reshape(-1)
+        assignment_experts = routing.indices.reshape(-1)
+        assignment_scores = routing.scores.reshape(-1)
+    with runtime.profile_scope("moe.packed.local_filter"):
+        local_mask = (assignment_experts >= mapping.expert_start) & (assignment_experts < mapping.expert_end)
+        local_tokens = assignment_tokens[local_mask]
+        local_assignment_count = int(local_tokens.numel())
     if stats is not None:
         stats.moe_local_assignments += local_assignment_count
     if local_assignment_count == 0:
@@ -623,32 +625,77 @@ def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMa
         packed_tokens = local_tokens[order]
         packed_experts = local_experts[order]
         packed_scores = local_scores[order]
-        packed_hidden = flat.index_select(0, packed_tokens)
         unique_experts, counts = torch.unique_consecutive(packed_experts, return_counts=True)
+    with runtime.profile_scope("moe.packed.gather_hidden"):
+        packed_hidden = flat.index_select(0, packed_tokens)
+    unique_expert_ids = unique_experts.tolist()
+    group_counts = counts.tolist()
     if stats is not None:
-        stats.moe_active_expert_groups += int(unique_experts.numel())
-        if counts.numel() > 0:
-            stats.moe_max_group_tokens = max(stats.moe_max_group_tokens, int(counts.max().item()))
-    expert_by_index = {expert.index: expert for expert in mapping.experts}
+        stats.moe_active_expert_groups += len(unique_expert_ids)
+        if group_counts:
+            stats.moe_max_group_tokens = max(stats.moe_max_group_tokens, max(group_counts))
+            for count in group_counts:
+                if count == 1:
+                    stats.moe_group_size_1 += 1
+                elif count <= 4:
+                    stats.moe_group_size_2_to_4 += 1
+                elif count <= 8:
+                    stats.moe_group_size_5_to_8 += 1
+                else:
+                    stats.moe_group_size_over_8 += 1
+    expert_by_index = _tp_moe_expert_by_index(mapping)
+    packed_output = torch.empty((local_assignment_count, flat.shape[-1]), device=flat.device, dtype=torch.float32)
     offset = 0
     with runtime.profile_scope("moe.packed.group_loop"):
-        for expert_id_tensor, count_tensor in zip(unique_experts, counts, strict=True):
-            expert_id = int(expert_id_tensor.item())
-            count = int(count_tensor.item())
+        for expert_id, count in zip(unique_expert_ids, group_counts, strict=True):
             try:
                 expert = expert_by_index[expert_id]
             except KeyError as exc:
                 raise RuntimeError(f"routing selected unmapped local expert {expert_id}") from exc
             end = offset + count
             hidden_chunk = packed_hidden[offset:end]
-            token_chunk = packed_tokens[offset:end]
             score_chunk = packed_scores[offset:end]
             token_output = _tp_moe_expert_group(hidden_chunk, expert, config, weights, runtime)
-            token_output = token_output * score_chunk[:, None]
-            with runtime.profile_scope("moe.packed.index_add"):
-                routed.index_add_(0, token_chunk, token_output.float())
+            with runtime.profile_scope("moe.packed.score_apply"):
+                packed_output[offset:end] = token_output.float() * score_chunk[:, None]
             offset = end
+    with runtime.profile_scope("moe.packed.scatter"):
+        routed.index_add_(0, packed_tokens, packed_output)
+    if stats is not None:
+        stats.moe_packed_index_add_calls += 1
+        stats.moe_packed_single_scatter_calls += 1
     return routed
+
+
+def _tp_moe_expert_by_index(mapping: MoEMapping) -> dict[int, Any]:
+    cached = getattr(mapping, "_expert_by_index_cache", None)
+    if cached is not None:
+        return cached
+    expert_by_index = {expert.index: expert for expert in mapping.experts}
+    try:
+        object.__setattr__(mapping, "_expert_by_index_cache", expert_by_index)
+    except (AttributeError, TypeError):
+        pass
+    return expert_by_index
+
+
+_NATIVE_MOE_EXPERT_FN: Any = None
+_NATIVE_MOE_EXPERT_IMPORT_FAILED = False
+
+
+def _native_moe_expert_fn() -> Any:
+    global _NATIVE_MOE_EXPERT_FN, _NATIVE_MOE_EXPERT_IMPORT_FAILED
+    if _NATIVE_MOE_EXPERT_FN is not None:
+        return _NATIVE_MOE_EXPERT_FN
+    if _NATIVE_MOE_EXPERT_IMPORT_FAILED:
+        return None
+    try:
+        from fp8_cuda import fp8_e4m3_bf16_moe_expert
+    except Exception:
+        _NATIVE_MOE_EXPERT_IMPORT_FAILED = True
+        return None
+    _NATIVE_MOE_EXPERT_FN = fp8_e4m3_bf16_moe_expert
+    return _NATIVE_MOE_EXPERT_FN
 
 
 def _tp_moe_expert_group(hidden_chunk: Any, expert: Any, config: RuntimeConfig, weights: ReferenceWeights, runtime: TpRuntime) -> Any:
@@ -667,13 +714,16 @@ def _tp_moe_expert_group(hidden_chunk: Any, expert: Any, config: RuntimeConfig, 
         _record_native_expert_fallback(stats, reason)
         with runtime.profile_scope("moe.fallback_expert"):
             return weights.expert(hidden_chunk, expert)
+    native_fn = _native_moe_expert_fn()
+    if native_fn is None:
+        _record_native_expert_fallback(stats, "exception")
+        with runtime.profile_scope("moe.fallback_expert"):
+            return weights.expert(hidden_chunk, expert)
     if stats is not None:
         stats.moe_native_expert_eligible += 1
     try:
-        from fp8_cuda import fp8_e4m3_bf16_moe_expert
-
         with runtime.profile_scope("moe.native_expert"):
-            output = fp8_e4m3_bf16_moe_expert(hidden_chunk.float(), *tensors)
+            output = native_fn(hidden_chunk.float(), *tensors)
     except RuntimeError:
         _record_native_expert_fallback(stats, "exception")
         with runtime.profile_scope("moe.fallback_expert"):

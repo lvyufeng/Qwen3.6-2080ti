@@ -144,6 +144,12 @@ def test_packed_tp_moe_matches_loop_and_records_stats() -> None:
     assert stats.moe_active_expert_groups == 2
     assert stats.moe_empty_local_dispatches == 0
     assert stats.moe_max_group_tokens == 3
+    assert stats.moe_packed_index_add_calls == 1
+    assert stats.moe_packed_single_scatter_calls == 1
+    assert stats.moe_group_size_1 == 0
+    assert stats.moe_group_size_2_to_4 == 2
+    assert stats.moe_group_size_5_to_8 == 0
+    assert stats.moe_group_size_over_8 == 0
     assert stats.moe_native_expert_calls == 2
     assert stats.moe_native_expert_hits == 0
     assert stats.moe_native_expert_fallbacks == 2
@@ -165,6 +171,8 @@ def test_packed_tp_moe_records_native_disabled_fallback() -> None:
         actual = tp_moe(hidden, mapping, packed_config, weights, runtime)
 
     torch.testing.assert_close(actual, expected)
+    assert weights.dispatch_stats.moe_packed_index_add_calls == 1
+    assert weights.dispatch_stats.moe_packed_single_scatter_calls == 1
     assert weights.dispatch_stats.moe_native_expert_calls == 2
     assert weights.dispatch_stats.moe_native_expert_hits == 0
     assert weights.dispatch_stats.moe_native_expert_fallbacks == 2
@@ -187,6 +195,27 @@ def test_loop_tp_moe_records_loop_stats() -> None:
     assert weights.dispatch_stats.moe_loop_calls == 1
     assert weights.dispatch_stats.moe_assignments == 2
     assert weights.dispatch_stats.moe_local_assignments == 0
+
+
+def test_packed_tp_moe_accumulates_duplicate_token_assignments_with_single_scatter() -> None:
+    hidden = torch.tensor([[[1.0, 0.0]]])
+    loader = _FakeLoader(_moe_test_tensors())
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    packed_config = _config_with_experts_per_token(2, packed=True)
+    loop_config = _config_with_experts_per_token(2, packed=False)
+    weights = ReferenceWeights(loader)
+    weights.dispatch_stats = LinearDispatchStats()
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        expected = tp_moe(hidden, mapping, loop_config, ReferenceWeights(loader), runtime)
+        actual = tp_moe(hidden, mapping, packed_config, weights, runtime)
+
+    torch.testing.assert_close(actual, expected)
+    assert weights.dispatch_stats.moe_local_assignments == 2
+    assert weights.dispatch_stats.moe_active_expert_groups == 2
+    assert weights.dispatch_stats.moe_packed_index_add_calls == 1
+    assert weights.dispatch_stats.moe_packed_single_scatter_calls == 1
+    assert weights.dispatch_stats.moe_group_size_1 == 2
 
 
 def test_two_rank_packed_tp_moe_matches_loop(tmp_path: Path) -> None:
@@ -258,6 +287,9 @@ def _tp_moe_worker(rank: int, tmp_path: Path) -> None:
     assert weights.dispatch_stats.moe_active_expert_groups == 1
     assert weights.dispatch_stats.moe_empty_local_dispatches == 0
     assert weights.dispatch_stats.moe_max_group_tokens == 3
+    assert weights.dispatch_stats.moe_packed_index_add_calls == 1
+    assert weights.dispatch_stats.moe_packed_single_scatter_calls == 1
+    assert weights.dispatch_stats.moe_group_size_2_to_4 == 1
     assert weights.dispatch_stats.moe_native_expert_calls == 1
     assert weights.dispatch_stats.moe_native_expert_hits == 0
     assert weights.dispatch_stats.moe_native_expert_fallbacks == 1

@@ -49,6 +49,12 @@ class LinearDispatchStats:
     moe_active_expert_groups: int = 0
     moe_empty_local_dispatches: int = 0
     moe_max_group_tokens: int = 0
+    moe_packed_index_add_calls: int = 0
+    moe_packed_single_scatter_calls: int = 0
+    moe_group_size_1: int = 0
+    moe_group_size_2_to_4: int = 0
+    moe_group_size_5_to_8: int = 0
+    moe_group_size_over_8: int = 0
     moe_native_expert_calls: int = 0
     moe_native_expert_eligible: int = 0
     moe_native_expert_hits: int = 0
