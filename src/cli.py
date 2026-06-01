@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from checkpoint import CheckpointError, Manifest, build_manifest
@@ -27,6 +29,18 @@ from worker import (
 
 class CliError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class TpConcurrentBenchmarkRun:
+    results: list[GenerateResult]
+    concurrency: int
+    prefill_wall_seconds: float
+    decode_wall_seconds: float
+    total_wall_seconds: float
+    batch_step_calls: int
+    generated_tokens: int
+    all_finite: bool
 
 
 
@@ -487,6 +501,123 @@ def _benchmark_prompt_from_args(manifest: Manifest, args: argparse.Namespace) ->
 
 def _format_tp_benchmark_result(result: GenerateResult) -> list[str]:
     return ["tp_benchmark_iterations: 1", *_format_tp_generate_result(result)]
+
+
+def _run_tp_concurrent_benchmark_once(
+    session: TpModelSession,
+    prompt: str,
+    max_new_tokens: int,
+    concurrency: int,
+) -> TpConcurrentBenchmarkRun:
+    states = []
+    results: list[GenerateResult] = []
+    total_start = time.perf_counter()
+    prefill_start = total_start
+    try:
+        for _ in range(concurrency):
+            states.append(session.start_generation(prompt, max_new_tokens))
+        prefill_end = time.perf_counter()
+        decode_start = prefill_end
+        batch_step_calls = 0
+        active = [state for state in states if not state.completed]
+        while active:
+            batch_step_calls += 1
+            session.step_generations_batch(active)
+            active = [state for state in active if not state.completed]
+        decode_end = time.perf_counter()
+        for state in states:
+            results.append(session.finish_generation(state))
+        total_end = time.perf_counter()
+    except Exception:
+        for state in states:
+            if not state.result_built:
+                state.decode_state.release()
+        raise
+    generated_tokens = sum(result.max_new_tokens for result in results)
+    return TpConcurrentBenchmarkRun(
+        results=results,
+        concurrency=concurrency,
+        prefill_wall_seconds=max(0.0, prefill_end - prefill_start),
+        decode_wall_seconds=max(0.0, decode_end - decode_start),
+        total_wall_seconds=max(0.0, total_end - total_start),
+        batch_step_calls=batch_step_calls,
+        generated_tokens=generated_tokens,
+        all_finite=all(result.all_finite for result in results),
+    )
+
+
+def _format_tp_concurrent_benchmark_results(
+    runs: list[TpConcurrentBenchmarkRun],
+    *,
+    warmup_iterations: int,
+    prompt_target_tokens: int | None,
+    print_runs: bool,
+) -> list[str]:
+    if not runs:
+        raise CliError("concurrent benchmark requires at least one measured run")
+    all_results = [result for run in runs for result in run.results]
+    concurrency = runs[0].concurrency
+    requests_total = sum(len(run.results) for run in runs)
+    tokens_total = sum(run.generated_tokens for run in runs)
+    batch_step_calls_total = sum(run.batch_step_calls for run in runs)
+    decode_tps = [
+        run.generated_tokens / run.decode_wall_seconds if run.decode_wall_seconds > 0 else float("inf")
+        for run in runs
+    ]
+    wall_tps = [
+        run.generated_tokens / run.total_wall_seconds if run.total_wall_seconds > 0 else float("inf")
+        for run in runs
+    ]
+    effective_batch_sizes = [
+        run.generated_tokens / run.batch_step_calls if run.batch_step_calls else 0.0
+        for run in runs
+    ]
+    lines = [
+        f"tp_benchmark_warmup_iterations: {warmup_iterations}",
+        f"tp_benchmark_iterations: {len(runs)}",
+        f"tp_benchmark_concurrency: {concurrency}",
+        f"tp_benchmark_prompt_target_tokens: {prompt_target_tokens}",
+        f"tp_benchmark_prompt_tokens_min: {min(result.prompt_tokens for result in all_results)}",
+        f"tp_benchmark_prompt_tokens_max: {max(result.prompt_tokens for result in all_results)}",
+        f"tp_benchmark_max_new_tokens: {all_results[0].max_new_tokens}",
+        f"tp_benchmark_concurrent_iterations: {len(runs)}",
+        f"tp_benchmark_concurrent_requests_total: {requests_total}",
+        f"tp_benchmark_concurrent_tokens_total: {tokens_total}",
+        f"tp_benchmark_concurrent_batch_step_calls_total: {batch_step_calls_total}",
+        f"tp_benchmark_concurrent_prefill_wall_seconds_avg: {_avg(run.prefill_wall_seconds for run in runs):.6f}",
+        f"tp_benchmark_concurrent_prefill_wall_seconds_min: {min(run.prefill_wall_seconds for run in runs):.6f}",
+        f"tp_benchmark_concurrent_prefill_wall_seconds_max: {max(run.prefill_wall_seconds for run in runs):.6f}",
+        f"tp_benchmark_concurrent_decode_wall_seconds_avg: {_avg(run.decode_wall_seconds for run in runs):.6f}",
+        f"tp_benchmark_concurrent_decode_wall_seconds_min: {min(run.decode_wall_seconds for run in runs):.6f}",
+        f"tp_benchmark_concurrent_decode_wall_seconds_max: {max(run.decode_wall_seconds for run in runs):.6f}",
+        f"tp_benchmark_concurrent_total_wall_seconds_avg: {_avg(run.total_wall_seconds for run in runs):.6f}",
+        f"tp_benchmark_concurrent_decode_tokens_per_second_avg: {_avg(decode_tps):.6f}",
+        f"tp_benchmark_concurrent_wall_tokens_per_second_avg: {_avg(wall_tps):.6f}",
+        f"tp_benchmark_concurrent_effective_batch_size_avg: {_avg(effective_batch_sizes):.6f}",
+        f"tp_benchmark_concurrent_all_finite: {all(run.all_finite for run in runs)}",
+        f"tp_benchmark_concurrent_per_request_decode_seconds_avg: {_avg(result.decode_seconds for result in all_results):.6f}",
+        f"tp_benchmark_concurrent_per_request_decode_tokens_per_second_avg: {_avg(result.decode_tokens_per_second for result in all_results):.6f}",
+        f"tp_benchmark_kv_estimated_total_bytes_max: {max(result.kv_cache.estimated_total_bytes for result in all_results)}",
+        f"tp_benchmark_cuda_max_allocated_max: {max((result.cuda_memory.max_allocated or 0) for result in all_results)}",
+        f"tp_benchmark_cuda_max_reserved_max: {max((result.cuda_memory.max_reserved or 0) for result in all_results)}",
+    ]
+    lines.extend(_format_profile_lines("tp_benchmark", _merge_profile_results(all_results), top_n=10))
+    if print_runs:
+        for index, run in enumerate(runs):
+            run_decode_tps = run.generated_tokens / run.decode_wall_seconds if run.decode_wall_seconds > 0 else float("inf")
+            lines.extend(
+                [
+                    f"tp_benchmark_run_{index}_concurrent_prefill_wall_seconds: {run.prefill_wall_seconds:.6f}",
+                    f"tp_benchmark_run_{index}_concurrent_decode_wall_seconds: {run.decode_wall_seconds:.6f}",
+                    f"tp_benchmark_run_{index}_concurrent_total_wall_seconds: {run.total_wall_seconds:.6f}",
+                    f"tp_benchmark_run_{index}_concurrent_decode_tokens_per_second: {run_decode_tps:.6f}",
+                    f"tp_benchmark_run_{index}_concurrent_batch_step_calls: {run.batch_step_calls}",
+                    f"tp_benchmark_run_{index}_concurrent_generated_tokens: {run.generated_tokens}",
+                ]
+            )
+    lines.extend(_format_tp_generate_result(all_results[-1]))
+    return lines
+
 
 
 def _format_tp_benchmark_results(
@@ -974,7 +1105,8 @@ def run(args: argparse.Namespace) -> int:
     if args.tp_benchmark:
         try:
             runtime_config = parse_runtime_config(config)
-            print("TP resident generation benchmark")
+            concurrent = args.tp_benchmark_concurrency > 1
+            print("TP resident concurrent generation benchmark" if concurrent else "TP resident generation benchmark")
             launch = _tp_launch_from_args(
                 args.tp_world_size,
                 args.tp_rank,
@@ -984,18 +1116,38 @@ def run(args: argparse.Namespace) -> int:
                 args.tp_device,
             )
             benchmark_prompt = _benchmark_prompt_from_args(manifest, args)
-            results: list[GenerateResult] = []
             with TpModelSession(manifest, runtime_config, launch, profile_config=_profile_config_from_args(args)) as session:
-                for _ in range(args.tp_benchmark_warmup):
-                    session.generate(benchmark_prompt, args.max_new_tokens)
-                for _ in range(args.tp_benchmark_iterations):
-                    results.append(session.generate(benchmark_prompt, args.max_new_tokens))
-            for line in _format_tp_benchmark_results(
-                results,
-                warmup_iterations=args.tp_benchmark_warmup,
-                prompt_target_tokens=args.tp_benchmark_prompt_tokens,
-                print_runs=args.tp_benchmark_print_runs,
-            ):
+                if concurrent:
+                    runs: list[TpConcurrentBenchmarkRun] = []
+                    for _ in range(args.tp_benchmark_warmup):
+                        _run_tp_concurrent_benchmark_once(
+                            session, benchmark_prompt, args.max_new_tokens, args.tp_benchmark_concurrency
+                        )
+                    for _ in range(args.tp_benchmark_iterations):
+                        runs.append(
+                            _run_tp_concurrent_benchmark_once(
+                                session, benchmark_prompt, args.max_new_tokens, args.tp_benchmark_concurrency
+                            )
+                        )
+                    lines = _format_tp_concurrent_benchmark_results(
+                        runs,
+                        warmup_iterations=args.tp_benchmark_warmup,
+                        prompt_target_tokens=args.tp_benchmark_prompt_tokens,
+                        print_runs=args.tp_benchmark_print_runs,
+                    )
+                else:
+                    results: list[GenerateResult] = []
+                    for _ in range(args.tp_benchmark_warmup):
+                        session.generate(benchmark_prompt, args.max_new_tokens)
+                    for _ in range(args.tp_benchmark_iterations):
+                        results.append(session.generate(benchmark_prompt, args.max_new_tokens))
+                    lines = _format_tp_benchmark_results(
+                        results,
+                        warmup_iterations=args.tp_benchmark_warmup,
+                        prompt_target_tokens=args.tp_benchmark_prompt_tokens,
+                        print_runs=args.tp_benchmark_print_runs,
+                    )
+            for line in lines:
                 print(line)
         except (ConfigError, EngineError, MappingError, LoaderError, TpRuntimeError, CliError) as exc:
             raise CliError(str(exc)) from exc
@@ -1162,6 +1314,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Approximate prompt token target for --tp-benchmark by repeating/truncating the prompt.",
     )
     parser.add_argument(
+        "--tp-benchmark-concurrency",
+        type=int,
+        default=1,
+        help="Concurrent generation requests to advance with batched decode during --tp-benchmark.",
+    )
+    parser.add_argument(
         "--tp-benchmark-print-runs",
         action="store_true",
         help="Print per-run benchmark timing lines in addition to aggregate metrics.",
@@ -1262,6 +1420,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--tp-benchmark-warmup must be non-negative")
     if args.tp_benchmark_prompt_tokens is not None and args.tp_benchmark_prompt_tokens <= 0:
         parser.error("--tp-benchmark-prompt-tokens must be positive")
+    if args.tp_benchmark_concurrency <= 0:
+        parser.error("--tp-benchmark-concurrency must be positive")
     if args.inspect_tp is not None and args.inspect_tp <= 0:
         parser.error("--inspect-tp must be positive")
     try:

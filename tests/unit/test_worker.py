@@ -1524,6 +1524,10 @@ def test_worker_cooperative_step_batches_preferred_request(tmp_path: Path, monke
     assert cooperative_a.data["request_id"] == "a"
     assert cooperative_a.data["status"] == "RUNNING"
     assert cooperative_a.data["progress"]["generated_tokens"] == 1
+    assert state.batch_step_calls == 1
+    assert state.batch_step_requests_total == 2
+    assert state.batch_step_tokens_total == 2
+    assert state.batch_step_max_size == 2
     assert "b" in state.pending_events
 
     drain_b = execute_command(state, WorkerCommand(STEP, {"request_id": "b"}))
@@ -1615,6 +1619,11 @@ def test_worker_status_reports_serving_controls(tmp_path: Path, monkeypatch: pyt
         "active_count": 0,
         "pending_event_requests": 0,
         "pending_event_count": 0,
+        "batch_step_calls": 0,
+        "batch_step_requests_total": 0,
+        "batch_step_tokens_total": 0,
+        "batch_step_max_size": 0,
+        "batch_step_avg_size": 0.0,
         "active_kv_estimated_total_bytes": 0,
         "active_kv_valid_tokens_total": 0,
         "active_kv_capacity_tokens_total": 0,

@@ -440,6 +440,68 @@ def test_cli_tp_benchmark_single_rank(tmp_path: Path, capsys, monkeypatch: pytes
     assert "inference: not implemented yet" not in out
 
 
+def test_cli_tp_benchmark_concurrent_single_rank(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _runtime_config()
+    text = config["text_config"]
+    text["hidden_size"] = 256
+    text["vocab_size"] = 320
+    text["num_hidden_layers"] = 1
+    text["layer_types"] = ["full_attention"]
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    tensors = {
+        "model.language_model.embed_tokens.weight": ("BF16", (320, 256)),
+        "model.language_model.norm.weight": ("BF16", (256,)),
+        "lm_head.weight": ("BF16", (320, 256)),
+    }
+    add_full_attention_layer(tensors, 0)
+    add_moe(tensors, 0)
+    write_safetensors(tmp_path / "model.safetensors", tensors)
+
+    class FakeTokenizer:
+        def __call__(self, prompt: str, *, return_tensors: str, add_special_tokens: bool):
+            assert return_tensors == "pt"
+            assert add_special_tokens is True
+            return {"input_ids": torch.tensor([[1, 2]])}
+
+        def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+            assert skip_special_tokens is False
+            return "decoded:" + ",".join(str(token_id) for token_id in token_ids)
+
+    transformers = pytest.importorskip("transformers")
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *_, **__: FakeTokenizer())
+
+    rc = main(
+        [
+            "--model",
+            str(tmp_path),
+            "--prompt",
+            "hello",
+            "--max-new-tokens",
+            "2",
+            "--tp-benchmark",
+            "--tp-benchmark-concurrency",
+            "2",
+            "--tp-world-size",
+            "1",
+            "--tp-backend",
+            "gloo",
+            "--tp-device",
+            "cpu",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "TP resident concurrent generation benchmark" in out
+    assert "tp_benchmark_concurrency: 2" in out
+    assert "tp_benchmark_concurrent_requests_total: 2" in out
+    assert "tp_benchmark_concurrent_tokens_total: 4" in out
+    assert "tp_benchmark_concurrent_decode_tokens_per_second_avg:" in out
+    assert "tp_benchmark_concurrent_effective_batch_size_avg:" in out
+    assert "tp_generate_text: decoded:" in out
+
+
+
 def test_cli_tp_worker_runs_protocol_loop_without_human_stdout(
     tmp_path: Path,
     capsys,
@@ -660,6 +722,8 @@ def test_cli_rejects_invalid_benchmark_controls(tmp_path: Path) -> None:
         main(["--model", str(tmp_path), "--prompt", "unused", "--max-new-tokens", "1", "--tp-benchmark-warmup", "-1"])
     with pytest.raises(SystemExit):
         main(["--model", str(tmp_path), "--prompt", "unused", "--max-new-tokens", "1", "--tp-benchmark-prompt-tokens", "0"])
+    with pytest.raises(SystemExit):
+        main(["--model", str(tmp_path), "--prompt", "unused", "--max-new-tokens", "1", "--tp-benchmark-concurrency", "0"])
 
 
 def test_reference_layer_defaults_to_first_full_attention_layer() -> None:

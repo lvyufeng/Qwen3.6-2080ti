@@ -352,6 +352,29 @@ def test_step_generations_batch_handles_mixed_completion(tmp_path: Path, monkeyp
     assert len(state_a.generated_token_ids) == 1
     assert len(state_b.generated_token_ids) == 1
 
+
+def test_step_generations_batch_uses_batched_greedy_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    manifest = build_manifest(tmp_path)
+    original = engine.tp_greedy_next_tokens
+    call_batches: list[int] = []
+
+    def counted_greedy(logits, lm_head, runtime):
+        call_batches.append(int(logits.shape[0]))
+        return original(logits, lm_head, runtime)
+
+    monkeypatch.setattr(engine, "tp_greedy_next_tokens", counted_greedy)
+
+    with TpModelSession(manifest, parse_runtime_config(manifest.config), TpLaunchConfig(backend="gloo", device="cpu")) as session:
+        state_a = session.start_generation("hello", max_new_tokens=1)
+        state_b = session.start_generation("hello", max_new_tokens=1)
+        steps = session.step_generations_batch([state_a, state_b])
+
+    assert [step.token_id for step in steps] == state_a.generated_token_ids + state_b.generated_token_ids
+    assert call_batches == [2]
+
+
 def _write_tiny_model(model_dir: Path) -> None:
     config = _runtime_config()
     text = config["text_config"]

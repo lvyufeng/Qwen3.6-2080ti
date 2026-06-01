@@ -448,7 +448,7 @@ def tp_local_argmax(logits: Any, lm_head: ShardedTensor) -> tuple[Any, Any]:
     return local_values, local_indices.to(torch.long) + start
 
 
-def tp_greedy_next_token(logits: Any, lm_head: ShardedTensor, runtime: TpRuntime) -> Any:
+def tp_greedy_next_tokens(logits: Any, lm_head: ShardedTensor, runtime: TpRuntime) -> Any:
     import torch
 
     local_values, local_tokens = tp_local_argmax(logits[:, -1], lm_head)
@@ -459,6 +459,10 @@ def tp_greedy_next_token(logits: Any, lm_head: ShardedTensor, runtime: TpRuntime
     best_rank = torch.argmax(gathered[..., 0], dim=0)
     batch_indices = torch.arange(gathered.shape[1], device=gathered.device)
     return gathered[best_rank, batch_indices, 1].to(torch.long)
+
+
+def tp_greedy_next_token(logits: Any, lm_head: ShardedTensor, runtime: TpRuntime) -> Any:
+    return tp_greedy_next_tokens(logits, lm_head, runtime)
 
 
 def tp_embedding(input_ids: Any, mapping: LanguageModelMapping, weights: ReferenceWeights, runtime: TpRuntime) -> Any:

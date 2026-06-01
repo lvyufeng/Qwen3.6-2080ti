@@ -9,7 +9,7 @@ from loader import TensorLoader
 from reference_ops import LinearDispatchStats
 from runtime_config import RuntimeConfig
 from tensor_parallel import TensorParallel
-from tp_runtime import PagedAttentionDispatchStats, RuntimeProfileConfig, RuntimeProfileStats, TpLaunchConfig, TpRuntime, mapped_tensor_bytes, tp_decode_step_batch, tp_decode_step_local_logits, tp_greedy_next_token
+from tp_runtime import PagedAttentionDispatchStats, RuntimeProfileConfig, RuntimeProfileStats, TpLaunchConfig, TpRuntime, mapped_tensor_bytes, tp_decode_step_batch, tp_decode_step_local_logits, tp_greedy_next_token, tp_greedy_next_tokens
 from tp_weights import MappedWeightStats, MappedWeights
 from weight_mapping import build_language_model_mapping
 
@@ -256,27 +256,24 @@ class TpModelSession:
             if state.decode_start is None:
                 state.decode_start = now
 
-        # Step 1: Extract next token for each state from their current logits
-        # Each state.logits is (1, seq, vocab_local) — take last position
-        next_tokens = []
-        step_finites = []
-        for state in states:
-            last_logits = state.logits[:, -1].float()
-            step_finite = bool(torch.isfinite(last_logits).all().item())
-            step_finites.append(step_finite)
-            next_token = tp_greedy_next_token(state.logits, self.mapping.lm_head, runtime)
-            next_token = _sync_next_token(next_token, runtime)
-            next_tokens.append(next_token)
+        # Step 1: Extract next tokens for all states from their current logits.
+        # Each state.logits is (1, seq, vocab_local); concatenate the last position
+        # so distributed greedy selection performs one batched all-gather instead of
+        # one collective per request.
+        logits_batch = torch.cat([state.logits[:, -1:] for state in states], dim=0)
+        finite_tensor = torch.isfinite(logits_batch[:, -1].float()).all(dim=-1)
+        step_finites = [bool(value) for value in finite_tensor.tolist()]
+        next_tokens = tp_greedy_next_tokens(logits_batch, self.mapping.lm_head, runtime)
+        next_tokens = _sync_next_token(next_tokens, runtime)
 
-        # Step 2: Stack tokens into (B, 1) and run batched decode
-        input_ids = torch.stack(next_tokens, dim=0)  # (B,) -> need (B, 1)
-        if input_ids.ndim == 1:
-            input_ids = input_ids.unsqueeze(1)
+        # Step 2: Convert tokens to (B, 1) and run batched decode.
+        input_ids = next_tokens[:, None]
+        token_ids = [int(value) for value in next_tokens.tolist()]
 
         # Determine which states need a forward pass (not completing this step)
         needs_forward = []
         for i, state in enumerate(states):
-            token_id = int(next_tokens[i].item())
+            token_id = token_ids[i]
             state.generated_token_ids.append(token_id)
             state.step_all_finite.append(step_finites[i])
             if len(state.generated_token_ids) >= state.max_new_tokens:

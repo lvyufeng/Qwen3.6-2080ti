@@ -22,6 +22,7 @@ from tp_runtime import (
     tp_decode_step,
     tp_decoder_layer,
     tp_greedy_next_token,
+    tp_greedy_next_tokens,
     tp_language_model,
     tp_moe,
     _record_paged_attention_dispatch,
@@ -349,9 +350,35 @@ def test_paged_attention_dispatch_records_per_request_pool_fallback_for_batches(
     assert stats.eligible == 0
     assert stats.native_hits == 0
 
+def test_tp_greedy_next_tokens_single_rank_batch_matches_argmax() -> None:
+    runtime = TpRuntime(TpLaunchConfig(world_size=1, rank=0, local_rank=0, backend="gloo", device="cpu"))
+    tp = TensorParallel(world_size=1, rank=0)
+    lm_head = ShardedTensor(_info("head", (4, 2), nbytes=16), TensorShard.dim_shard("parallel_head", (4, 2), dim=0, tp=tp))
+    logits = torch.tensor(
+        [
+            [[0.0, 1.0, 4.0, 3.0], [2.0, 0.0, 1.0, 3.0]],
+            [[5.0, 1.0, 0.0, 2.0], [0.0, 8.0, 2.0, 1.0]],
+        ]
+    )
+
+    actual = tp_greedy_next_tokens(logits, lm_head, runtime)
+    expected = torch.argmax(logits[:, -1], dim=-1)
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_two_rank_tp_greedy_next_token_matches_full_gather_argmax(tmp_path: Path) -> None:
     torch.multiprocessing.spawn(
         _tp_greedy_next_token_worker,
+        args=(tmp_path,),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_two_rank_tp_greedy_next_tokens_matches_full_gather_argmax(tmp_path: Path) -> None:
+    torch.multiprocessing.spawn(
+        _tp_greedy_next_tokens_worker,
         args=(tmp_path,),
         nprocs=2,
         join=True,
@@ -390,21 +417,17 @@ def _tp_moe_worker(rank: int, tmp_path: Path) -> None:
     assert weights.dispatch_stats.moe_native_expert_fallback_device == 1
 
 
+def _tp_greedy_lm_head(rank: int) -> ShardedTensor:
+    tp = TensorParallel(world_size=2, rank=rank)
+    return ShardedTensor(
+        _info("head", (4, 2), nbytes=16),
+        TensorShard.dim_shard("parallel_head", (4, 2), dim=0, tp=tp),
+    )
+
+
 def _tp_greedy_next_token_worker(rank: int, tmp_path: Path) -> None:
     init_method = f"file://{tmp_path / 'tp-greedy-dist-init'}"
     with TpRuntime(TpLaunchConfig(world_size=2, rank=rank, local_rank=rank, backend="gloo", init_method=init_method, device="cpu")) as runtime:
-        tp = TensorParallel(world_size=2, rank=rank)
-        lm_head = ShardedTensor(_info("head", (4, 2), nbytes=16), TensorShard.dim_shard("parallel_head", (4, 2), dim=0, tp=tp))
-        tp_mapping = LanguageModelMapping(
-            model_dir=Path("."),
-            embed_tokens=_info("embed", (4, 2), nbytes=16),
-            final_norm=_info("norm", (2,), nbytes=4),
-            lm_head=lm_head,
-            layers=(),
-            mapped_tensor_names=frozenset(),
-            ignored_tensor_names=frozenset(),
-            unmapped_language_tensor_names=(),
-        )
         local_logits = (
             torch.tensor([[[1.0, 4.0], [0.0, 3.0]]])
             if rank == 0
@@ -412,7 +435,27 @@ def _tp_greedy_next_token_worker(rank: int, tmp_path: Path) -> None:
         )
         full_logits = runtime.all_gather_cat(local_logits, dim=-1)
         expected = torch.argmax(full_logits[:, -1], dim=-1)
-        actual = tp_greedy_next_token(local_logits, tp_mapping.lm_head, runtime)
+        actual = tp_greedy_next_token(local_logits, _tp_greedy_lm_head(rank), runtime)
+        torch.testing.assert_close(actual, expected)
+
+
+def _tp_greedy_next_tokens_worker(rank: int, tmp_path: Path) -> None:
+    init_method = f"file://{tmp_path / 'tp-greedy-batch-dist-init'}"
+    with TpRuntime(TpLaunchConfig(world_size=2, rank=rank, local_rank=rank, backend="gloo", init_method=init_method, device="cpu")) as runtime:
+        local_logits = (
+            torch.tensor([
+                [[1.0, 4.0], [0.0, 3.0]],
+                [[5.0, 1.0], [2.0, 6.0]],
+            ])
+            if rank == 0
+            else torch.tensor([
+                [[2.0, 3.0], [5.0, 1.0]],
+                [[0.0, 9.0], [8.0, 1.0]],
+            ])
+        )
+        full_logits = runtime.all_gather_cat(local_logits, dim=-1)
+        expected = torch.argmax(full_logits[:, -1], dim=-1)
+        actual = tp_greedy_next_tokens(local_logits, _tp_greedy_lm_head(rank), runtime)
         torch.testing.assert_close(actual, expected)
 
 

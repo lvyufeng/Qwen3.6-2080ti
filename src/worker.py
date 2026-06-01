@@ -68,6 +68,10 @@ class WorkerState:
     max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS
     max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS
     batch_step_mode: str = STEP_MODE_LEGACY
+    batch_step_calls: int = 0
+    batch_step_requests_total: int = 0
+    batch_step_tokens_total: int = 0
+    batch_step_max_size: int = 0
     profile_config: RuntimeProfileConfig = field(default_factory=RuntimeProfileConfig)
 
     @property
@@ -609,6 +613,11 @@ def _batch_step_active_generations(
 
     try:
         steps = session.step_generations_batch(active_states)
+        batch_size = len(active_states)
+        state.batch_step_calls += 1
+        state.batch_step_requests_total += batch_size
+        state.batch_step_tokens_total += len(steps)
+        state.batch_step_max_size = max(state.batch_step_max_size, batch_size)
     except Exception as exc:
         # On batch failure, fail all active requests
         for active in actives:
@@ -1131,6 +1140,9 @@ def _scheduler_snapshot_data(snapshot: SchedulerSnapshot) -> dict[str, Any]:
 
 def _serving_state_data(state: WorkerState) -> dict[str, Any]:
     active_kv = [active.state.decode_state.kv_stats() for active in state.active_generations.values()]
+    batch_step_avg_size = (
+        state.batch_step_requests_total / state.batch_step_calls if state.batch_step_calls else 0.0
+    )
     return {
         "max_active_requests": state.max_active_requests,
         "max_pending_requests": state.max_pending_requests,
@@ -1138,6 +1150,11 @@ def _serving_state_data(state: WorkerState) -> dict[str, Any]:
         "active_count": len(state.active_generations),
         "pending_event_requests": len(state.pending_events),
         "pending_event_count": sum(len(queue) for queue in state.pending_events.values()),
+        "batch_step_calls": state.batch_step_calls,
+        "batch_step_requests_total": state.batch_step_requests_total,
+        "batch_step_tokens_total": state.batch_step_tokens_total,
+        "batch_step_max_size": state.batch_step_max_size,
+        "batch_step_avg_size": batch_step_avg_size,
         "active_kv_estimated_total_bytes": sum(stats.estimated_total_bytes for stats in active_kv),
         "active_kv_valid_tokens_total": sum(stats.valid_tokens_total for stats in active_kv),
         "active_kv_capacity_tokens_total": sum(stats.capacity_tokens_total for stats in active_kv),
@@ -1179,6 +1196,10 @@ def _close_worker_state(state: WorkerState) -> None:
     state.active_generations.clear()
     state.round_robin_index = 0
     state.pending_events.clear()
+    state.batch_step_calls = 0
+    state.batch_step_requests_total = 0
+    state.batch_step_tokens_total = 0
+    state.batch_step_max_size = 0
     if state.session is not None:
         state.session.close()
     state.session = None
