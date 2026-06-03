@@ -516,6 +516,78 @@ def _format_kv_cache_lines(prefix: str, kv_cache: dict[str, object]) -> list[str
     return [f"{prefix}_kv_{key}: {kv_cache.get(key)}" for key in keys]
 
 
+def _profile_scope_seconds(scopes: dict[object, object], predicate) -> float:
+    total = 0.0
+    for name, data in scopes.items():
+        if not isinstance(data, dict):
+            continue
+        scope_name = str(name)
+        if predicate(scope_name):
+            total += float(data.get("total_seconds", 0.0))
+    return total
+
+
+def _profile_summary_denominator_seconds(scopes: dict[object, object], total_scope_seconds: float) -> float:
+    decode_step_seconds = _profile_scope_seconds(scopes, lambda name: name in ("batch.decode_step.total", "decode_step.total"))
+    prefill_layers_seconds = _profile_scope_seconds(scopes, lambda name: name == "layers_total")
+    layers_seconds = _profile_scope_seconds(scopes, lambda name: name in ("batch.layers_total", "layers_total"))
+    if decode_step_seconds > 0.0:
+        return decode_step_seconds + prefill_layers_seconds
+    if layers_seconds > 0.0:
+        return layers_seconds
+    return total_scope_seconds
+
+
+def _profile_layer_total_seconds(scopes: dict[object, object], suffix: str) -> float:
+    return _profile_scope_seconds(scopes, lambda name: name.startswith("layer.") and name.endswith(suffix))
+
+
+def _profile_group_seconds(scopes: dict[object, object], *, layer_suffix: str, fallback_prefixes: tuple[str, ...]) -> float:
+    layer_seconds = _profile_layer_total_seconds(scopes, layer_suffix)
+    if layer_seconds > 0.0:
+        return layer_seconds
+    return _profile_scope_seconds(scopes, lambda name: name.startswith(fallback_prefixes))
+
+
+def _format_profile_summary_lines(prefix: str, scopes: dict[object, object]) -> list[str]:
+    total_seconds = _profile_scope_seconds(scopes, lambda _name: True)
+    denominator_seconds = _profile_summary_denominator_seconds(scopes, total_seconds)
+    collective_seconds = _profile_scope_seconds(scopes, lambda name: name.startswith("collective."))
+    moe_seconds = _profile_group_seconds(scopes, layer_suffix=".moe.total", fallback_prefixes=("moe.",))
+    full_attention_seconds = _profile_group_seconds(
+        scopes,
+        layer_suffix=".full_attention.total",
+        fallback_prefixes=("full_attention.", "batch.full_attention."),
+    )
+    linear_attention_seconds = _profile_group_seconds(
+        scopes,
+        layer_suffix=".linear_attention.total",
+        fallback_prefixes=("linear_attention.",),
+    )
+    dense_attention_seconds = _profile_scope_seconds(scopes, lambda name: name.endswith(".dense_fallback"))
+    batch_kv_seconds = _profile_scope_seconds(scopes, lambda name: name.endswith(".batch_kv_tensors"))
+
+    def pct(seconds: float) -> float:
+        return (seconds / denominator_seconds * 100.0) if denominator_seconds > 0.0 else 0.0
+
+    return [
+        f"{prefix}_profile_total_scope_seconds: {total_seconds:.6f}",
+        f"{prefix}_profile_summary_denominator_seconds: {denominator_seconds:.6f}",
+        f"{prefix}_profile_collective_total_seconds: {collective_seconds:.6f}",
+        f"{prefix}_profile_collective_percent: {pct(collective_seconds):.2f}",
+        f"{prefix}_profile_moe_total_seconds: {moe_seconds:.6f}",
+        f"{prefix}_profile_moe_percent: {pct(moe_seconds):.2f}",
+        f"{prefix}_profile_full_attention_total_seconds: {full_attention_seconds:.6f}",
+        f"{prefix}_profile_full_attention_percent: {pct(full_attention_seconds):.2f}",
+        f"{prefix}_profile_linear_attention_total_seconds: {linear_attention_seconds:.6f}",
+        f"{prefix}_profile_linear_attention_percent: {pct(linear_attention_seconds):.2f}",
+        f"{prefix}_profile_dense_attention_fallback_total_seconds: {dense_attention_seconds:.6f}",
+        f"{prefix}_profile_dense_attention_fallback_percent: {pct(dense_attention_seconds):.2f}",
+        f"{prefix}_profile_batch_kv_tensors_total_seconds: {batch_kv_seconds:.6f}",
+        f"{prefix}_profile_batch_kv_tensors_percent: {pct(batch_kv_seconds):.2f}",
+    ]
+
+
 def _format_profile_lines(prefix: str, profile: dict[str, object], *, top_n: int = 20) -> list[str]:
     enabled = bool(profile.get("enabled", False))
     sync_cuda = bool(profile.get("sync_cuda", False))
@@ -526,6 +598,7 @@ def _format_profile_lines(prefix: str, profile: dict[str, object], *, top_n: int
     scopes = profile.get("scopes", {})
     if not enabled or not isinstance(scopes, dict):
         return lines
+    lines.extend(_format_profile_summary_lines(prefix, scopes))
     ranked = sorted(
         ((str(name), data) for name, data in scopes.items() if isinstance(data, dict)),
         key=lambda item: float(item[1].get("total_seconds", 0.0)),
@@ -670,6 +743,8 @@ def _format_tp_concurrent_benchmark_results(
         f"tp_benchmark_concurrent_decode_tokens_per_second_avg: {_avg(decode_tps):.6f}",
         f"tp_benchmark_concurrent_wall_tokens_per_second_avg: {_avg(wall_tps):.6f}",
         f"tp_benchmark_concurrent_effective_batch_size_avg: {_avg(effective_batch_sizes):.6f}",
+        f"tp_benchmark_concurrent_seconds_per_decode_token_avg: {_avg((run.decode_wall_seconds / run.generated_tokens if run.generated_tokens else 0.0) for run in runs):.6f}",
+        f"tp_benchmark_concurrent_seconds_per_batch_step_avg: {_avg((run.decode_wall_seconds / run.batch_step_calls if run.batch_step_calls else 0.0) for run in runs):.6f}",
         f"tp_benchmark_concurrent_all_finite: {all(run.all_finite for run in runs)}",
         f"tp_benchmark_concurrent_per_request_decode_seconds_avg: {_avg(result.decode_seconds for result in all_results):.6f}",
         f"tp_benchmark_concurrent_per_request_decode_tokens_per_second_avg: {_avg(result.decode_tokens_per_second for result in all_results):.6f}",
@@ -677,7 +752,8 @@ def _format_tp_concurrent_benchmark_results(
         f"tp_benchmark_cuda_max_allocated_max: {max((result.cuda_memory.max_allocated or 0) for result in all_results)}",
         f"tp_benchmark_cuda_max_reserved_max: {max((result.cuda_memory.max_reserved or 0) for result in all_results)}",
     ]
-    lines.extend(_format_profile_lines("tp_benchmark", _merge_profile_results(all_results), top_n=10))
+    profile_results = [run.results[-1] for run in runs if run.results]
+    lines.extend(_format_profile_lines("tp_benchmark", _merge_profile_results(profile_results), top_n=10))
     if print_runs:
         for index, run in enumerate(runs):
             run_decode_tps = run.generated_tokens / run.decode_wall_seconds if run.decode_wall_seconds > 0 else float("inf")

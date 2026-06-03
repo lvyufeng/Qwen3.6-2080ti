@@ -388,6 +388,11 @@ def test_cli_tp_generate_with_profile_prints_profile_lines(tmp_path: Path, capsy
     out = capsys.readouterr().out
     assert rc == 0
     assert "tp_generate_profile_enabled: True" in out
+    assert "tp_generate_profile_total_scope_seconds:" in out
+    assert "tp_generate_profile_collective_total_seconds:" in out
+    assert "tp_generate_profile_moe_total_seconds:" in out
+    assert "tp_generate_profile_full_attention_total_seconds:" in out
+    assert "tp_generate_profile_dense_attention_fallback_total_seconds:" in out
     assert "tp_generate_profile_scope_0_name:" in out
 
 
@@ -518,6 +523,8 @@ def test_cli_tp_benchmark_concurrent_single_rank(tmp_path: Path, capsys, monkeyp
     assert "tp_benchmark_concurrent_tokens_total: 4" in out
     assert "tp_benchmark_concurrent_decode_tokens_per_second_avg:" in out
     assert "tp_benchmark_concurrent_effective_batch_size_avg:" in out
+    assert "tp_benchmark_concurrent_seconds_per_decode_token_avg:" in out
+    assert "tp_benchmark_concurrent_seconds_per_batch_step_avg:" in out
     assert "tp_generate_text: decoded:" in out
 
 

@@ -1637,6 +1637,7 @@ def test_worker_status_reports_serving_controls(tmp_path: Path, monkeypatch: pyt
         "max_pending_requests": 5,
         "batch_step_mode": STEP_MODE_COOPERATIVE,
         "active_count": 0,
+        "pending_count": 0,
         "pending_event_requests": 0,
         "pending_event_count": 0,
         "batch_step_calls": 0,

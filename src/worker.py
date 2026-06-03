@@ -1216,6 +1216,7 @@ def _scheduler_snapshot_data(snapshot: SchedulerSnapshot) -> dict[str, Any]:
 
 def _serving_state_data(state: WorkerState) -> dict[str, Any]:
     active_kv = [active.state.decode_state.kv_stats() for active in state.active_generations.values()]
+    scheduler_snapshot = state.scheduler.snapshot()
     batch_step_avg_size = (
         state.batch_step_requests_total / state.batch_step_calls if state.batch_step_calls else 0.0
     )
@@ -1224,6 +1225,7 @@ def _serving_state_data(state: WorkerState) -> dict[str, Any]:
         "max_pending_requests": state.max_pending_requests,
         "batch_step_mode": state.batch_step_mode,
         "active_count": len(state.active_generations),
+        "pending_count": scheduler_snapshot.pending,
         "pending_event_requests": len(state.pending_events),
         "pending_event_count": sum(len(queue) for queue in state.pending_events.values()),
         "batch_step_calls": state.batch_step_calls,

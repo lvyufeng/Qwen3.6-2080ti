@@ -375,6 +375,27 @@ def test_step_generations_batch_uses_batched_greedy_once(tmp_path: Path, monkeyp
     assert call_batches == [2]
 
 
+def test_step_generations_batch_skips_redundant_token_broadcast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    manifest = build_manifest(tmp_path)
+    sync_calls = 0
+
+    def counted_sync(next_token, runtime):
+        nonlocal sync_calls
+        sync_calls += 1
+        return next_token
+
+    monkeypatch.setattr(engine, "_sync_next_token", counted_sync)
+
+    with TpModelSession(manifest, parse_runtime_config(manifest.config), TpLaunchConfig(backend="gloo", device="cpu")) as session:
+        state_a = session.start_generation("hello", max_new_tokens=1)
+        state_b = session.start_generation("hello", max_new_tokens=1)
+        session.step_generations_batch([state_a, state_b])
+
+    assert sync_calls == 0
+
+
 def _write_tiny_model(model_dir: Path) -> None:
     config = _runtime_config()
     text = config["text_config"]

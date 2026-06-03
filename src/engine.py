@@ -202,7 +202,8 @@ class TpModelSession:
             state.decode_start = time.perf_counter()
         last_logits = state.logits[:, -1].float()
         step_finite = bool(torch.isfinite(last_logits).all().item())
-        next_token = tp_greedy_next_token(state.logits, self.mapping.lm_head, runtime)
+        with runtime.profile_scope("greedy_next_token", output_tokens=1):
+            next_token = tp_greedy_next_token(state.logits, self.mapping.lm_head, runtime)
         next_token = _sync_next_token(next_token, runtime)
         token_id = int(next_token.item())
         state.generated_token_ids.append(token_id)
@@ -263,8 +264,8 @@ class TpModelSession:
         logits_batch = torch.cat([state.logits[:, -1:] for state in states], dim=0)
         finite_tensor = torch.isfinite(logits_batch[:, -1].float()).all(dim=-1)
         step_finites = [bool(value) for value in finite_tensor.tolist()]
-        next_tokens = tp_greedy_next_tokens(logits_batch, self.mapping.lm_head, runtime)
-        next_tokens = _sync_next_token(next_tokens, runtime)
+        with runtime.profile_scope("batch.greedy_next_tokens", output_tokens=len(states)):
+            next_tokens = tp_greedy_next_tokens(logits_batch, self.mapping.lm_head, runtime)
 
         # Step 2: Convert tokens to (B, 1) and run batched decode.
         input_ids = next_tokens[:, None]
@@ -287,9 +288,10 @@ class TpModelSession:
         if forward_indices:
             forward_ids = input_ids[forward_indices]  # (F, 1)
             forward_states = [states[i].decode_state for i in forward_indices]
-            batch_logits = tp_decode_step_batch(
-                forward_ids, self.mapping, self.runtime_config, weights, runtime, forward_states
-            )
+            with runtime.profile_scope("batch.decode_step.total", input_tokens=int(forward_ids.numel())):
+                batch_logits = tp_decode_step_batch(
+                    forward_ids, self.mapping, self.runtime_config, weights, runtime, forward_states
+                )
             # Split logits back to per-state
             for idx_in_batch, state_idx in enumerate(forward_indices):
                 states[state_idx].logits = batch_logits[idx_in_batch: idx_in_batch + 1]
@@ -421,10 +423,12 @@ class TpModelRunner:
 
 
 def _sync_next_token(next_token: Any, runtime: TpRuntime) -> Any:
-    if runtime.config.is_distributed:
-        import torch.distributed as dist
+    byte_count = int(next_token.numel() * next_token.element_size()) if hasattr(next_token, "numel") else 0
+    with runtime.profile_scope("token_sync.broadcast", output_tokens=int(next_token.numel()) if hasattr(next_token, "numel") else 0, bytes=byte_count):
+        if runtime.config.is_distributed:
+            import torch.distributed as dist
 
-        dist.broadcast(next_token, src=0)
+            dist.broadcast(next_token, src=0)
     return next_token
 
 
