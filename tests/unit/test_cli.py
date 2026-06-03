@@ -305,6 +305,11 @@ def test_cli_tp_generate_single_rank(tmp_path: Path, capsys, monkeypatch: pytest
     assert "tp_generate_dispatch_moe_native_assignment_hits:" in out
     assert "tp_generate_dispatch_moe_native_assignment_offsets_calls:" in out
     assert "tp_generate_dispatch_moe_native_assignment_offsets_fallback_device:" in out
+    assert "tp_generate_dispatch_moe_native_assignment_parallel_calls:" in out
+    assert "tp_generate_dispatch_moe_native_assignment_parallel_hits:" in out
+    assert "tp_generate_dispatch_moe_native_assignment_parallel_fallback_disabled:" in out
+    assert "tp_generate_dispatch_moe_native_assignment_parallel_fallback_capacity:" in out
+    assert "tp_generate_dispatch_moe_native_assignment_parallel_capacity:" in out
     assert "tp_generate_dispatch_moe_native_scatter_calls:" in out
     assert "tp_generate_dispatch_moe_native_scatter_fallback_small:" in out
     assert "tp_generate_dispatch_moe_native_scatter_fallback_device:" in out

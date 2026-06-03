@@ -121,6 +121,68 @@ def test_moe_packed_local_assignment_offsets_matches_reference() -> None:
         _assert_assignment_offset_groups_match(packed_tokens, packed_scores, ref_tokens, ref_scores, counts, offsets)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the assignment offset planner extension")
+def test_moe_packed_local_assignment_offsets_with_experts_matches_reference() -> None:
+    try:
+        from fp8_cuda import moe_packed_local_assignment_offsets_with_experts
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(14)
+    indices = torch.tensor([[5, 4, 5], [7, 6, 4], [3, 8, 9], [4, 4, 4]], device=device, dtype=torch.long)
+    scores = torch.rand((4, 3), device=device, dtype=torch.float32)
+    expert_start = 4
+    expert_end = 8
+
+    packed_tokens, packed_scores, unique_experts, counts, offsets, packed_local_experts = moe_packed_local_assignment_offsets_with_experts(
+        indices,
+        scores,
+        expert_start,
+        expert_end,
+    )
+    ref_tokens, ref_scores, ref_unique_experts, ref_counts = _reference_packed_assignments(indices, scores, expert_start, expert_end)
+    expected_counts = torch.zeros((expert_end - expert_start,), device=device, dtype=torch.long)
+    expected_counts[ref_unique_experts - expert_start] = ref_counts
+    expected_offsets = torch.cumsum(expected_counts, dim=0) - expected_counts
+    expected_unique = torch.arange(expert_start, expert_end, device=device, dtype=torch.long)
+
+    torch.testing.assert_close(unique_experts, expected_unique)
+    torch.testing.assert_close(counts, expected_counts)
+    torch.testing.assert_close(offsets, expected_offsets)
+    assert packed_tokens.numel() == indices.numel()
+    assert packed_scores.numel() == scores.numel()
+    assert packed_local_experts.numel() == indices.numel()
+    _assert_assignment_offset_groups_match(packed_tokens, packed_scores, ref_tokens, ref_scores, counts, offsets)
+    for local, count in enumerate(counts.tolist()):
+        offset = int(offsets[local].item())
+        if count:
+            torch.testing.assert_close(packed_local_experts[offset:offset + count], torch.full((count,), local, device=device, dtype=torch.long))
+    local_total = int(counts.sum().item())
+    if local_total < packed_local_experts.numel():
+        assert bool((packed_local_experts[local_total:] < 0).all().item())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the assignment offset planner extension")
+def test_moe_packed_local_assignment_offsets_with_experts_handles_empty_local_dispatch() -> None:
+    try:
+        from fp8_cuda import moe_packed_local_assignment_offsets_with_experts
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    indices = torch.tensor([[0, 1], [2, 3]], device=device, dtype=torch.long)
+    scores = torch.rand((2, 2), device=device, dtype=torch.float32)
+    packed_tokens, packed_scores, unique_experts, counts, offsets, packed_local_experts = moe_packed_local_assignment_offsets_with_experts(indices, scores, 4, 8)
+
+    assert packed_tokens.numel() == indices.numel()
+    assert packed_scores.numel() == scores.numel()
+    torch.testing.assert_close(unique_experts, torch.arange(4, 8, device=device, dtype=torch.long))
+    torch.testing.assert_close(counts, torch.zeros((4,), device=device, dtype=torch.long))
+    torch.testing.assert_close(offsets, torch.zeros((4,), device=device, dtype=torch.long))
+    assert bool((packed_local_experts < 0).all().item())
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the scatter extension")
 def test_moe_packed_score_scatter_add_matches_index_add_reference() -> None:
     try:
@@ -502,6 +564,165 @@ def test_moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16_handles_duplicate_
     )
 
     torch.testing.assert_close(routed, ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the assignment-parallel grouped MoE offset dispatch extension")
+def test_moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16_matches_reference() -> None:
+    try:
+        from fp8_cuda import moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(28)
+    hidden_size = 256
+    intermediate_size = 384
+    tensor_lists = _make_fp8_moe_tensor_lists(
+        device=device,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        seeds=(61, 62, 63, 64),
+    )
+    gate_weights, gate_scales, up_weights, up_scales, down_weights, down_scales = tensor_lists
+    flat_hidden = torch.randn((5, hidden_size), device=device, dtype=torch.float32)
+    packed_tokens = torch.tensor([4, 0, 1, 1, 2, 3, 3, 0, 4, 2], device=device, dtype=torch.long)
+    packed_scores = torch.tensor([0.2, -0.5, 0.75, 0.1, 1.2, -0.7, 0.3, 0.9, -0.4, 0.6], device=device, dtype=torch.float32)
+    counts = torch.tensor([1, 3, 2, 4], device=device, dtype=torch.long)
+    offsets = torch.tensor([0, 1, 4, 6], device=device, dtype=torch.long)
+    packed_local_experts = torch.tensor([0, 1, 1, 1, 2, 2, 3, 3, 3, 3], device=device, dtype=torch.long)
+    token_count = 5
+
+    routed = moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16(
+        flat_hidden,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        packed_local_experts,
+        4,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        down_weights,
+        down_scales,
+        token_count,
+    )
+    ref = _reference_offset_dispatch(
+        flat_hidden,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        down_weights,
+        down_scales,
+        token_count,
+    )
+
+    torch.testing.assert_close(routed, ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the assignment-parallel grouped MoE offset dispatch extension")
+def test_moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16_matches_segmented_dispatch() -> None:
+    try:
+        from fp8_cuda import (
+            moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16,
+            moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16,
+        )
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(29)
+    hidden_size = 256
+    intermediate_size = 384
+    tensor_lists = _make_fp8_moe_tensor_lists(
+        device=device,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        seeds=(71, 72, 73),
+    )
+    gate_weights, gate_scales, up_weights, up_scales, down_weights, down_scales = tensor_lists
+    flat_hidden = torch.randn((3, hidden_size), device=device, dtype=torch.float32)
+    packed_tokens = torch.tensor([0, 0, 1, 1, 1, 2, 2, 0], device=device, dtype=torch.long)
+    packed_scores = torch.tensor([0.5, -0.2, 0.3, 0.4, -0.6, 0.8, 0.1, 0.7], device=device, dtype=torch.float32)
+    counts = torch.tensor([2, 0, 6], device=device, dtype=torch.long)
+    offsets = torch.tensor([0, 2, 2], device=device, dtype=torch.long)
+    packed_local_experts = torch.tensor([0, 0, 2, 2, 2, 2, 2, 2], device=device, dtype=torch.long)
+    token_count = 3
+
+    assignment = moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16(
+        flat_hidden,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        packed_local_experts,
+        7,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        down_weights,
+        down_scales,
+        token_count,
+    )
+    segmented = moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16(
+        flat_hidden,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        7,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        down_weights,
+        down_scales,
+        token_count,
+    )
+
+    torch.testing.assert_close(assignment, segmented, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the assignment-parallel grouped MoE offset dispatch extension")
+def test_moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16_handles_empty_dispatch() -> None:
+    try:
+        from fp8_cuda import moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    hidden_size = 256
+    intermediate_size = 384
+    weight = torch.zeros((intermediate_size, hidden_size), device=device, dtype=torch.float8_e4m3fn)
+    down = torch.zeros((hidden_size, intermediate_size), device=device, dtype=torch.float8_e4m3fn)
+    scale = torch.ones((3, 2), device=device, dtype=torch.bfloat16)
+    down_scale = torch.ones((2, 3), device=device, dtype=torch.bfloat16)
+
+    routed = moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16(
+        torch.empty((3, hidden_size), device=device, dtype=torch.float32),
+        torch.empty((0,), device=device, dtype=torch.long),
+        torch.empty((0,), device=device, dtype=torch.float32),
+        torch.zeros((1,), device=device, dtype=torch.long),
+        torch.zeros((1,), device=device, dtype=torch.long),
+        torch.empty((0,), device=device, dtype=torch.long),
+        0,
+        [weight],
+        [scale],
+        [weight],
+        [scale],
+        [down],
+        [down_scale],
+        3,
+    )
+
+    torch.testing.assert_close(routed, torch.zeros((3, hidden_size), device=device, dtype=torch.float32))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the grouped MoE offset dispatch extension")

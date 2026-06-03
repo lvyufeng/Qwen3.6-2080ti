@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import tp_runtime
 from checkpoint import TensorInfo, build_manifest
 from reference_ops import LinearDispatchStats, ReferenceWeights, decoder_layer, language_model
 from runtime_config import parse_runtime_config
@@ -28,8 +29,10 @@ from tp_runtime import (
     _record_paged_attention_dispatch,
     _recurrent_gated_delta_rule,
     _try_native_moe_assignment_offsets,
+    _try_native_moe_assignment_offsets_with_experts,
     _try_native_moe_grouped_dispatch,
     _try_native_moe_grouped_dispatch_offsets,
+    _try_native_moe_grouped_dispatch_offsets_assignment_parallel,
     _try_native_moe_grouped_dispatch_offsets_segmented,
     _try_native_moe_grouped_dispatch_offsets_tensor_core,
 )
@@ -316,6 +319,121 @@ def test_native_grouped_dispatch_offsets_records_cpu_fallback() -> None:
     assert stats.moe_native_grouped_dispatch_offsets_hits == 0
     assert stats.moe_native_grouped_dispatch_offsets_fallbacks == 1
     assert stats.moe_native_grouped_dispatch_offsets_fallback_device == 1
+
+
+def test_native_assignment_offsets_with_experts_records_cpu_fallback() -> None:
+    stats = LinearDispatchStats()
+    routing = SimpleNamespace(
+        indices=torch.zeros((2, 2), dtype=torch.long),
+        scores=torch.ones((2, 2), dtype=torch.float32),
+    )
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        plan = _try_native_moe_assignment_offsets_with_experts(routing, mapping, runtime, stats)
+
+    assert plan is None
+    assert stats.moe_native_assignment_offsets_calls == 1
+    assert stats.moe_native_assignment_offsets_eligible == 0
+    assert stats.moe_native_assignment_offsets_hits == 0
+    assert stats.moe_native_assignment_offsets_fallbacks == 1
+    assert stats.moe_native_assignment_offsets_fallback_device == 1
+
+
+def test_native_grouped_dispatch_offsets_assignment_parallel_records_small_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tp_runtime, "_NATIVE_MOE_ASSIGNMENT_PARALLEL_ENABLED", True)
+    stats = LinearDispatchStats()
+    loader = _FakeLoader(_moe_test_tensors())
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    config = _config_with_experts_per_token(2, packed=True)
+    weights = ReferenceWeights(loader)
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        routed = _try_native_moe_grouped_dispatch_offsets_assignment_parallel(
+            torch.zeros((2, 2), dtype=torch.float32),
+            torch.zeros((4,), dtype=torch.long),
+            torch.ones((4,), dtype=torch.float32),
+            torch.ones((2,), dtype=torch.long),
+            torch.tensor([0, 2], dtype=torch.long),
+            torch.zeros((4,), dtype=torch.long),
+            mapping,
+            config,
+            weights,
+            runtime,
+            stats,
+            token_count=2,
+        )
+
+    assert routed is None
+    assert stats.moe_native_assignment_parallel_calls == 1
+    assert stats.moe_native_assignment_parallel_eligible == 0
+    assert stats.moe_native_assignment_parallel_hits == 0
+    assert stats.moe_native_assignment_parallel_fallbacks == 1
+    assert stats.moe_native_assignment_parallel_fallback_small == 1
+
+
+def test_native_grouped_dispatch_offsets_assignment_parallel_records_cpu_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tp_runtime, "_NATIVE_MOE_ASSIGNMENT_PARALLEL_ENABLED", True)
+    stats = LinearDispatchStats()
+    loader = _FakeLoader(_moe_test_tensors())
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    config = _config_with_experts_per_token(2, packed=True)
+    weights = ReferenceWeights(loader)
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        routed = _try_native_moe_grouped_dispatch_offsets_assignment_parallel(
+            torch.zeros((32, 2), dtype=torch.float32),
+            torch.zeros((256,), dtype=torch.long),
+            torch.ones((256,), dtype=torch.float32),
+            torch.ones((2,), dtype=torch.long) * 128,
+            torch.tensor([0, 128], dtype=torch.long),
+            torch.zeros((256,), dtype=torch.long),
+            mapping,
+            config,
+            weights,
+            runtime,
+            stats,
+            token_count=32,
+        )
+
+    assert routed is None
+    assert stats.moe_native_assignment_parallel_calls == 1
+    assert stats.moe_native_assignment_parallel_eligible == 0
+    assert stats.moe_native_assignment_parallel_hits == 0
+    assert stats.moe_native_assignment_parallel_fallbacks == 1
+    assert stats.moe_native_assignment_parallel_fallback_device == 1
+
+
+def test_native_grouped_dispatch_offsets_assignment_parallel_records_capacity_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tp_runtime, "_NATIVE_MOE_ASSIGNMENT_PARALLEL_ENABLED", True)
+    stats = LinearDispatchStats()
+    loader = _FakeLoader(_moe_test_tensors())
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    config = _config_with_experts_per_token(2, packed=True)
+    weights = ReferenceWeights(loader)
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        routed = _try_native_moe_grouped_dispatch_offsets_assignment_parallel(
+            torch.zeros((128, 2), dtype=torch.float32),
+            torch.zeros((1024,), dtype=torch.long),
+            torch.ones((1024,), dtype=torch.float32),
+            torch.ones((2,), dtype=torch.long) * 512,
+            torch.tensor([0, 512], dtype=torch.long),
+            torch.zeros((1024,), dtype=torch.long),
+            mapping,
+            config,
+            weights,
+            runtime,
+            stats,
+            token_count=128,
+        )
+
+    assert routed is None
+    assert stats.moe_native_assignment_parallel_calls == 1
+    assert stats.moe_native_assignment_parallel_eligible == 0
+    assert stats.moe_native_assignment_parallel_hits == 0
+    assert stats.moe_native_assignment_parallel_fallbacks == 1
+    assert stats.moe_native_assignment_parallel_fallback_capacity == 1
 
 
 def test_native_grouped_dispatch_offsets_tensor_core_records_cpu_fallback() -> None:

@@ -24,6 +24,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     torch::Tensor scores,
     int64_t expert_start,
     int64_t expert_end);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moe_packed_local_assignment_offsets_with_experts(
+    torch::Tensor indices,
+    torch::Tensor scores,
+    int64_t expert_start,
+    int64_t expert_end);
 void moe_packed_score_scatter_add(
     torch::Tensor routed,
     torch::Tensor packed_output,
@@ -63,6 +68,21 @@ torch::Tensor moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16(
     torch::Tensor packed_scores,
     torch::Tensor counts,
     torch::Tensor offsets,
+    int64_t expert_start,
+    std::vector<torch::Tensor> gate_weights,
+    std::vector<torch::Tensor> gate_scales,
+    std::vector<torch::Tensor> up_weights,
+    std::vector<torch::Tensor> up_scales,
+    std::vector<torch::Tensor> down_weights,
+    std::vector<torch::Tensor> down_scales,
+    int64_t token_count);
+torch::Tensor moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16(
+    torch::Tensor flat_hidden,
+    torch::Tensor packed_tokens,
+    torch::Tensor packed_scores,
+    torch::Tensor counts,
+    torch::Tensor offsets,
+    torch::Tensor packed_local_experts,
     int64_t expert_start,
     std::vector<torch::Tensor> gate_weights,
     std::vector<torch::Tensor> gate_scales,

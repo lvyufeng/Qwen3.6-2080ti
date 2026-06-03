@@ -335,6 +335,117 @@ __global__ void fp8_moe_segmented_down_scatter_kernel(
     }
 }
 
+__global__ void fp8_moe_assignment_gate_up_silu_kernel(
+    const float* __restrict__ flat_hidden,
+    const int64_t* __restrict__ packed_tokens,
+    const int64_t* __restrict__ packed_local_experts,
+    const uint8_t* const* __restrict__ gate_weights,
+    const uint16_t* const* __restrict__ gate_scales,
+    const uint8_t* const* __restrict__ up_weights,
+    const uint16_t* const* __restrict__ up_scales,
+    float* __restrict__ activation,
+    int64_t capacity,
+    int64_t token_count,
+    int local_experts,
+    int hidden_size,
+    int intermediate_size,
+    int input_scale_cols) {
+    const int row = blockIdx.x;
+    const int64_t assignment = blockIdx.y;
+    if (row >= intermediate_size || assignment >= capacity) return;
+    const int64_t local = packed_local_experts[assignment];
+    if (local < 0 || local >= local_experts) return;
+    const int64_t token = packed_tokens[assignment];
+    if (token < 0 || token >= token_count) return;
+
+    const uint8_t* gate_weight = gate_weights[local];
+    const uint16_t* gate_scale = gate_scales[local];
+    const uint8_t* up_weight = up_weights[local];
+    const uint16_t* up_scale = up_scales[local];
+    const int row_block = row / kFp8BlockSize;
+    const float* token_hidden = flat_hidden + static_cast<size_t>(token) * hidden_size;
+
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (int col = threadIdx.x; col < hidden_size; col += blockDim.x) {
+        const int col_block = col / kFp8BlockSize;
+        const size_t weight_idx = static_cast<size_t>(row) * hidden_size + col;
+        const size_t scale_idx = static_cast<size_t>(row_block) * input_scale_cols + col_block;
+        const float x = token_hidden[col];
+        gate_sum += kFp8E4M3Lut[gate_weight[weight_idx]] * bf16_bits_to_float(gate_scale[scale_idx]) * x;
+        up_sum += kFp8E4M3Lut[up_weight[weight_idx]] * bf16_bits_to_float(up_scale[scale_idx]) * x;
+    }
+
+    extern __shared__ float scratch[];
+    float* gate_scratch = scratch;
+    float* up_scratch = scratch + blockDim.x;
+    gate_scratch[threadIdx.x] = gate_sum;
+    up_scratch[threadIdx.x] = up_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            gate_scratch[threadIdx.x] += gate_scratch[threadIdx.x + stride];
+            up_scratch[threadIdx.x] += up_scratch[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const float gate = gate_scratch[0];
+        const float up = up_scratch[0];
+        const float silu = gate / (1.0f + expf(-gate));
+        activation[static_cast<size_t>(assignment) * intermediate_size + row] = silu * up;
+    }
+}
+
+__global__ void fp8_moe_assignment_down_scatter_kernel(
+    float* __restrict__ routed,
+    const float* __restrict__ activation,
+    const int64_t* __restrict__ packed_tokens,
+    const float* __restrict__ packed_scores,
+    const int64_t* __restrict__ packed_local_experts,
+    const uint8_t* const* __restrict__ down_weights,
+    const uint16_t* const* __restrict__ down_scales,
+    int64_t capacity,
+    int64_t token_count,
+    int local_experts,
+    int hidden_size,
+    int intermediate_size,
+    int down_scale_cols) {
+    const int row = blockIdx.x;
+    const int64_t assignment = blockIdx.y;
+    if (row >= hidden_size || assignment >= capacity) return;
+    const int64_t local = packed_local_experts[assignment];
+    if (local < 0 || local >= local_experts) return;
+    const int64_t token = packed_tokens[assignment];
+    if (token < 0 || token >= token_count) return;
+
+    const uint8_t* down_weight = down_weights[local];
+    const uint16_t* down_scale = down_scales[local];
+    const int row_block = row / kFp8BlockSize;
+    const float* assignment_activation = activation + static_cast<size_t>(assignment) * intermediate_size;
+
+    float sum = 0.0f;
+    for (int col = threadIdx.x; col < intermediate_size; col += blockDim.x) {
+        const int col_block = col / kFp8BlockSize;
+        const size_t weight_idx = static_cast<size_t>(row) * intermediate_size + col;
+        const size_t scale_idx = static_cast<size_t>(row_block) * down_scale_cols + col_block;
+        sum += kFp8E4M3Lut[down_weight[weight_idx]] * bf16_bits_to_float(down_scale[scale_idx]) * assignment_activation[col];
+    }
+
+    extern __shared__ float scratch[];
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const float score = packed_scores[assignment];
+        atomicAdd(routed + token * static_cast<int64_t>(hidden_size) + row, scratch[0] * score);
+    }
+}
+
 __global__ void moe_assignment_count_kernel(
     const int64_t* __restrict__ indices,
     int64_t* __restrict__ counts,
@@ -371,6 +482,31 @@ __global__ void moe_assignment_fill_kernel(
             const int64_t out_pos = static_cast<int64_t>(atomicAdd(reinterpret_cast<unsigned long long*>(&cursors[local]), 1ULL));
             packed_tokens[out_pos] = idx / top_k;
             packed_scores[out_pos] = scores[idx];
+        }
+    }
+}
+
+__global__ void moe_assignment_fill_with_experts_kernel(
+    const int64_t* __restrict__ indices,
+    const float* __restrict__ scores,
+    int64_t* __restrict__ cursors,
+    int64_t* __restrict__ packed_tokens,
+    float* __restrict__ packed_scores,
+    int64_t* __restrict__ packed_local_experts,
+    int64_t total_assignments,
+    int top_k,
+    int64_t expert_start,
+    int64_t expert_end) {
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total_assignments;
+         idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int64_t expert = indices[idx];
+        if (expert >= expert_start && expert < expert_end) {
+            const int64_t local = expert - expert_start;
+            const int64_t out_pos = static_cast<int64_t>(atomicAdd(reinterpret_cast<unsigned long long*>(&cursors[local]), 1ULL));
+            packed_tokens[out_pos] = idx / top_k;
+            packed_scores[out_pos] = scores[idx];
+            packed_local_experts[out_pos] = local;
         }
     }
 }
@@ -1423,6 +1559,181 @@ torch::Tensor moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16(
 }
 
 
+torch::Tensor moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16(
+    torch::Tensor flat_hidden,
+    torch::Tensor packed_tokens,
+    torch::Tensor packed_scores,
+    torch::Tensor counts,
+    torch::Tensor offsets,
+    torch::Tensor packed_local_experts,
+    int64_t expert_start,
+    std::vector<torch::Tensor> gate_weights,
+    std::vector<torch::Tensor> gate_scales,
+    std::vector<torch::Tensor> up_weights,
+    std::vector<torch::Tensor> up_scales,
+    std::vector<torch::Tensor> down_weights,
+    std::vector<torch::Tensor> down_scales,
+    int64_t token_count) {
+    (void)expert_start;
+    TORCH_CHECK(flat_hidden.is_cuda(), "flat_hidden must be CUDA");
+    TORCH_CHECK(packed_tokens.is_cuda(), "packed_tokens must be CUDA");
+    TORCH_CHECK(packed_scores.is_cuda(), "packed_scores must be CUDA");
+    TORCH_CHECK(counts.is_cuda(), "counts must be CUDA");
+    TORCH_CHECK(offsets.is_cuda(), "offsets must be CUDA");
+    TORCH_CHECK(packed_local_experts.is_cuda(), "packed_local_experts must be CUDA");
+    TORCH_CHECK(flat_hidden.is_contiguous(), "flat_hidden must be contiguous");
+    TORCH_CHECK(packed_tokens.is_contiguous(), "packed_tokens must be contiguous");
+    TORCH_CHECK(packed_scores.is_contiguous(), "packed_scores must be contiguous");
+    TORCH_CHECK(counts.is_contiguous(), "counts must be contiguous");
+    TORCH_CHECK(offsets.is_contiguous(), "offsets must be contiguous");
+    TORCH_CHECK(packed_local_experts.is_contiguous(), "packed_local_experts must be contiguous");
+    TORCH_CHECK(flat_hidden.scalar_type() == at::kFloat, "flat_hidden must be float32");
+    TORCH_CHECK(packed_tokens.scalar_type() == at::kLong, "packed_tokens must be int64");
+    TORCH_CHECK(packed_scores.scalar_type() == at::kFloat, "packed_scores must be float32");
+    TORCH_CHECK(counts.scalar_type() == at::kLong, "counts must be int64");
+    TORCH_CHECK(offsets.scalar_type() == at::kLong, "offsets must be int64");
+    TORCH_CHECK(packed_local_experts.scalar_type() == at::kLong, "packed_local_experts must be int64");
+    TORCH_CHECK(flat_hidden.dim() == 2, "flat_hidden must have shape [tokens, hidden]");
+    TORCH_CHECK(packed_tokens.dim() == 1, "packed_tokens must have shape [capacity]");
+    TORCH_CHECK(packed_scores.dim() == 1, "packed_scores must have shape [capacity]");
+    TORCH_CHECK(packed_local_experts.dim() == 1, "packed_local_experts must have shape [capacity]");
+    TORCH_CHECK(counts.dim() == 1, "counts must have shape [local_experts]");
+    TORCH_CHECK(offsets.dim() == 1, "offsets must have shape [local_experts]");
+    TORCH_CHECK(packed_scores.size(0) == packed_tokens.size(0), "packed_scores length must match packed_tokens capacity");
+    TORCH_CHECK(packed_local_experts.size(0) == packed_tokens.size(0), "packed_local_experts length must match packed_tokens capacity");
+    TORCH_CHECK(counts.size(0) == offsets.size(0), "counts length must match offsets length");
+    TORCH_CHECK(token_count >= 0, "token_count must be non-negative");
+    TORCH_CHECK(token_count <= flat_hidden.size(0), "token_count must not exceed flat_hidden rows");
+    TORCH_CHECK(flat_hidden.size(1) > 0 && flat_hidden.size(1) <= INT_MAX, "hidden size must be positive and fit int32");
+    TORCH_CHECK(gate_weights.size() == gate_scales.size(), "gate weight/scale list length mismatch");
+    TORCH_CHECK(gate_weights.size() == up_weights.size(), "gate/up weight list length mismatch");
+    TORCH_CHECK(gate_weights.size() == up_scales.size(), "gate/up scale list length mismatch");
+    TORCH_CHECK(gate_weights.size() == down_weights.size(), "gate/down weight list length mismatch");
+    TORCH_CHECK(gate_weights.size() == down_scales.size(), "gate/down scale list length mismatch");
+    TORCH_CHECK(!gate_weights.empty(), "expert tensor lists must be non-empty");
+    TORCH_CHECK(static_cast<int64_t>(gate_weights.size()) == counts.size(0), "expert tensor-list length must match counts length");
+
+    c10::cuda::CUDAGuard device_guard(flat_hidden.device());
+    TORCH_CHECK(packed_tokens.device() == flat_hidden.device(), "packed_tokens must be on same CUDA device as flat_hidden");
+    TORCH_CHECK(packed_scores.device() == flat_hidden.device(), "packed_scores must be on same CUDA device as flat_hidden");
+    TORCH_CHECK(counts.device() == flat_hidden.device(), "counts must be on same CUDA device as flat_hidden");
+    TORCH_CHECK(offsets.device() == flat_hidden.device(), "offsets must be on same CUDA device as flat_hidden");
+    TORCH_CHECK(packed_local_experts.device() == flat_hidden.device(), "packed_local_experts must be on same CUDA device as flat_hidden");
+    TORCH_CHECK(ensure_fp8_lut(), "failed to initialize FP8 LUT");
+
+    const auto hidden64 = flat_hidden.size(1);
+    const int64_t local_experts64 = counts.size(0);
+    TORCH_CHECK(local_experts64 > 0 && local_experts64 <= INT_MAX, "local expert count must be positive and fit int32");
+    const auto intermediate64 = gate_weights[0].size(0);
+    TORCH_CHECK(intermediate64 > 0 && intermediate64 <= INT_MAX, "intermediate size must be positive and fit int32");
+    for (size_t index = 0; index < gate_weights.size(); ++index) {
+        check_moe_expert_tensor_basics(gate_weights[index], "gate_weight", at::kFloat8_e4m3fn);
+        check_moe_expert_tensor_basics(gate_scales[index], "gate_scale", at::kBFloat16);
+        check_moe_expert_tensor_basics(up_weights[index], "up_weight", at::kFloat8_e4m3fn);
+        check_moe_expert_tensor_basics(up_scales[index], "up_scale", at::kBFloat16);
+        check_moe_expert_tensor_basics(down_weights[index], "down_weight", at::kFloat8_e4m3fn);
+        check_moe_expert_tensor_basics(down_scales[index], "down_scale", at::kBFloat16);
+        TORCH_CHECK(gate_weights[index].device() == flat_hidden.device(), "gate_weight must be on same CUDA device as flat_hidden");
+        TORCH_CHECK(gate_scales[index].device() == flat_hidden.device(), "gate_scale must be on same CUDA device as flat_hidden");
+        TORCH_CHECK(up_weights[index].device() == flat_hidden.device(), "up_weight must be on same CUDA device as flat_hidden");
+        TORCH_CHECK(up_scales[index].device() == flat_hidden.device(), "up_scale must be on same CUDA device as flat_hidden");
+        TORCH_CHECK(down_weights[index].device() == flat_hidden.device(), "down_weight must be on same CUDA device as flat_hidden");
+        TORCH_CHECK(down_scales[index].device() == flat_hidden.device(), "down_scale must be on same CUDA device as flat_hidden");
+        TORCH_CHECK(gate_weights[index].size(0) == intermediate64, "all gate_weight rows must match");
+        TORCH_CHECK(gate_weights[index].size(1) == hidden64, "gate_weight cols must match hidden size");
+        TORCH_CHECK(up_weights[index].size(0) == intermediate64 && up_weights[index].size(1) == hidden64, "up_weight shape must match gate_weight");
+        TORCH_CHECK(down_weights[index].size(0) == hidden64 && down_weights[index].size(1) == intermediate64, "down_weight shape must be [hidden, intermediate]");
+        TORCH_CHECK(hidden64 % kFp8BlockSize == 0, "hidden size must be divisible by 128 for assignment-parallel MoE offset dispatch op");
+        TORCH_CHECK(intermediate64 % kFp8BlockSize == 0, "intermediate size must be divisible by 128 for assignment-parallel MoE offset dispatch op");
+        TORCH_CHECK(gate_scales[index].size(0) == intermediate64 / kFp8BlockSize, "gate_scale row blocks mismatch");
+        TORCH_CHECK(gate_scales[index].size(1) == hidden64 / kFp8BlockSize, "gate_scale col blocks mismatch");
+        TORCH_CHECK(up_scales[index].size(0) == intermediate64 / kFp8BlockSize, "up_scale row blocks mismatch");
+        TORCH_CHECK(up_scales[index].size(1) == hidden64 / kFp8BlockSize, "up_scale col blocks mismatch");
+        TORCH_CHECK(down_scales[index].size(0) == hidden64 / kFp8BlockSize, "down_scale row blocks mismatch");
+        TORCH_CHECK(down_scales[index].size(1) == intermediate64 / kFp8BlockSize, "down_scale col blocks mismatch");
+    }
+
+    auto routed = torch::zeros({token_count, hidden64}, flat_hidden.options());
+    const int64_t capacity64 = packed_tokens.size(0);
+    if (token_count == 0 || capacity64 == 0 || local_experts64 == 0) return routed;
+    TORCH_CHECK(capacity64 <= INT_MAX, "packed assignment capacity must fit int32 grid dimension");
+
+    auto activation = torch::empty({capacity64, intermediate64}, flat_hidden.options());
+    auto pointer_options = flat_hidden.options().dtype(at::kLong);
+    auto gate_weight_ptrs = torch::empty({local_experts64}, pointer_options);
+    auto gate_scale_ptrs = torch::empty({local_experts64}, pointer_options);
+    auto up_weight_ptrs = torch::empty({local_experts64}, pointer_options);
+    auto up_scale_ptrs = torch::empty({local_experts64}, pointer_options);
+    auto down_weight_ptrs = torch::empty({local_experts64}, pointer_options);
+    auto down_scale_ptrs = torch::empty({local_experts64}, pointer_options);
+
+    const size_t local_experts = static_cast<size_t>(local_experts64);
+    std::vector<int64_t> gate_weight_host(local_experts);
+    std::vector<int64_t> gate_scale_host(local_experts);
+    std::vector<int64_t> up_weight_host(local_experts);
+    std::vector<int64_t> up_scale_host(local_experts);
+    std::vector<int64_t> down_weight_host(local_experts);
+    std::vector<int64_t> down_scale_host(local_experts);
+    for (size_t index = 0; index < local_experts; ++index) {
+        gate_weight_host[index] = reinterpret_cast<int64_t>(gate_weights[index].data_ptr());
+        gate_scale_host[index] = reinterpret_cast<int64_t>(gate_scales[index].data_ptr<at::BFloat16>());
+        up_weight_host[index] = reinterpret_cast<int64_t>(up_weights[index].data_ptr());
+        up_scale_host[index] = reinterpret_cast<int64_t>(up_scales[index].data_ptr<at::BFloat16>());
+        down_weight_host[index] = reinterpret_cast<int64_t>(down_weights[index].data_ptr());
+        down_scale_host[index] = reinterpret_cast<int64_t>(down_scales[index].data_ptr<at::BFloat16>());
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream(flat_hidden.device().index()).stream();
+    const size_t pointer_bytes = local_experts * sizeof(int64_t);
+    check_cuda(cudaMemcpyAsync(gate_weight_ptrs.data_ptr<int64_t>(), gate_weight_host.data(), pointer_bytes, cudaMemcpyHostToDevice, stream), "copy assignment gate_weight pointers");
+    check_cuda(cudaMemcpyAsync(gate_scale_ptrs.data_ptr<int64_t>(), gate_scale_host.data(), pointer_bytes, cudaMemcpyHostToDevice, stream), "copy assignment gate_scale pointers");
+    check_cuda(cudaMemcpyAsync(up_weight_ptrs.data_ptr<int64_t>(), up_weight_host.data(), pointer_bytes, cudaMemcpyHostToDevice, stream), "copy assignment up_weight pointers");
+    check_cuda(cudaMemcpyAsync(up_scale_ptrs.data_ptr<int64_t>(), up_scale_host.data(), pointer_bytes, cudaMemcpyHostToDevice, stream), "copy assignment up_scale pointers");
+    check_cuda(cudaMemcpyAsync(down_weight_ptrs.data_ptr<int64_t>(), down_weight_host.data(), pointer_bytes, cudaMemcpyHostToDevice, stream), "copy assignment down_weight pointers");
+    check_cuda(cudaMemcpyAsync(down_scale_ptrs.data_ptr<int64_t>(), down_scale_host.data(), pointer_bytes, cudaMemcpyHostToDevice, stream), "copy assignment down_scale pointers");
+
+    const int hidden_size = static_cast<int>(hidden64);
+    const int intermediate_size = static_cast<int>(intermediate64);
+    const int input_scale_cols = hidden_size / kFp8BlockSize;
+    const int down_scale_cols = intermediate_size / kFp8BlockSize;
+    const int threads = 256;
+    const int local_experts_int = static_cast<int>(local_experts64);
+    fp8_moe_assignment_gate_up_silu_kernel<<<dim3(intermediate_size, static_cast<unsigned int>(capacity64)), threads, 2 * threads * sizeof(float), stream>>>(
+        flat_hidden.data_ptr<float>(),
+        packed_tokens.data_ptr<int64_t>(),
+        packed_local_experts.data_ptr<int64_t>(),
+        reinterpret_cast<const uint8_t* const*>(gate_weight_ptrs.data_ptr<int64_t>()),
+        reinterpret_cast<const uint16_t* const*>(gate_scale_ptrs.data_ptr<int64_t>()),
+        reinterpret_cast<const uint8_t* const*>(up_weight_ptrs.data_ptr<int64_t>()),
+        reinterpret_cast<const uint16_t* const*>(up_scale_ptrs.data_ptr<int64_t>()),
+        activation.data_ptr<float>(),
+        capacity64,
+        token_count,
+        local_experts_int,
+        hidden_size,
+        intermediate_size,
+        input_scale_cols);
+    check_cuda(cudaGetLastError(), "fp8_moe_assignment_gate_up_silu_kernel");
+
+    fp8_moe_assignment_down_scatter_kernel<<<dim3(hidden_size, static_cast<unsigned int>(capacity64)), threads, threads * sizeof(float), stream>>>(
+        routed.data_ptr<float>(),
+        activation.data_ptr<float>(),
+        packed_tokens.data_ptr<int64_t>(),
+        packed_scores.data_ptr<float>(),
+        packed_local_experts.data_ptr<int64_t>(),
+        reinterpret_cast<const uint8_t* const*>(down_weight_ptrs.data_ptr<int64_t>()),
+        reinterpret_cast<const uint16_t* const*>(down_scale_ptrs.data_ptr<int64_t>()),
+        capacity64,
+        token_count,
+        local_experts_int,
+        hidden_size,
+        intermediate_size,
+        down_scale_cols);
+    check_cuda(cudaGetLastError(), "fp8_moe_assignment_down_scatter_kernel");
+    return routed;
+}
+
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moe_packed_local_assignment_offsets(
     torch::Tensor indices,
     torch::Tensor scores,
@@ -1498,6 +1809,86 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         check_cuda(cudaGetLastError(), "moe_assignment_fill_kernel");
     }
     return std::make_tuple(packed_tokens, packed_scores, unique_experts, counts, offsets);
+}
+
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> moe_packed_local_assignment_offsets_with_experts(
+    torch::Tensor indices,
+    torch::Tensor scores,
+    int64_t expert_start,
+    int64_t expert_end) {
+    TORCH_CHECK(indices.is_cuda(), "indices must be CUDA");
+    TORCH_CHECK(scores.is_cuda(), "scores must be CUDA");
+    TORCH_CHECK(indices.is_contiguous(), "indices must be contiguous");
+    TORCH_CHECK(scores.is_contiguous(), "scores must be contiguous");
+    TORCH_CHECK(indices.scalar_type() == at::kLong, "indices must be int64");
+    TORCH_CHECK(scores.scalar_type() == at::kFloat, "scores must be float32");
+    TORCH_CHECK(indices.dim() == 2, "indices must have shape [tokens, top_k]");
+    TORCH_CHECK(scores.dim() == 2, "scores must have shape [tokens, top_k]");
+    TORCH_CHECK(indices.sizes() == scores.sizes(), "indices and scores shapes must match");
+    TORCH_CHECK(expert_end >= expert_start, "expert_end must be >= expert_start");
+
+    c10::cuda::CUDAGuard device_guard(indices.device());
+    TORCH_CHECK(scores.device() == indices.device(), "scores must be on same CUDA device as indices");
+
+    const auto tokens64 = indices.size(0);
+    const auto top_k64 = indices.size(1);
+    TORCH_CHECK(tokens64 >= 0, "token count must be non-negative");
+    TORCH_CHECK(top_k64 > 0 && top_k64 <= INT_MAX, "top_k must be positive and fit int32");
+    TORCH_CHECK(tokens64 == 0 || tokens64 <= (std::numeric_limits<int64_t>::max() / top_k64), "assignment count overflow");
+    const int top_k = static_cast<int>(top_k64);
+    const int64_t total_assignments = tokens64 * top_k64;
+    const int64_t local_experts64 = expert_end - expert_start;
+    TORCH_CHECK(local_experts64 >= 0 && local_experts64 <= INT_MAX, "local expert count must fit int32");
+
+    auto long_options = indices.options().dtype(at::kLong);
+    auto score_options = scores.options();
+    auto packed_tokens = torch::empty({total_assignments}, long_options);
+    auto packed_scores = torch::empty({total_assignments}, score_options);
+    auto packed_local_experts = torch::full({total_assignments}, -1, long_options);
+    auto unique_experts = torch::empty({local_experts64}, long_options);
+    auto counts = torch::zeros({local_experts64}, long_options);
+    auto offsets = torch::zeros({local_experts64}, long_options);
+    if (local_experts64 == 0) {
+        return std::make_tuple(packed_tokens, packed_scores, unique_experts, counts, offsets, packed_local_experts);
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream(indices.device().index()).stream();
+    const int threads = 256;
+    const int blocks = static_cast<int>(std::min<int64_t>((std::max<int64_t>(total_assignments, 1) + threads - 1) / threads, 65535));
+    if (total_assignments > 0) {
+        moe_assignment_count_kernel<<<blocks, threads, 0, stream>>>(
+            indices.data_ptr<int64_t>(),
+            counts.data_ptr<int64_t>(),
+            total_assignments,
+            top_k,
+            expert_start,
+            expert_end);
+        check_cuda(cudaGetLastError(), "moe_assignment_count_kernel");
+    }
+    moe_assignment_offsets_kernel<<<1, 1, 0, stream>>>(
+        counts.data_ptr<int64_t>(),
+        offsets.data_ptr<int64_t>(),
+        unique_experts.data_ptr<int64_t>(),
+        local_experts64,
+        expert_start);
+    check_cuda(cudaGetLastError(), "moe_assignment_offsets_kernel");
+    if (total_assignments > 0) {
+        auto cursors = offsets.clone();
+        moe_assignment_fill_with_experts_kernel<<<blocks, threads, 0, stream>>>(
+            indices.data_ptr<int64_t>(),
+            scores.data_ptr<float>(),
+            cursors.data_ptr<int64_t>(),
+            packed_tokens.data_ptr<int64_t>(),
+            packed_scores.data_ptr<float>(),
+            packed_local_experts.data_ptr<int64_t>(),
+            total_assignments,
+            top_k,
+            expert_start,
+            expert_end);
+        check_cuda(cudaGetLastError(), "moe_assignment_fill_with_experts_kernel");
+    }
+    return std::make_tuple(packed_tokens, packed_scores, unique_experts, counts, offsets, packed_local_experts);
 }
 
 
