@@ -290,6 +290,220 @@ def test_moe_grouped_dispatch_offsets_fp8_e4m3_bf16_matches_reference() -> None:
     torch.testing.assert_close(routed, ref, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the segmented grouped MoE offset dispatch extension")
+def test_moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16_matches_reference() -> None:
+    try:
+        from fp8_cuda import moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(25)
+    hidden_size = 256
+    intermediate_size = 384
+    tensor_lists = _make_fp8_moe_tensor_lists(
+        device=device,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        seeds=(31, 32, 33, 34),
+    )
+    gate_weights, gate_scales, up_weights, up_scales, down_weights, down_scales = tensor_lists
+    flat_hidden = torch.randn((4, hidden_size), device=device, dtype=torch.float32)
+    packed_tokens = torch.tensor([2, 0, 0, 0, 2, 1, 1, 3], device=device, dtype=torch.long)
+    packed_scores = torch.tensor([0.5, 1.25, 0.0, 0.0, -0.25, 0.75, 0.5, -0.5], device=device, dtype=torch.float32)
+    counts = torch.tensor([2, 0, 1, 3], device=device, dtype=torch.long)
+    offsets = torch.tensor([0, 2, 4, 5], device=device, dtype=torch.long)
+    expert_start = 4
+    token_count = 4
+
+    routed = moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16(
+        flat_hidden,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        expert_start,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        down_weights,
+        down_scales,
+        token_count,
+    )
+    ref = _reference_offset_dispatch(
+        flat_hidden,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        down_weights,
+        down_scales,
+        token_count,
+    )
+
+    torch.testing.assert_close(routed, ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the segmented grouped MoE offset dispatch extension")
+def test_moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16_matches_legacy_offset_dispatch() -> None:
+    try:
+        from fp8_cuda import (
+            moe_grouped_dispatch_offsets_fp8_e4m3_bf16,
+            moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16,
+        )
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(26)
+    hidden_size = 256
+    intermediate_size = 384
+    tensor_lists = _make_fp8_moe_tensor_lists(
+        device=device,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        seeds=(41, 42, 43, 44),
+    )
+    gate_weights, gate_scales, up_weights, up_scales, down_weights, down_scales = tensor_lists
+    flat_hidden = torch.randn((5, hidden_size), device=device, dtype=torch.float32)
+    packed_tokens = torch.tensor([4, 0, 1, 1, 2, 3, 3, 0, 4, 2], device=device, dtype=torch.long)
+    packed_scores = torch.tensor([0.2, -0.5, 0.75, 0.1, 1.2, -0.7, 0.3, 0.9, -0.4, 0.6], device=device, dtype=torch.float32)
+    counts = torch.tensor([1, 3, 2, 4], device=device, dtype=torch.long)
+    offsets = torch.tensor([0, 1, 4, 6], device=device, dtype=torch.long)
+    expert_start = 4
+    token_count = 5
+
+    legacy = moe_grouped_dispatch_offsets_fp8_e4m3_bf16(
+        flat_hidden,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        expert_start,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        down_weights,
+        down_scales,
+        token_count,
+    )
+    segmented = moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16(
+        flat_hidden,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        expert_start,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        down_weights,
+        down_scales,
+        token_count,
+    )
+
+    torch.testing.assert_close(segmented, legacy, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the segmented grouped MoE offset dispatch extension")
+def test_moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16_handles_empty_dispatch() -> None:
+    try:
+        from fp8_cuda import moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    hidden_size = 256
+    intermediate_size = 384
+    weight = torch.zeros((intermediate_size, hidden_size), device=device, dtype=torch.float8_e4m3fn)
+    down = torch.zeros((hidden_size, intermediate_size), device=device, dtype=torch.float8_e4m3fn)
+    scale = torch.ones((3, 2), device=device, dtype=torch.bfloat16)
+    down_scale = torch.ones((2, 3), device=device, dtype=torch.bfloat16)
+
+    routed = moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16(
+        torch.empty((3, hidden_size), device=device, dtype=torch.float32),
+        torch.empty((0,), device=device, dtype=torch.long),
+        torch.empty((0,), device=device, dtype=torch.float32),
+        torch.zeros((1,), device=device, dtype=torch.long),
+        torch.zeros((1,), device=device, dtype=torch.long),
+        0,
+        [weight],
+        [scale],
+        [weight],
+        [scale],
+        [down],
+        [down_scale],
+        3,
+    )
+
+    torch.testing.assert_close(routed, torch.zeros((3, hidden_size), device=device, dtype=torch.float32))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the segmented grouped MoE offset dispatch extension")
+def test_moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16_handles_duplicate_tokens() -> None:
+    try:
+        from fp8_cuda import moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(27)
+    hidden_size = 256
+    intermediate_size = 384
+    tensor_lists = _make_fp8_moe_tensor_lists(
+        device=device,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        seeds=(51, 52, 53),
+    )
+    gate_weights, gate_scales, up_weights, up_scales, down_weights, down_scales = tensor_lists
+    flat_hidden = torch.randn((3, hidden_size), device=device, dtype=torch.float32)
+    packed_tokens = torch.tensor([0, 0, 1, 1, 1, 2, 2], device=device, dtype=torch.long)
+    packed_scores = torch.tensor([0.5, -0.2, 0.3, 0.4, -0.6, 0.8, 0.1], device=device, dtype=torch.float32)
+    counts = torch.tensor([2, 0, 5], device=device, dtype=torch.long)
+    offsets = torch.tensor([0, 2, 2], device=device, dtype=torch.long)
+    token_count = 3
+
+    routed = moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16(
+        flat_hidden,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        7,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        down_weights,
+        down_scales,
+        token_count,
+    )
+    ref = _reference_offset_dispatch(
+        flat_hidden,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        gate_weights,
+        gate_scales,
+        up_weights,
+        up_scales,
+        down_weights,
+        down_scales,
+        token_count,
+    )
+
+    torch.testing.assert_close(routed, ref, atol=5e-2, rtol=5e-2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the grouped MoE offset dispatch extension")
 def test_moe_grouped_dispatch_offsets_fp8_e4m3_bf16_handles_empty_dispatch() -> None:
     try:
@@ -418,6 +632,59 @@ def test_fp8_cuda_linear_wrapper_falls_back_for_cpu() -> None:
     out = linear(x, weight, scale)
 
     torch.testing.assert_close(out, torch.tensor([[6.0, 4.0]]))
+
+
+def _make_fp8_moe_tensor_lists(
+    *,
+    device: str,
+    hidden_size: int,
+    intermediate_size: int,
+    seeds: tuple[int, ...],
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    gate_weights = []
+    gate_scales = []
+    up_weights = []
+    up_scales = []
+    down_weights = []
+    down_scales = []
+    for seed in seeds:
+        torch.manual_seed(seed)
+        gate_weights.append((torch.randn((intermediate_size, hidden_size), device=device, dtype=torch.float32) * 0.04).to(torch.float8_e4m3fn))
+        up_weights.append((torch.randn((intermediate_size, hidden_size), device=device, dtype=torch.float32) * 0.04).to(torch.float8_e4m3fn))
+        down_weights.append((torch.randn((hidden_size, intermediate_size), device=device, dtype=torch.float32) * 0.04).to(torch.float8_e4m3fn))
+        gate_scales.append(torch.full((intermediate_size // 128, hidden_size // 128), 0.25, device=device, dtype=torch.bfloat16))
+        up_scales.append(torch.full((intermediate_size // 128, hidden_size // 128), 0.25, device=device, dtype=torch.bfloat16))
+        down_scales.append(torch.full((hidden_size // 128, intermediate_size // 128), 0.25, device=device, dtype=torch.bfloat16))
+    return gate_weights, gate_scales, up_weights, up_scales, down_weights, down_scales
+
+
+def _reference_offset_dispatch(
+    flat_hidden: torch.Tensor,
+    packed_tokens: torch.Tensor,
+    packed_scores: torch.Tensor,
+    counts: torch.Tensor,
+    offsets: torch.Tensor,
+    gate_weights: list[torch.Tensor],
+    gate_scales: list[torch.Tensor],
+    up_weights: list[torch.Tensor],
+    up_scales: list[torch.Tensor],
+    down_weights: list[torch.Tensor],
+    down_scales: list[torch.Tensor],
+    token_count: int,
+) -> torch.Tensor:
+    routed = torch.zeros((token_count, flat_hidden.shape[1]), device=flat_hidden.device, dtype=torch.float32)
+    for local, count in enumerate(counts.tolist()):
+        if count == 0:
+            continue
+        offset = int(offsets[local].item())
+        end = offset + count
+        token_slice = packed_tokens[offset:end]
+        hidden = flat_hidden.index_select(0, token_slice)
+        gate = linear(hidden, gate_weights[local], gate_scales[local], use_cuda_kernel=False)
+        up = linear(hidden, up_weights[local], up_scales[local], use_cuda_kernel=False)
+        out = linear(silu_mul(gate, up), down_weights[local], down_scales[local], use_cuda_kernel=False)
+        routed.index_add_(0, token_slice, out.float() * packed_scores[offset:end, None])
+    return routed
 
 
 def _reference_packed_assignments(

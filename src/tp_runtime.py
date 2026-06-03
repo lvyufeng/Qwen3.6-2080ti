@@ -35,6 +35,10 @@ _NATIVE_MOE_OFFSET_ASSIGNMENT_ENABLED = os.environ.get("QWEN36_NATIVE_MOE_OFFSET
 _NATIVE_MOE_OFFSET_ASSIGNMENT_MIN_ASSIGNMENTS = int(os.environ.get("QWEN36_NATIVE_MOE_OFFSET_ASSIGNMENT_MIN_ASSIGNMENTS", "1"))
 _NATIVE_MOE_OFFSET_ASSIGNMENT_MAX_CAPACITY = int(os.environ.get("QWEN36_NATIVE_MOE_OFFSET_ASSIGNMENT_MAX_CAPACITY", "16384"))
 _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_ENABLED = os.environ.get("QWEN36_NATIVE_MOE_GROUPED_DISPATCH_OFFSETS", "1") != "0"
+_NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_ENABLED = os.environ.get("QWEN36_NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED", "1") != "0"
+_NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_MIN_ASSIGNMENTS = int(os.environ.get("QWEN36_NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_MIN_ASSIGNMENTS", "128"))
+_NATIVE_MOE_TENSOR_CORE_ENABLED = os.environ.get("QWEN36_NATIVE_MOE_TENSOR_CORE", "1") != "0"
+_NATIVE_MOE_TENSOR_CORE_MIN_ASSIGNMENTS = int(os.environ.get("QWEN36_NATIVE_MOE_TENSOR_CORE_MIN_ASSIGNMENTS", "128"))
 _NATIVE_MOE_EXACT_OFFSET_STATS = os.environ.get("QWEN36_NATIVE_MOE_EXACT_OFFSET_STATS", "0") == "1"
 
 
@@ -871,6 +875,8 @@ _NATIVE_MOE_ASSIGNMENT_OFFSETS_FN: Any = None
 _NATIVE_MOE_ASSIGNMENT_OFFSETS_IMPORT_FAILED = False
 _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_FN: Any = None
 _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_IMPORT_FAILED = False
+_NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_FN: Any = None
+_NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_IMPORT_FAILED = False
 
 
 def _native_moe_assignment_offsets_fn() -> Any:
@@ -903,6 +909,21 @@ def _native_moe_grouped_dispatch_offsets_fn() -> Any:
     return _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_FN
 
 
+def _native_moe_grouped_dispatch_offsets_segmented_fn() -> Any:
+    global _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_FN, _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_IMPORT_FAILED
+    if _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_FN is not None:
+        return _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_FN
+    if _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_IMPORT_FAILED:
+        return None
+    try:
+        from fp8_cuda import moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16
+    except Exception:
+        _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_IMPORT_FAILED = True
+        return None
+    _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_FN = moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16
+    return _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_FN
+
+
 def _try_native_moe_offsets_fast_path(
     flat: Any,
     routing: TopKRouting,
@@ -915,6 +936,10 @@ def _try_native_moe_offsets_fast_path(
     if not config.moe.native_fused_expert_dispatch:
         _record_native_assignment_offsets_call(stats, eligible=False)
         _record_native_assignment_offsets_fallback(stats, "disabled")
+        _record_native_tensor_core_call(stats, eligible=False)
+        _record_native_tensor_core_fallback(stats, "disabled")
+        _record_native_grouped_dispatch_offsets_segmented_call(stats, eligible=False)
+        _record_native_grouped_dispatch_offsets_segmented_fallback(stats, "disabled")
         _record_native_grouped_dispatch_offsets_call(stats, eligible=False)
         _record_native_grouped_dispatch_offsets_fallback(stats, "disabled")
         return None
@@ -922,6 +947,37 @@ def _try_native_moe_offsets_fast_path(
     if assignment_plan is None:
         return None
     packed_tokens, packed_scores, _unique_experts, counts, offsets = assignment_plan
+    if _NATIVE_MOE_TENSOR_CORE_ENABLED:
+        tensor_core_routed = _try_native_moe_grouped_dispatch_offsets_tensor_core(
+            flat,
+            packed_tokens,
+            packed_scores,
+            counts,
+            offsets,
+            mapping,
+            config,
+            weights,
+            runtime,
+            stats,
+            token_count=int(flat.shape[0]),
+        )
+        if tensor_core_routed is not None:
+            return tensor_core_routed
+    segmented_routed = _try_native_moe_grouped_dispatch_offsets_segmented(
+        flat,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        mapping,
+        config,
+        weights,
+        runtime,
+        stats,
+        token_count=int(flat.shape[0]),
+    )
+    if segmented_routed is not None:
+        return segmented_routed
     return _try_native_moe_grouped_dispatch_offsets(
         flat,
         packed_tokens,
@@ -996,6 +1052,78 @@ def _tp_moe_offset_assignment_eligibility(routing: TopKRouting, mapping: MoEMapp
     return True, ""
 
 
+def _try_native_moe_grouped_dispatch_offsets_tensor_core(
+    flat: Any,
+    packed_tokens: Any,
+    packed_scores: Any,
+    counts: Any,
+    offsets: Any,
+    mapping: MoEMapping,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    stats: Any,
+    *,
+    token_count: int,
+) -> Any | None:
+    import torch
+
+    _record_native_tensor_core_call(stats, eligible=False)
+    if not _NATIVE_MOE_TENSOR_CORE_ENABLED or not config.moe.native_fused_expert_dispatch:
+        _record_native_tensor_core_fallback(stats, "disabled")
+        return None
+    capacity = int(packed_tokens.shape[0]) if hasattr(packed_tokens, "shape") else 0
+    if capacity < _NATIVE_MOE_TENSOR_CORE_MIN_ASSIGNMENTS:
+        _record_native_tensor_core_fallback(stats, "small")
+        return None
+    flat_native = flat
+    if getattr(flat, "is_cuda", False) and getattr(flat, "dtype", None) in (torch.float16, torch.bfloat16):
+        with runtime.profile_scope("moe.packed.grouped_native_offsets_tensor_core_cast"):
+            flat_native = flat.float()
+    eligible, reason, tensor_lists = _tp_moe_grouped_dispatch_offsets_eligibility(
+        flat_native,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        mapping,
+        weights,
+    )
+    if not eligible:
+        _record_native_tensor_core_fallback(stats, reason)
+        return None
+    if stats is not None:
+        stats.moe_native_tensor_core_eligible += 1
+    native_fn = _native_moe_grouped_dispatch_offsets_fn()
+    if native_fn is None:
+        _record_native_tensor_core_fallback(stats, "exception")
+        return None
+    try:
+        with runtime.profile_scope("moe.packed.grouped_native_offsets_tensor_core_dispatch"):
+            routed = native_fn(
+                flat_native,
+                packed_tokens,
+                packed_scores,
+                counts,
+                offsets,
+                mapping.expert_start,
+                *tensor_lists,
+                token_count,
+            )
+    except Exception:
+        _record_native_tensor_core_fallback(stats, "exception")
+        return None
+    if stats is not None:
+        stats.moe_native_tensor_core_hits += 1
+        if _NATIVE_MOE_EXACT_OFFSET_STATS:
+            with runtime.profile_scope("moe.packed.offset_exact_stats"):
+                local_assignment_count = int(counts.sum().item())
+            stats.moe_local_assignments += local_assignment_count
+            if local_assignment_count == 0:
+                stats.moe_empty_local_dispatches += 1
+    return routed
+
+
 def _try_native_moe_grouped_dispatch_offsets(
     flat: Any,
     packed_tokens: Any,
@@ -1065,6 +1193,79 @@ def _try_native_moe_grouped_dispatch_offsets(
     return routed
 
 
+def _try_native_moe_grouped_dispatch_offsets_segmented(
+    flat: Any,
+    packed_tokens: Any,
+    packed_scores: Any,
+    counts: Any,
+    offsets: Any,
+    mapping: MoEMapping,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    stats: Any,
+    *,
+    token_count: int,
+) -> Any | None:
+    import torch
+
+    _record_native_grouped_dispatch_offsets_segmented_call(stats, eligible=False)
+    if not _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_ENABLED or not config.moe.native_fused_expert_dispatch:
+        _record_native_grouped_dispatch_offsets_segmented_fallback(stats, "disabled")
+        return None
+    capacity = int(packed_tokens.shape[0]) if hasattr(packed_tokens, "shape") else 0
+    if capacity < _NATIVE_MOE_GROUPED_DISPATCH_OFFSETS_SEGMENTED_MIN_ASSIGNMENTS:
+        _record_native_grouped_dispatch_offsets_segmented_fallback(stats, "small")
+        return None
+    flat_native = flat
+    if getattr(flat, "is_cuda", False) and getattr(flat, "dtype", None) in (torch.float16, torch.bfloat16):
+        with runtime.profile_scope("moe.packed.grouped_native_offsets_segmented_cast"):
+            flat_native = flat.float()
+    eligible, reason, tensor_lists = _tp_moe_grouped_dispatch_offsets_eligibility(
+        flat_native,
+        packed_tokens,
+        packed_scores,
+        counts,
+        offsets,
+        mapping,
+        weights,
+    )
+    if not eligible:
+        _record_native_grouped_dispatch_offsets_segmented_fallback(stats, reason)
+        return None
+    if stats is not None:
+        stats.moe_native_grouped_dispatch_offsets_segmented_eligible += 1
+        stats.moe_native_grouped_dispatch_offsets_segmented_capacity += capacity
+    native_fn = _native_moe_grouped_dispatch_offsets_segmented_fn()
+    if native_fn is None:
+        _record_native_grouped_dispatch_offsets_segmented_fallback(stats, "exception")
+        return None
+    try:
+        with runtime.profile_scope("moe.packed.grouped_native_offsets_segmented_dispatch"):
+            routed = native_fn(
+                flat_native,
+                packed_tokens,
+                packed_scores,
+                counts,
+                offsets,
+                mapping.expert_start,
+                *tensor_lists,
+                token_count,
+            )
+    except Exception:
+        _record_native_grouped_dispatch_offsets_segmented_fallback(stats, "exception")
+        return None
+    if stats is not None:
+        stats.moe_native_grouped_dispatch_offsets_segmented_hits += 1
+        if _NATIVE_MOE_EXACT_OFFSET_STATS:
+            with runtime.profile_scope("moe.packed.offset_exact_stats"):
+                local_assignment_count = int(counts.sum().item())
+            stats.moe_local_assignments += local_assignment_count
+            if local_assignment_count == 0:
+                stats.moe_empty_local_dispatches += 1
+    return routed
+
+
 def _tp_moe_grouped_dispatch_offsets_eligibility(
     flat: Any,
     packed_tokens: Any,
@@ -1125,6 +1326,60 @@ def _record_native_assignment_offsets_fallback(stats: Any, reason: str) -> None:
         stats.moe_native_assignment_offsets_fallback_exception += 1
     else:
         stats.moe_native_assignment_offsets_fallback_shape += 1
+
+
+def _record_native_tensor_core_call(stats: Any, *, eligible: bool) -> None:
+    if stats is None:
+        return
+    stats.moe_native_tensor_core_calls += 1
+    if eligible:
+        stats.moe_native_tensor_core_eligible += 1
+
+
+def _record_native_tensor_core_fallback(stats: Any, reason: str) -> None:
+    if stats is None:
+        return
+    stats.moe_native_tensor_core_fallbacks += 1
+    if reason == "disabled":
+        stats.moe_native_tensor_core_fallback_disabled += 1
+    elif reason == "small":
+        stats.moe_native_tensor_core_fallback_small += 1
+    elif reason == "device":
+        stats.moe_native_tensor_core_fallback_device += 1
+    elif reason == "dtype":
+        stats.moe_native_tensor_core_fallback_dtype += 1
+    elif reason == "exception":
+        stats.moe_native_tensor_core_fallback_exception += 1
+    else:
+        stats.moe_native_tensor_core_fallback_shape += 1
+
+
+def _record_native_grouped_dispatch_offsets_segmented_call(stats: Any, *, eligible: bool) -> None:
+    if stats is None:
+        return
+    stats.moe_native_grouped_dispatch_offsets_segmented_calls += 1
+    if eligible:
+        stats.moe_native_grouped_dispatch_offsets_segmented_eligible += 1
+
+
+def _record_native_grouped_dispatch_offsets_segmented_fallback(stats: Any, reason: str) -> None:
+    if stats is None:
+        return
+    stats.moe_native_grouped_dispatch_offsets_segmented_fallbacks += 1
+    if reason == "disabled":
+        stats.moe_native_grouped_dispatch_offsets_segmented_fallback_disabled += 1
+    elif reason == "small":
+        stats.moe_native_grouped_dispatch_offsets_segmented_fallback_small += 1
+    elif reason == "missing_scale":
+        stats.moe_native_grouped_dispatch_offsets_segmented_fallback_missing_scale += 1
+    elif reason == "device":
+        stats.moe_native_grouped_dispatch_offsets_segmented_fallback_device += 1
+    elif reason == "dtype":
+        stats.moe_native_grouped_dispatch_offsets_segmented_fallback_dtype += 1
+    elif reason == "exception":
+        stats.moe_native_grouped_dispatch_offsets_segmented_fallback_exception += 1
+    else:
+        stats.moe_native_grouped_dispatch_offsets_segmented_fallback_shape += 1
 
 
 def _record_native_grouped_dispatch_offsets_call(stats: Any, *, eligible: bool) -> None:

@@ -57,6 +57,20 @@ torch::Tensor moe_grouped_dispatch_offsets_fp8_e4m3_bf16(
     std::vector<torch::Tensor> down_weights,
     std::vector<torch::Tensor> down_scales,
     int64_t token_count);
+torch::Tensor moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16(
+    torch::Tensor flat_hidden,
+    torch::Tensor packed_tokens,
+    torch::Tensor packed_scores,
+    torch::Tensor counts,
+    torch::Tensor offsets,
+    int64_t expert_start,
+    std::vector<torch::Tensor> gate_weights,
+    std::vector<torch::Tensor> gate_scales,
+    std::vector<torch::Tensor> up_weights,
+    std::vector<torch::Tensor> up_scales,
+    std::vector<torch::Tensor> down_weights,
+    std::vector<torch::Tensor> down_scales,
+    int64_t token_count);
 std::tuple<torch::Tensor, torch::Tensor> linear_attention_recurrent_core(
     torch::Tensor query,
     torch::Tensor key,

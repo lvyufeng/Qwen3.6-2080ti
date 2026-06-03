@@ -312,6 +312,12 @@ def test_cli_tp_generate_single_rank(tmp_path: Path, capsys, monkeypatch: pytest
     assert "tp_generate_dispatch_moe_native_grouped_dispatch_fallback_small:" in out
     assert "tp_generate_dispatch_moe_native_grouped_dispatch_offsets_calls:" in out
     assert "tp_generate_dispatch_moe_native_grouped_dispatch_offsets_fallback_device:" in out
+    assert "tp_generate_dispatch_moe_native_grouped_dispatch_offsets_segmented_calls:" in out
+    assert "tp_generate_dispatch_moe_native_grouped_dispatch_offsets_segmented_fallback_small:" in out
+    assert "tp_generate_dispatch_moe_native_grouped_dispatch_offsets_segmented_capacity:" in out
+    assert "tp_generate_dispatch_moe_native_tensor_core_calls:" in out
+    assert "tp_generate_dispatch_moe_native_tensor_core_hits:" in out
+    assert "tp_generate_dispatch_moe_native_tensor_core_fallback_disabled:" in out
     assert "tp_generate_paged_attention_calls:" in out
     assert "tp_generate_paged_attention_dense_fallbacks:" in out
     assert "tp_generate_kv_full_attention_layers: 1" in out

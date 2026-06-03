@@ -30,6 +30,8 @@ from tp_runtime import (
     _try_native_moe_assignment_offsets,
     _try_native_moe_grouped_dispatch,
     _try_native_moe_grouped_dispatch_offsets,
+    _try_native_moe_grouped_dispatch_offsets_segmented,
+    _try_native_moe_grouped_dispatch_offsets_tensor_core,
 )
 from loader import TensorLoader
 from weight_mapping import (
@@ -314,6 +316,127 @@ def test_native_grouped_dispatch_offsets_records_cpu_fallback() -> None:
     assert stats.moe_native_grouped_dispatch_offsets_hits == 0
     assert stats.moe_native_grouped_dispatch_offsets_fallbacks == 1
     assert stats.moe_native_grouped_dispatch_offsets_fallback_device == 1
+
+
+def test_native_grouped_dispatch_offsets_tensor_core_records_cpu_fallback() -> None:
+    stats = LinearDispatchStats()
+    loader = _FakeLoader(_moe_test_tensors())
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    config = _config_with_experts_per_token(2, packed=True)
+    weights = ReferenceWeights(loader)
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        routed = _try_native_moe_grouped_dispatch_offsets_tensor_core(
+            torch.zeros((128, 2), dtype=torch.float32),
+            torch.zeros((256,), dtype=torch.long),
+            torch.ones((256,), dtype=torch.float32),
+            torch.ones((2,), dtype=torch.long) * 128,
+            torch.tensor([0, 128], dtype=torch.long),
+            mapping,
+            config,
+            weights,
+            runtime,
+            stats,
+            token_count=128,
+        )
+
+    assert routed is None
+    assert stats.moe_native_tensor_core_calls == 1
+    assert stats.moe_native_tensor_core_eligible == 0
+    assert stats.moe_native_tensor_core_hits == 0
+    assert stats.moe_native_tensor_core_fallbacks == 1
+    assert stats.moe_native_tensor_core_fallback_device == 1
+
+
+def test_native_grouped_dispatch_offsets_tensor_core_records_disabled_fallback() -> None:
+    stats = LinearDispatchStats()
+    loader = _FakeLoader(_moe_test_tensors())
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    base = _config_with_experts_per_token(2, packed=True)
+    config = replace(base, moe=replace(base.moe, native_fused_expert_dispatch=False))
+    weights = ReferenceWeights(loader)
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        routed = _try_native_moe_grouped_dispatch_offsets_tensor_core(
+            torch.zeros((2, 2), dtype=torch.float32),
+            torch.zeros((4,), dtype=torch.long),
+            torch.ones((4,), dtype=torch.float32),
+            torch.ones((2,), dtype=torch.long),
+            torch.tensor([0, 2], dtype=torch.long),
+            mapping,
+            config,
+            weights,
+            runtime,
+            stats,
+            token_count=2,
+        )
+
+    assert routed is None
+    assert stats.moe_native_tensor_core_calls == 1
+    assert stats.moe_native_tensor_core_eligible == 0
+    assert stats.moe_native_tensor_core_hits == 0
+    assert stats.moe_native_tensor_core_fallbacks == 1
+    assert stats.moe_native_tensor_core_fallback_disabled == 1
+
+
+def test_native_grouped_dispatch_offsets_segmented_records_small_fallback() -> None:
+    stats = LinearDispatchStats()
+    loader = _FakeLoader(_moe_test_tensors())
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    config = _config_with_experts_per_token(2, packed=True)
+    weights = ReferenceWeights(loader)
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        routed = _try_native_moe_grouped_dispatch_offsets_segmented(
+            torch.zeros((2, 2), dtype=torch.float32),
+            torch.zeros((4,), dtype=torch.long),
+            torch.ones((4,), dtype=torch.float32),
+            torch.ones((2,), dtype=torch.long),
+            torch.tensor([0, 2], dtype=torch.long),
+            mapping,
+            config,
+            weights,
+            runtime,
+            stats,
+            token_count=2,
+        )
+
+    assert routed is None
+    assert stats.moe_native_grouped_dispatch_offsets_segmented_calls == 1
+    assert stats.moe_native_grouped_dispatch_offsets_segmented_eligible == 0
+    assert stats.moe_native_grouped_dispatch_offsets_segmented_hits == 0
+    assert stats.moe_native_grouped_dispatch_offsets_segmented_fallbacks == 1
+    assert stats.moe_native_grouped_dispatch_offsets_segmented_fallback_small == 1
+
+
+def test_native_grouped_dispatch_offsets_segmented_records_cpu_fallback() -> None:
+    stats = LinearDispatchStats()
+    loader = _FakeLoader(_moe_test_tensors())
+    mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
+    config = _config_with_experts_per_token(2, packed=True)
+    weights = ReferenceWeights(loader)
+
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        routed = _try_native_moe_grouped_dispatch_offsets_segmented(
+            torch.zeros((32, 2), dtype=torch.float32),
+            torch.zeros((256,), dtype=torch.long),
+            torch.ones((256,), dtype=torch.float32),
+            torch.ones((2,), dtype=torch.long) * 128,
+            torch.tensor([0, 128], dtype=torch.long),
+            mapping,
+            config,
+            weights,
+            runtime,
+            stats,
+            token_count=32,
+        )
+
+    assert routed is None
+    assert stats.moe_native_grouped_dispatch_offsets_segmented_calls == 1
+    assert stats.moe_native_grouped_dispatch_offsets_segmented_eligible == 0
+    assert stats.moe_native_grouped_dispatch_offsets_segmented_hits == 0
+    assert stats.moe_native_grouped_dispatch_offsets_segmented_fallbacks == 1
+    assert stats.moe_native_grouped_dispatch_offsets_segmented_fallback_device == 1
 
 
 def test_packed_tp_moe_accumulates_duplicate_token_assignments_with_single_scatter() -> None:

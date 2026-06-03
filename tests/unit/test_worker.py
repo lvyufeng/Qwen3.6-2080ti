@@ -249,6 +249,12 @@ def test_worker_load_then_generate_single_rank(tmp_path: Path, monkeypatch: pyte
     assert "moe_native_grouped_dispatch_fallback_small" in generate_result.data["dispatch"]
     assert "moe_native_grouped_dispatch_offsets_calls" in generate_result.data["dispatch"]
     assert "moe_native_grouped_dispatch_offsets_fallback_device" in generate_result.data["dispatch"]
+    assert "moe_native_grouped_dispatch_offsets_segmented_calls" in generate_result.data["dispatch"]
+    assert "moe_native_grouped_dispatch_offsets_segmented_fallback_small" in generate_result.data["dispatch"]
+    assert "moe_native_grouped_dispatch_offsets_segmented_capacity" in generate_result.data["dispatch"]
+    assert "moe_native_tensor_core_calls" in generate_result.data["dispatch"]
+    assert "moe_native_tensor_core_hits" in generate_result.data["dispatch"]
+    assert "moe_native_tensor_core_fallback_disabled" in generate_result.data["dispatch"]
     assert generate_result.data["paged_attention"]["calls"] >= 1
     assert generate_result.data["paged_attention"]["dense_fallbacks"] >= 1
     assert generate_result.data["paged_attention"]["native_hits"] == 0

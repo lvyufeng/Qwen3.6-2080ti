@@ -117,6 +117,28 @@ class LinearDispatchStats:
     moe_native_grouped_dispatch_offsets_fallback_shape: int = 0
     moe_native_grouped_dispatch_offsets_fallback_missing_scale: int = 0
     moe_native_grouped_dispatch_offsets_fallback_exception: int = 0
+    moe_native_grouped_dispatch_offsets_segmented_calls: int = 0
+    moe_native_grouped_dispatch_offsets_segmented_eligible: int = 0
+    moe_native_grouped_dispatch_offsets_segmented_hits: int = 0
+    moe_native_grouped_dispatch_offsets_segmented_fallbacks: int = 0
+    moe_native_grouped_dispatch_offsets_segmented_fallback_disabled: int = 0
+    moe_native_grouped_dispatch_offsets_segmented_fallback_small: int = 0
+    moe_native_grouped_dispatch_offsets_segmented_fallback_device: int = 0
+    moe_native_grouped_dispatch_offsets_segmented_fallback_dtype: int = 0
+    moe_native_grouped_dispatch_offsets_segmented_fallback_shape: int = 0
+    moe_native_grouped_dispatch_offsets_segmented_fallback_missing_scale: int = 0
+    moe_native_grouped_dispatch_offsets_segmented_fallback_exception: int = 0
+    moe_native_grouped_dispatch_offsets_segmented_capacity: int = 0
+    moe_native_tensor_core_calls: int = 0
+    moe_native_tensor_core_eligible: int = 0
+    moe_native_tensor_core_hits: int = 0
+    moe_native_tensor_core_fallbacks: int = 0
+    moe_native_tensor_core_fallback_disabled: int = 0
+    moe_native_tensor_core_fallback_small: int = 0
+    moe_native_tensor_core_fallback_device: int = 0
+    moe_native_tensor_core_fallback_dtype: int = 0
+    moe_native_tensor_core_fallback_shape: int = 0
+    moe_native_tensor_core_fallback_exception: int = 0
 
 
 def embedding(input_ids: Any, weight: Any) -> Any:

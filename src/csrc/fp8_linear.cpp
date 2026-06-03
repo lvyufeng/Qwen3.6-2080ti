@@ -10,5 +10,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_packed_score_scatter_add", &moe_packed_score_scatter_add, "Qwen packed MoE score/scatter accumulation");
     m.def("moe_grouped_dispatch_fp8_e4m3_bf16", &moe_grouped_dispatch_fp8_e4m3_bf16, "Qwen grouped FP8 MoE dispatch");
     m.def("moe_grouped_dispatch_offsets_fp8_e4m3_bf16", &moe_grouped_dispatch_offsets_fp8_e4m3_bf16, "Qwen offset grouped FP8 MoE dispatch");
+    m.def("moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16", &moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16, "Qwen segmented offset grouped FP8 MoE dispatch");
     m.def("linear_attention_recurrent_core", &linear_attention_recurrent_core, "Qwen linear-attention recurrent gated-delta core");
 }
