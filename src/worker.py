@@ -827,6 +827,7 @@ def _generate_result_data(result: GenerateResult) -> dict[str, Any]:
         "rank": result.rank,
         "device": str(result.device),
         "fast_decode": result.fast_decode,
+        "cuda_graph_probe": result.cuda_graph_probe.to_dict(),
         "prompt_tokens": result.prompt_tokens,
         "max_new_tokens": result.max_new_tokens,
         "load_seconds": result.load_seconds,
@@ -859,6 +860,7 @@ def _runtime_data(result: GenerateResult) -> dict[str, Any]:
         "local_rank": result.local_rank,
         "device": str(result.device),
         "fast_decode": result.fast_decode,
+        "cuda_graph_probe": result.cuda_graph_probe.to_dict(),
     }
 
 
@@ -914,6 +916,9 @@ def _dispatch_stats_data(result: GenerateResult) -> dict[str, Any]:
         "moe_calls": dispatch.moe_calls,
         "moe_packed_calls": dispatch.moe_packed_calls,
         "moe_loop_calls": dispatch.moe_loop_calls,
+        "moe_single_token_dispatch_calls": dispatch.moe_single_token_dispatch_calls,
+        "moe_single_token_dispatch_hits": dispatch.moe_single_token_dispatch_hits,
+        "moe_single_token_local_assignments": dispatch.moe_single_token_local_assignments,
         "moe_assignments": dispatch.moe_assignments,
         "moe_local_assignments": dispatch.moe_local_assignments,
         "moe_active_expert_groups": dispatch.moe_active_expert_groups,

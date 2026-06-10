@@ -559,7 +559,8 @@ def test_native_grouped_dispatch_offsets_segmented_records_cpu_fallback() -> Non
     assert stats.moe_native_grouped_dispatch_offsets_segmented_fallback_device == 1
 
 
-def test_packed_tp_moe_accumulates_duplicate_token_assignments_with_single_scatter() -> None:
+def test_packed_tp_moe_single_token_path_accumulates_duplicate_assignments(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tp_runtime, "_NATIVE_MOE_SINGLE_TOKEN_DISPATCH_ENABLED", True)
     hidden = torch.tensor([[[1.0, 0.0]]])
     loader = _FakeLoader(_moe_test_tensors())
     mapping = _moe_mapping((0, 1), TensorParallel(world_size=1, rank=0))
@@ -573,19 +574,17 @@ def test_packed_tp_moe_accumulates_duplicate_token_assignments_with_single_scatt
         actual = tp_moe(hidden, mapping, packed_config, weights, runtime)
 
     torch.testing.assert_close(actual, expected)
+    assert weights.dispatch_stats.moe_single_token_dispatch_calls == 1
+    assert weights.dispatch_stats.moe_single_token_dispatch_hits == 1
+    assert weights.dispatch_stats.moe_single_token_local_assignments == 2
     assert weights.dispatch_stats.moe_local_assignments == 2
     assert weights.dispatch_stats.moe_active_expert_groups == 2
-    assert weights.dispatch_stats.moe_packed_index_add_calls == 1
-    assert weights.dispatch_stats.moe_packed_single_scatter_calls == 1
+    assert weights.dispatch_stats.moe_packed_index_add_calls == 0
+    assert weights.dispatch_stats.moe_packed_single_scatter_calls == 0
     assert weights.dispatch_stats.moe_group_size_1 == 2
-    assert weights.dispatch_stats.moe_native_assignment_offsets_calls == 1
-    assert weights.dispatch_stats.moe_native_assignment_offsets_fallback_device == 1
-    assert weights.dispatch_stats.moe_native_scatter_calls == 1
-    assert weights.dispatch_stats.moe_native_scatter_hits == 0
-    assert weights.dispatch_stats.moe_native_scatter_fallback_small == 1
-    assert weights.dispatch_stats.moe_native_grouped_dispatch_calls == 1
-    assert weights.dispatch_stats.moe_native_grouped_dispatch_hits == 0
-    assert weights.dispatch_stats.moe_native_grouped_dispatch_fallback_small == 1
+    assert weights.dispatch_stats.moe_native_assignment_offsets_calls == 0
+    assert weights.dispatch_stats.moe_native_scatter_calls == 0
+    assert weights.dispatch_stats.moe_native_grouped_dispatch_calls == 0
 
 
 def test_two_rank_packed_tp_moe_matches_loop(tmp_path: Path) -> None:

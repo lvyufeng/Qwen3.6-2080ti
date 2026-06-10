@@ -28,6 +28,22 @@ class CudaMemoryStats:
 
 
 @dataclass(frozen=True)
+class CudaGraphProbeResult:
+    enabled: bool
+    eligible: bool
+    reasons: tuple[str, ...]
+    notes: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "eligible": self.eligible,
+            "reasons": list(self.reasons),
+            "notes": list(self.notes),
+        }
+
+
+@dataclass(frozen=True)
 class GenerateResult:
     backend: str
     world_size: int
@@ -35,6 +51,7 @@ class GenerateResult:
     local_rank: int
     device: Any
     fast_decode: bool
+    cuda_graph_probe: CudaGraphProbeResult
     prompt_tokens: int
     max_new_tokens: int
     layers: int
@@ -79,6 +96,7 @@ class GenerationRequestState:
     total_start: float
     prefill_seconds: float
     fast_decode: bool = False
+    cuda_graph_probe: bool = False
     generated_token_ids: list[int] = field(default_factory=list)
     generated_token_tensors: list[Any] = field(default_factory=list)
     step_all_finite: list[bool] = field(default_factory=list)
@@ -145,8 +163,8 @@ class TpModelSession:
             raise
         return self
 
-    def generate(self, prompt: str, max_new_tokens: int, *, fast_decode: bool = False) -> GenerateResult:
-        state = self.start_generation(prompt, max_new_tokens, fast_decode=fast_decode)
+    def generate(self, prompt: str, max_new_tokens: int, *, fast_decode: bool = False, cuda_graph_probe: bool = False) -> GenerateResult:
+        state = self.start_generation(prompt, max_new_tokens, fast_decode=fast_decode, cuda_graph_probe=cuda_graph_probe)
         try:
             while not state.completed:
                 self.step_generation(state)
@@ -155,7 +173,7 @@ class TpModelSession:
             state.decode_state.release()
             raise
 
-    def start_generation(self, prompt: str, max_new_tokens: int, *, fast_decode: bool = False) -> GenerationRequestState:
+    def start_generation(self, prompt: str, max_new_tokens: int, *, fast_decode: bool = False, cuda_graph_probe: bool = False) -> GenerationRequestState:
         import time
 
         runtime, weights, _load_stats = self._require_loaded_components()
@@ -191,6 +209,7 @@ class TpModelSession:
             total_start=total_start,
             prefill_seconds=_elapsed_seconds(prefill_start, prefill_end),
             fast_decode=fast_decode,
+            cuda_graph_probe=cuda_graph_probe,
             completed=max_new_tokens == 0,
         )
 
@@ -360,6 +379,15 @@ class TpModelSession:
             local_rank=self.launch.local_rank,
             device=runtime.device,
             fast_decode=state.fast_decode,
+            cuda_graph_probe=_cuda_graph_probe_result(
+                enabled=state.cuda_graph_probe,
+                launch=self.launch,
+                config=self.runtime_config,
+                state=state,
+                paged_attention=runtime.paged_attention_stats.snapshot(),
+                profile=profile,
+                kv_cache=kv_cache,
+            ),
             prompt_tokens=state.prompt_tokens,
             max_new_tokens=state.max_new_tokens,
             layers=len(self.mapping.layers),
@@ -438,9 +466,59 @@ class TpModelRunner:
         self.tp = TensorParallel(world_size=launch.world_size, rank=launch.rank)
         self.mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=self.tp)
 
-    def generate(self, prompt: str, max_new_tokens: int, *, fast_decode: bool = False) -> GenerateResult:
+    def generate(self, prompt: str, max_new_tokens: int, *, fast_decode: bool = False, cuda_graph_probe: bool = False) -> GenerateResult:
         with TpModelSession(self.manifest, self.runtime_config, self.launch, profile_config=self.profile_config) as session:
-            return session.generate(prompt, max_new_tokens, fast_decode=fast_decode)
+            return session.generate(prompt, max_new_tokens, fast_decode=fast_decode, cuda_graph_probe=cuda_graph_probe)
+
+
+def _cuda_graph_probe_result(
+    *,
+    enabled: bool,
+    launch: TpLaunchConfig,
+    config: RuntimeConfig,
+    state: GenerationRequestState,
+    paged_attention: PagedAttentionDispatchStats,
+    profile: RuntimeProfileStats,
+    kv_cache: KVCacheStats,
+) -> CudaGraphProbeResult:
+    if not enabled:
+        return CudaGraphProbeResult(enabled=False, eligible=False, reasons=())
+    reasons: list[str] = []
+    notes: list[str] = [
+        "probe_only_no_cuda_graph_capture_attempted",
+        "prefill_excluded_candidate_is_decode_seq_len_1_local_logits_forward",
+    ]
+    if state.max_new_tokens <= 0:
+        reasons.append("no_decode_tokens")
+    if launch.world_size > 1:
+        reasons.append("tp_collectives_not_static_preallocated")
+    if not config.full_attention.paged_kv_metadata or not config.full_attention.native_paged_attention:
+        reasons.append("native_paged_attention_required")
+    allowed_prefill_fallbacks = config.full_attention_layers
+    expected_decode_native_hits = config.full_attention_layers * max(state.max_new_tokens - 1, 0)
+    if paged_attention.native_hits < expected_decode_native_hits:
+        reasons.append("native_paged_attention_not_all_decode_hits")
+    if paged_attention.dense_fallbacks > allowed_prefill_fallbacks:
+        reasons.append("dense_attention_fallback_during_decode")
+    if kv_cache.page_table_tensor_calls_total:
+        reasons.append("page_table_tensors_recreated_each_step")
+    if kv_cache.growth_events_total:
+        notes.append("kv_cache_growth_events_observed_prefill_or_setup")
+    if config.linear_attention_layers:
+        reasons.append("linear_attention_state_not_static_inplace")
+    if config.moe.num_experts and config.moe.experts_per_token:
+        reasons.append("moe_dynamic_route_dispatch")
+    scope_names = set(profile.scopes)
+    if any(name.startswith("batch.") for name in scope_names):
+        reasons.append("batched_decode_not_supported")
+    if any(name.endswith("dense_fallback") for name in scope_names):
+        notes.append("dense_fallback_scope_observed_prefill_is_allowed_decode_is_not")
+    return CudaGraphProbeResult(
+        enabled=True,
+        eligible=not reasons,
+        reasons=tuple(dict.fromkeys(reasons)),
+        notes=tuple(notes),
+    )
 
 
 def materialize_generated_token_ids(state: GenerationRequestState) -> None:

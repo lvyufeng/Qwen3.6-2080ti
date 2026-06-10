@@ -316,6 +316,8 @@ def test_cli_tp_generate_single_rank(tmp_path: Path, capsys, monkeypatch: pytest
     assert "tp_generate_rank: 0" in out
     assert "tp_generate_device: cpu" in out
     assert "tp_generate_fast_decode: False" in out
+    assert "tp_generate_cuda_graph_probe_enabled: False" in out
+    assert "tp_generate_cuda_graph_probe_eligible: False" in out
     assert "tp_generate_loaded_tensors:" in out
     assert "tp_generate_loaded_bytes:" in out
     assert "tp_generate_load_seconds:" in out
@@ -325,6 +327,9 @@ def test_cli_tp_generate_single_rank(tmp_path: Path, capsys, monkeypatch: pytest
     assert "tp_generate_decode_tokens_per_second:" in out
     assert "tp_generate_total_tokens_per_second:" in out
     assert "tp_generate_dispatch_calls:" in out
+    assert "tp_generate_dispatch_moe_single_token_dispatch_calls:" in out
+    assert "tp_generate_dispatch_moe_single_token_dispatch_hits:" in out
+    assert "tp_generate_dispatch_moe_single_token_local_assignments:" in out
     assert "tp_generate_dispatch_moe_packed_single_scatter_calls:" in out
     assert "tp_generate_dispatch_moe_native_assignment_hits:" in out
     assert "tp_generate_dispatch_moe_native_assignment_offsets_calls:" in out
@@ -399,6 +404,7 @@ def test_cli_tp_generate_fast_decode_flag(tmp_path: Path, capsys, monkeypatch: p
             "2",
             "--tp-generate",
             "--tp-fast-decode",
+            "--tp-cuda-graph-probe",
             "--tp-world-size",
             "1",
             "--tp-backend",
@@ -411,6 +417,10 @@ def test_cli_tp_generate_fast_decode_flag(tmp_path: Path, capsys, monkeypatch: p
     out = capsys.readouterr().out
     assert rc == 0
     assert "tp_generate_fast_decode: True" in out
+    assert "tp_generate_cuda_graph_probe_enabled: True" in out
+    assert "tp_generate_cuda_graph_probe_eligible: False" in out
+    assert "native_paged_attention_required" in out
+    assert "moe_dynamic_route_dispatch" in out
     assert "tp_generate_generated_token_ids:" in out
     assert "tp_generate_text: decoded:" in out
 

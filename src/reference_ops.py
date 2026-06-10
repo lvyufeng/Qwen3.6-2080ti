@@ -44,6 +44,9 @@ class LinearDispatchStats:
     moe_calls: int = 0
     moe_packed_calls: int = 0
     moe_loop_calls: int = 0
+    moe_single_token_dispatch_calls: int = 0
+    moe_single_token_dispatch_hits: int = 0
+    moe_single_token_local_assignments: int = 0
     moe_assignments: int = 0
     moe_local_assignments: int = 0
     moe_active_expert_groups: int = 0

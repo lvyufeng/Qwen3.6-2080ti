@@ -42,6 +42,7 @@ _NATIVE_MOE_ASSIGNMENT_PARALLEL_MIN_ASSIGNMENTS = int(os.environ.get("QWEN36_NAT
 _NATIVE_MOE_ASSIGNMENT_PARALLEL_MAX_ASSIGNMENTS = int(os.environ.get("QWEN36_NATIVE_MOE_ASSIGNMENT_PARALLEL_MAX_ASSIGNMENTS", "512"))
 _NATIVE_MOE_TENSOR_CORE_ENABLED = os.environ.get("QWEN36_NATIVE_MOE_TENSOR_CORE", "1") != "0"
 _NATIVE_MOE_TENSOR_CORE_MIN_ASSIGNMENTS = int(os.environ.get("QWEN36_NATIVE_MOE_TENSOR_CORE_MIN_ASSIGNMENTS", "128"))
+_NATIVE_MOE_SINGLE_TOKEN_DISPATCH_ENABLED = os.environ.get("QWEN36_NATIVE_MOE_SINGLE_TOKEN_DISPATCH", "0") != "0"
 _NATIVE_MOE_EXACT_OFFSET_STATS = os.environ.get("QWEN36_NATIVE_MOE_EXACT_OFFSET_STATS", "0") == "1"
 
 
@@ -903,10 +904,69 @@ def _tp_moe_per_expert_loop(flat: Any, routing: TopKRouting, mapping: MoEMapping
     return routed
 
 
+def _try_tp_moe_single_token_local_experts(
+    flat: Any,
+    routing: TopKRouting,
+    mapping: MoEMapping,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    stats: Any,
+) -> Any | None:
+    if not _NATIVE_MOE_SINGLE_TOKEN_DISPATCH_ENABLED:
+        return None
+    if int(flat.shape[0]) != 1:
+        return None
+    import torch
+
+    if stats is not None:
+        stats.moe_single_token_dispatch_calls += 1
+    indices = routing.indices[0]
+    scores = routing.scores[0]
+    local_mask = (indices >= mapping.expert_start) & (indices < mapping.expert_end)
+    local_positions = torch.nonzero(local_mask, as_tuple=False).flatten()
+    local_count = int(local_positions.numel())
+    routed = torch.zeros_like(flat.float())
+    if stats is not None:
+        stats.moe_single_token_local_assignments += local_count
+        stats.moe_local_assignments += local_count
+    if local_count == 0:
+        if stats is not None:
+            stats.moe_empty_local_dispatches += 1
+            stats.moe_single_token_dispatch_hits += 1
+        return routed
+
+    expert_by_index = _tp_moe_expert_by_index(mapping)
+    if stats is not None:
+        stats.moe_active_expert_groups += local_count
+        stats.moe_max_group_tokens = max(stats.moe_max_group_tokens, 1)
+        stats.moe_group_size_1 += local_count
+    with runtime.profile_scope("moe.single_token.group_loop"):
+        for position in local_positions.tolist():
+            expert_id = int(indices[position].item())
+            expert = expert_by_index[expert_id]
+            token_output = _tp_moe_expert_group(flat, expert, config, weights, runtime)
+            routed.add_(token_output.float() * scores[position])
+    if stats is not None:
+        stats.moe_single_token_dispatch_hits += 1
+    return routed
+
+
 def _tp_moe_packed_local_experts(flat: Any, routing: TopKRouting, mapping: MoEMapping, config: RuntimeConfig, weights: ReferenceWeights, runtime: TpRuntime) -> Any:
     import torch
 
     stats = getattr(weights, "dispatch_stats", None)
+    single_token_routed = _try_tp_moe_single_token_local_experts(
+        flat,
+        routing,
+        mapping,
+        config,
+        weights,
+        runtime,
+        stats,
+    )
+    if single_token_routed is not None:
+        return single_token_routed
     offset_routed = _try_native_moe_offsets_fast_path(
         flat,
         routing,

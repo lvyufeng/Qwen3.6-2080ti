@@ -51,6 +51,23 @@ def test_tp_model_runner_generate_single_rank_cpu_gloo(tmp_path: Path, monkeypat
     assert result.kv_cache.full_attention_layers == 1
     assert result.kv_cache.valid_tokens_total > 0
     assert result.kv_cache.capacity_tokens_total >= result.kv_cache.valid_tokens_total
+    assert result.cuda_graph_probe.enabled is False
+    assert result.cuda_graph_probe.eligible is False
+
+
+def test_tp_model_session_cuda_graph_probe_reports_blockers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    manifest = build_manifest(tmp_path)
+    runner = TpModelRunner(manifest, parse_runtime_config(manifest.config), TpLaunchConfig(backend="gloo", device="cpu"))
+
+    result = runner.generate("hello", max_new_tokens=2, cuda_graph_probe=True)
+
+    assert result.cuda_graph_probe.enabled is True
+    assert result.cuda_graph_probe.eligible is False
+    assert "native_paged_attention_required" in result.cuda_graph_probe.reasons
+    assert "moe_dynamic_route_dispatch" in result.cuda_graph_probe.reasons
+    assert "probe_only_no_cuda_graph_capture_attempted" in result.cuda_graph_probe.notes
 
 
 def test_tp_model_session_profile_enabled_records_scopes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

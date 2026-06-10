@@ -302,10 +302,11 @@ def _summarize_tp_generate(
     device: str | None,
     profile_config: RuntimeProfileConfig | None = None,
     fast_decode: bool = False,
+    cuda_graph_probe: bool = False,
 ) -> list[str]:
     launch = _tp_launch_from_args(world_size, rank, local_rank, backend, init_method, device)
     runner = TpModelRunner(manifest, runtime_config, launch, profile_config=profile_config)
-    return _format_tp_generate_result(runner.generate(prompt, max_new_tokens, fast_decode=fast_decode))
+    return _format_tp_generate_result(runner.generate(prompt, max_new_tokens, fast_decode=fast_decode, cuda_graph_probe=cuda_graph_probe))
 
 
 def _format_tp_generate_result(result: GenerateResult) -> list[str]:
@@ -317,6 +318,10 @@ def _format_tp_generate_result(result: GenerateResult) -> list[str]:
         f"tp_generate_local_rank: {result.local_rank}",
         f"tp_generate_device: {result.device}",
         f"tp_generate_fast_decode: {result.fast_decode}",
+        f"tp_generate_cuda_graph_probe_enabled: {result.cuda_graph_probe.enabled}",
+        f"tp_generate_cuda_graph_probe_eligible: {result.cuda_graph_probe.eligible}",
+        f"tp_generate_cuda_graph_probe_reasons: {','.join(result.cuda_graph_probe.reasons)}",
+        f"tp_generate_cuda_graph_probe_notes: {','.join(result.cuda_graph_probe.notes)}",
         f"tp_generate_prompt_tokens: {result.prompt_tokens}",
         f"tp_generate_max_new_tokens: {result.max_new_tokens}",
         f"tp_generate_layers: {result.layers}",
@@ -347,6 +352,9 @@ def _format_tp_generate_result(result: GenerateResult) -> list[str]:
         f"tp_generate_dispatch_moe_calls: {dispatch.moe_calls}",
         f"tp_generate_dispatch_moe_packed_calls: {dispatch.moe_packed_calls}",
         f"tp_generate_dispatch_moe_loop_calls: {dispatch.moe_loop_calls}",
+        f"tp_generate_dispatch_moe_single_token_dispatch_calls: {dispatch.moe_single_token_dispatch_calls}",
+        f"tp_generate_dispatch_moe_single_token_dispatch_hits: {dispatch.moe_single_token_dispatch_hits}",
+        f"tp_generate_dispatch_moe_single_token_local_assignments: {dispatch.moe_single_token_local_assignments}",
         f"tp_generate_dispatch_moe_assignments: {dispatch.moe_assignments}",
         f"tp_generate_dispatch_moe_local_assignments: {dispatch.moe_local_assignments}",
         f"tp_generate_dispatch_moe_active_expert_groups: {dispatch.moe_active_expert_groups}",
@@ -1284,6 +1292,7 @@ def run(args: argparse.Namespace) -> int:
                 args.tp_device,
                 _profile_config_from_args(args),
                 fast_decode=args.tp_fast_decode,
+                cuda_graph_probe=args.tp_cuda_graph_probe,
             ):
                 print(line)
         except (ConfigError, EngineError, MappingError, LoaderError, TpRuntimeError, CliError) as exc:
@@ -1337,7 +1346,14 @@ def run(args: argparse.Namespace) -> int:
                     for _ in range(args.tp_benchmark_warmup):
                         session.generate(benchmark_prompt, args.max_new_tokens, fast_decode=args.tp_fast_decode)
                     for _ in range(args.tp_benchmark_iterations):
-                        results.append(session.generate(benchmark_prompt, args.max_new_tokens, fast_decode=args.tp_fast_decode))
+                        results.append(
+                            session.generate(
+                                benchmark_prompt,
+                                args.max_new_tokens,
+                                fast_decode=args.tp_fast_decode,
+                                cuda_graph_probe=args.tp_cuda_graph_probe,
+                            )
+                        )
                     lines = _format_tp_benchmark_results(
                         results,
                         warmup_iterations=args.tp_benchmark_warmup,
@@ -1503,6 +1519,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--tp-fast-decode",
         action="store_true",
         help="Skip avoidable per-token CUDA synchronizations and diagnostics in TP generate/benchmark/service decode loops.",
+    )
+    parser.add_argument(
+        "--tp-cuda-graph-probe",
+        action="store_true",
+        help="Report CUDA graph decode-readiness blockers without attempting capture or replay.",
     )
     parser.add_argument(
         "--tp-benchmark-iterations",
