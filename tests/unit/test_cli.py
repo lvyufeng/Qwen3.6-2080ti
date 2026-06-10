@@ -315,6 +315,7 @@ def test_cli_tp_generate_single_rank(tmp_path: Path, capsys, monkeypatch: pytest
     assert "tp_generate_world_size: 1" in out
     assert "tp_generate_rank: 0" in out
     assert "tp_generate_device: cpu" in out
+    assert "tp_generate_fast_decode: False" in out
     assert "tp_generate_loaded_tensors:" in out
     assert "tp_generate_loaded_bytes:" in out
     assert "tp_generate_load_seconds:" in out
@@ -356,6 +357,62 @@ def test_cli_tp_generate_single_rank(tmp_path: Path, capsys, monkeypatch: pytest
     assert "tp_generate_generated_token_ids:" in out
     assert "tp_generate_text: decoded:" in out
     assert "inference: not implemented yet" not in out
+
+
+def test_cli_tp_generate_fast_decode_flag(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _runtime_config()
+    text = config["text_config"]
+    text["hidden_size"] = 256
+    text["vocab_size"] = 320
+    text["num_hidden_layers"] = 1
+    text["layer_types"] = ["full_attention"]
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    tensors = {
+        "model.language_model.embed_tokens.weight": ("BF16", (320, 256)),
+        "model.language_model.norm.weight": ("BF16", (256,)),
+        "lm_head.weight": ("BF16", (320, 256)),
+    }
+    add_full_attention_layer(tensors, 0)
+    add_moe(tensors, 0)
+    write_safetensors(tmp_path / "model.safetensors", tensors)
+
+    class FakeTokenizer:
+        def __call__(self, prompt: str, *, return_tensors: str, add_special_tokens: bool):
+            assert return_tensors == "pt"
+            assert add_special_tokens is True
+            return {"input_ids": torch.tensor([[1, 2]])}
+
+        def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+            assert skip_special_tokens is False
+            return "decoded:" + ",".join(str(token_id) for token_id in token_ids)
+
+    transformers = pytest.importorskip("transformers")
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *_, **__: FakeTokenizer())
+
+    rc = main(
+        [
+            "--model",
+            str(tmp_path),
+            "--prompt",
+            "hello",
+            "--max-new-tokens",
+            "2",
+            "--tp-generate",
+            "--tp-fast-decode",
+            "--tp-world-size",
+            "1",
+            "--tp-backend",
+            "gloo",
+            "--tp-device",
+            "cpu",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "tp_generate_fast_decode: True" in out
+    assert "tp_generate_generated_token_ids:" in out
+    assert "tp_generate_text: decoded:" in out
 
 
 def test_cli_tp_generate_with_profile_prints_profile_lines(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -594,7 +651,50 @@ def test_cli_tp_worker_runs_protocol_loop_without_human_stdout(
     assert len(calls) == 1
     state, runtime = calls[0]
     assert isinstance(state, cli.WorkerState)
+    assert state.fast_decode is False
     assert str(runtime.device) == "cpu"
+
+
+def test_cli_tp_worker_passes_fast_decode_flag(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(_runtime_config()), encoding="utf-8")
+    (tmp_path / "model.safetensors").write_bytes(b"\x02\x00\x00\x00\x00\x00\x00\x00{}")
+    calls = []
+
+    def fake_protocol_loop(state, runtime):
+        calls.append((state, runtime))
+        print('{"ok":true}')
+
+    monkeypatch.setattr(cli, "run_worker_protocol_loop", fake_protocol_loop)
+
+    rc = main(
+        [
+            "--model",
+            str(tmp_path),
+            "--prompt",
+            "unused",
+            "--max-new-tokens",
+            "1",
+            "--tp-worker",
+            "--tp-fast-decode",
+            "--tp-world-size",
+            "1",
+            "--tp-backend",
+            "gloo",
+            "--tp-device",
+            "cpu",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out == '{"ok":true}\n'
+    assert len(calls) == 1
+    state, _runtime = calls[0]
+    assert state.fast_decode is True
 
 
 

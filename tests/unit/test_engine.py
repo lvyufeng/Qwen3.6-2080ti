@@ -396,6 +396,57 @@ def test_step_generations_batch_skips_redundant_token_broadcast(tmp_path: Path, 
     assert sync_calls == 0
 
 
+def test_tp_model_session_fast_decode_defers_step_syncs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    manifest = build_manifest(tmp_path)
+
+    with TpModelSession(manifest, parse_runtime_config(manifest.config), TpLaunchConfig(backend="gloo", device="cpu")) as session:
+        state = session.start_generation("hello", max_new_tokens=2, fast_decode=True)
+        sync_device_calls = 0
+        sync_token_calls = 0
+        isfinite_calls = 0
+        original_isfinite = torch.isfinite
+
+        def counted_sync_device(device):
+            nonlocal sync_device_calls
+            sync_device_calls += 1
+
+        def counted_sync_token(next_token, runtime):
+            nonlocal sync_token_calls
+            sync_token_calls += 1
+            return next_token
+
+        def counted_isfinite(*args, **kwargs):
+            nonlocal isfinite_calls
+            isfinite_calls += 1
+            return original_isfinite(*args, **kwargs)
+
+        monkeypatch.setattr(engine, "_sync_device", counted_sync_device)
+        monkeypatch.setattr(engine, "_sync_next_token", counted_sync_token)
+        monkeypatch.setattr(torch, "isfinite", counted_isfinite)
+
+        first = session.step_generation(state)
+        second = session.step_generation(state)
+
+        assert first.token_id == -1
+        assert second.token_id == -1
+        assert state.generated_token_ids == [-1, -1]
+        assert sync_device_calls == 0
+        assert sync_token_calls == 0
+        assert isfinite_calls == 0
+
+        result = session.finish_generation(state)
+
+    assert sync_device_calls == 1
+    assert result.fast_decode is True
+    assert result.all_finite is True
+    assert len(result.generated_token_ids) == 2
+    assert all(token_id >= 0 for token_id in result.generated_token_ids)
+    assert result.text == "decoded:" + ",".join(str(token) for token in result.generated_token_ids)
+
+
+
 def _write_tiny_model(model_dir: Path) -> None:
     config = _runtime_config()
     text = config["text_config"]

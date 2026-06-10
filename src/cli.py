@@ -301,10 +301,11 @@ def _summarize_tp_generate(
     init_method: str | None,
     device: str | None,
     profile_config: RuntimeProfileConfig | None = None,
+    fast_decode: bool = False,
 ) -> list[str]:
     launch = _tp_launch_from_args(world_size, rank, local_rank, backend, init_method, device)
     runner = TpModelRunner(manifest, runtime_config, launch, profile_config=profile_config)
-    return _format_tp_generate_result(runner.generate(prompt, max_new_tokens))
+    return _format_tp_generate_result(runner.generate(prompt, max_new_tokens, fast_decode=fast_decode))
 
 
 def _format_tp_generate_result(result: GenerateResult) -> list[str]:
@@ -315,6 +316,7 @@ def _format_tp_generate_result(result: GenerateResult) -> list[str]:
         f"tp_generate_rank: {result.rank}",
         f"tp_generate_local_rank: {result.local_rank}",
         f"tp_generate_device: {result.device}",
+        f"tp_generate_fast_decode: {result.fast_decode}",
         f"tp_generate_prompt_tokens: {result.prompt_tokens}",
         f"tp_generate_max_new_tokens: {result.max_new_tokens}",
         f"tp_generate_layers: {result.layers}",
@@ -679,6 +681,8 @@ def _run_tp_concurrent_benchmark_once(
     prompt: str,
     max_new_tokens: int,
     concurrency: int,
+    *,
+    fast_decode: bool = False,
 ) -> TpConcurrentBenchmarkRun:
     states = []
     results: list[GenerateResult] = []
@@ -686,7 +690,7 @@ def _run_tp_concurrent_benchmark_once(
     prefill_start = total_start
     try:
         for _ in range(concurrency):
-            states.append(session.start_generation(prompt, max_new_tokens))
+            states.append(session.start_generation(prompt, max_new_tokens, fast_decode=fast_decode))
         prefill_end = time.perf_counter()
         decode_start = prefill_end
         batch_step_calls = 0
@@ -1091,6 +1095,7 @@ def _run_tp_worker(args: argparse.Namespace) -> int:
                     launch,
                     profile_config=_profile_config_from_args(args),
                     native_paged_attention_override=_native_paged_attention_override_from_args(args),
+                    fast_decode=args.tp_fast_decode,
                 ),
                 runtime,
             )
@@ -1126,6 +1131,7 @@ def _run_tp_service(args: argparse.Namespace, model_dir: Path) -> int:
                     batch_step_mode=args.tp_service_batch_step_mode,
                     profile_config=_profile_config_from_args(args),
                     native_paged_attention_override=_native_paged_attention_override_from_args(args),
+                    fast_decode=args.tp_fast_decode,
                 ),
                 runtime,
                 config,
@@ -1277,6 +1283,7 @@ def run(args: argparse.Namespace) -> int:
                 args.tp_init_method,
                 args.tp_device,
                 _profile_config_from_args(args),
+                fast_decode=args.tp_fast_decode,
             ):
                 print(line)
         except (ConfigError, EngineError, MappingError, LoaderError, TpRuntimeError, CliError) as exc:
@@ -1303,12 +1310,20 @@ def run(args: argparse.Namespace) -> int:
                     runs: list[TpConcurrentBenchmarkRun] = []
                     for _ in range(args.tp_benchmark_warmup):
                         _run_tp_concurrent_benchmark_once(
-                            session, benchmark_prompt, args.max_new_tokens, args.tp_benchmark_concurrency
+                            session,
+                            benchmark_prompt,
+                            args.max_new_tokens,
+                            args.tp_benchmark_concurrency,
+                            fast_decode=args.tp_fast_decode,
                         )
                     for _ in range(args.tp_benchmark_iterations):
                         runs.append(
                             _run_tp_concurrent_benchmark_once(
-                                session, benchmark_prompt, args.max_new_tokens, args.tp_benchmark_concurrency
+                                session,
+                                benchmark_prompt,
+                                args.max_new_tokens,
+                                args.tp_benchmark_concurrency,
+                                fast_decode=args.tp_fast_decode,
                             )
                         )
                     lines = _format_tp_concurrent_benchmark_results(
@@ -1320,9 +1335,9 @@ def run(args: argparse.Namespace) -> int:
                 else:
                     results: list[GenerateResult] = []
                     for _ in range(args.tp_benchmark_warmup):
-                        session.generate(benchmark_prompt, args.max_new_tokens)
+                        session.generate(benchmark_prompt, args.max_new_tokens, fast_decode=args.tp_fast_decode)
                     for _ in range(args.tp_benchmark_iterations):
-                        results.append(session.generate(benchmark_prompt, args.max_new_tokens))
+                        results.append(session.generate(benchmark_prompt, args.max_new_tokens, fast_decode=args.tp_fast_decode))
                     lines = _format_tp_benchmark_results(
                         results,
                         warmup_iterations=args.tp_benchmark_warmup,
@@ -1483,6 +1498,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("config", "on", "off"),
         default="config",
         help="Override text_config.native_paged_attention for TP generate/benchmark/service runs.",
+    )
+    parser.add_argument(
+        "--tp-fast-decode",
+        action="store_true",
+        help="Skip avoidable per-token CUDA synchronizations and diagnostics in TP generate/benchmark/service decode loops.",
     )
     parser.add_argument(
         "--tp-benchmark-iterations",

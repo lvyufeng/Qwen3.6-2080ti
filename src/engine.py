@@ -34,6 +34,7 @@ class GenerateResult:
     rank: int
     local_rank: int
     device: Any
+    fast_decode: bool
     prompt_tokens: int
     max_new_tokens: int
     layers: int
@@ -77,7 +78,9 @@ class GenerationRequestState:
     prompt_tokens: int
     total_start: float
     prefill_seconds: float
+    fast_decode: bool = False
     generated_token_ids: list[int] = field(default_factory=list)
+    generated_token_tensors: list[Any] = field(default_factory=list)
     step_all_finite: list[bool] = field(default_factory=list)
     decode_seconds: float = 0.0
     decode_start: float | None = None
@@ -142,8 +145,8 @@ class TpModelSession:
             raise
         return self
 
-    def generate(self, prompt: str, max_new_tokens: int) -> GenerateResult:
-        state = self.start_generation(prompt, max_new_tokens)
+    def generate(self, prompt: str, max_new_tokens: int, *, fast_decode: bool = False) -> GenerateResult:
+        state = self.start_generation(prompt, max_new_tokens, fast_decode=fast_decode)
         try:
             while not state.completed:
                 self.step_generation(state)
@@ -152,7 +155,7 @@ class TpModelSession:
             state.decode_state.release()
             raise
 
-    def start_generation(self, prompt: str, max_new_tokens: int) -> GenerationRequestState:
+    def start_generation(self, prompt: str, max_new_tokens: int, *, fast_decode: bool = False) -> GenerationRequestState:
         import time
 
         runtime, weights, _load_stats = self._require_loaded_components()
@@ -187,6 +190,7 @@ class TpModelSession:
             prompt_tokens=input_ids.numel(),
             total_start=total_start,
             prefill_seconds=_elapsed_seconds(prefill_start, prefill_end),
+            fast_decode=fast_decode,
             completed=max_new_tokens == 0,
         )
 
@@ -201,11 +205,15 @@ class TpModelSession:
         if state.decode_start is None:
             state.decode_start = time.perf_counter()
         last_logits = state.logits[:, -1].float()
-        step_finite = bool(torch.isfinite(last_logits).all().item())
+        step_finite = True if state.fast_decode else bool(torch.isfinite(last_logits).all().item())
         with runtime.profile_scope("greedy_next_token", output_tokens=1):
             next_token = tp_greedy_next_token(state.logits, self.mapping.lm_head, runtime)
-        next_token = _sync_next_token(next_token, runtime)
-        token_id = int(next_token.item())
+        if state.fast_decode:
+            token_id = -1
+            state.generated_token_tensors.append(next_token.detach())
+        else:
+            next_token = _sync_next_token(next_token, runtime)
+            token_id = int(next_token.item())
         state.generated_token_ids.append(token_id)
         state.step_all_finite.append(step_finite)
         step_index = len(state.generated_token_ids) - 1
@@ -215,7 +223,8 @@ class TpModelSession:
             )
         else:
             state.completed = True
-        _sync_device(runtime.device)
+        if not state.fast_decode:
+            _sync_device(runtime.device)
         decode_end = time.perf_counter()
         state.decode_seconds = _elapsed_seconds(state.decode_start, decode_end)
         return GenerationStep(
@@ -262,20 +271,27 @@ class TpModelSession:
         # so distributed greedy selection performs one batched all-gather instead of
         # one collective per request.
         logits_batch = torch.cat([state.logits[:, -1:] for state in states], dim=0)
-        finite_tensor = torch.isfinite(logits_batch[:, -1].float()).all(dim=-1)
-        step_finites = [bool(value) for value in finite_tensor.tolist()]
+        all_fast_decode = all(state.fast_decode for state in states)
+        if all_fast_decode:
+            step_finites = [True] * len(states)
+        else:
+            finite_tensor = torch.isfinite(logits_batch[:, -1].float()).all(dim=-1)
+            step_finites = [bool(value) for value in finite_tensor.tolist()]
         with runtime.profile_scope("batch.greedy_next_tokens", output_tokens=len(states)):
             next_tokens = tp_greedy_next_tokens(logits_batch, self.mapping.lm_head, runtime)
 
-        # Step 2: Convert tokens to (B, 1) and run batched decode.
+        # Step 2: Convert tokens to (B, 1) and run batched decode. Fast decode keeps
+        # token ids on device until finalization to avoid one CPU sync per batch step.
         input_ids = next_tokens[:, None]
-        token_ids = [int(value) for value in next_tokens.tolist()]
+        token_ids = [-1] * len(states) if all_fast_decode else [int(value) for value in next_tokens.tolist()]
 
         # Determine which states need a forward pass (not completing this step)
         needs_forward = []
         for i, state in enumerate(states):
             token_id = token_ids[i]
             state.generated_token_ids.append(token_id)
+            if state.fast_decode and token_id < 0:
+                state.generated_token_tensors.append(next_tokens[i : i + 1].detach())
             state.step_all_finite.append(step_finites[i])
             if len(state.generated_token_ids) >= state.max_new_tokens:
                 state.completed = True
@@ -300,7 +316,8 @@ class TpModelSession:
             # (they don't need new logits but their caches are already consistent)
             pass
 
-        _sync_device(runtime.device)
+        if not all_fast_decode:
+            _sync_device(runtime.device)
         decode_end = time.perf_counter()
 
         # Build GenerationStep results
@@ -329,6 +346,9 @@ class TpModelSession:
             raise EngineError("TP generation result is already finalized")
         _sync_device(runtime.device)
         total_end = time.perf_counter()
+        materialize_generated_token_ids(state)
+        if state.decode_start is not None:
+            state.decode_seconds = _elapsed_seconds(state.decode_start, total_end)
         total_seconds = _elapsed_seconds(state.total_start, total_end)
         state.result_built = True
         profile = runtime.profile_stats.snapshot()
@@ -339,6 +359,7 @@ class TpModelSession:
             rank=self.launch.rank,
             local_rank=self.launch.local_rank,
             device=runtime.device,
+            fast_decode=state.fast_decode,
             prompt_tokens=state.prompt_tokens,
             max_new_tokens=state.max_new_tokens,
             layers=len(self.mapping.layers),
@@ -417,9 +438,20 @@ class TpModelRunner:
         self.tp = TensorParallel(world_size=launch.world_size, rank=launch.rank)
         self.mapping = build_language_model_mapping(manifest, strict=True, tensor_parallel=self.tp)
 
-    def generate(self, prompt: str, max_new_tokens: int) -> GenerateResult:
+    def generate(self, prompt: str, max_new_tokens: int, *, fast_decode: bool = False) -> GenerateResult:
         with TpModelSession(self.manifest, self.runtime_config, self.launch, profile_config=self.profile_config) as session:
-            return session.generate(prompt, max_new_tokens)
+            return session.generate(prompt, max_new_tokens, fast_decode=fast_decode)
+
+
+def materialize_generated_token_ids(state: GenerationRequestState) -> None:
+    if not state.generated_token_tensors:
+        return
+    unresolved = [index for index, token_id in enumerate(state.generated_token_ids) if token_id < 0]
+    if len(unresolved) != len(state.generated_token_tensors):
+        unresolved = list(range(len(state.generated_token_ids) - len(state.generated_token_tensors), len(state.generated_token_ids)))
+    for index, token in zip(unresolved, state.generated_token_tensors, strict=True):
+        state.generated_token_ids[index] = int(token.reshape(-1)[0].item())
+    state.generated_token_tensors.clear()
 
 
 def _sync_next_token(next_token: Any, runtime: TpRuntime) -> Any:

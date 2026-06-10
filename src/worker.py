@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable, TextIO, cast
 
 from checkpoint import Manifest, build_manifest
-from engine import GenerationRequestState, GenerationStep, GenerateResult, TpModelSession
+from engine import GenerationRequestState, GenerationStep, GenerateResult, TpModelSession, materialize_generated_token_ids
 from runtime_config import RuntimeConfig, parse_runtime_config
 from scheduler import RequestScheduler, RequestStatus, ScheduledResult, SchedulerError, SchedulerSnapshot
 from tp_runtime import RuntimeProfileConfig, TpLaunchConfig, TpRuntime
@@ -74,6 +74,7 @@ class WorkerState:
     batch_step_max_size: int = 0
     profile_config: RuntimeProfileConfig = field(default_factory=RuntimeProfileConfig)
     native_paged_attention_override: bool | None = None
+    fast_decode: bool = False
 
     @property
     def active_generation(self) -> ActiveGeneration | None:
@@ -331,8 +332,27 @@ def _execute_load(state: WorkerState, command: WorkerCommand) -> WorkerResult:
             "loaded_tensors": session.load_stats.tensor_count if session.load_stats else 0,
             "loaded_bytes": session.load_stats.bytes if session.load_stats else 0,
             "native_paged_attention": runtime_config.full_attention.native_paged_attention,
+            "fast_decode": state.fast_decode,
         },
     )
+
+
+def _session_generate(session: TpModelSession, prompt: str, max_new_tokens: int, *, fast_decode: bool) -> GenerateResult:
+    if not fast_decode:
+        return session.generate(prompt, max_new_tokens)
+    return session.generate(prompt, max_new_tokens, fast_decode=True)
+
+
+def _session_start_generation(
+    session: TpModelSession,
+    prompt: str,
+    max_new_tokens: int,
+    *,
+    fast_decode: bool,
+) -> GenerationRequestState:
+    if not fast_decode:
+        return session.start_generation(prompt, max_new_tokens)
+    return session.start_generation(prompt, max_new_tokens, fast_decode=True)
 
 
 def _execute_generate(state: WorkerState, command: WorkerCommand, runtime: TpRuntime | None = None) -> WorkerResult:
@@ -343,7 +363,7 @@ def _execute_generate(state: WorkerState, command: WorkerCommand, runtime: TpRun
     scheduled = state.scheduler.run_blocking_generate(
         prompt,
         max_new_tokens,
-        lambda request: session.generate(request.prompt, request.max_new_tokens),
+        lambda request: _session_generate(session, request.prompt, request.max_new_tokens, fast_decode=state.fast_decode),
         request_id=request_id,
     )
     assert scheduled.result is not None
@@ -405,7 +425,7 @@ def _execute_poll(state: WorkerState, command: WorkerCommand, runtime: TpRuntime
         return WorkerResult(POLL, state.launch.rank, True, data)
     scheduled = state.scheduler.result_for(request_id)
     if scheduled is None and not state.active_generations and state.scheduler.is_pending(request_id):
-        state.scheduler.run_next(lambda request: session.generate(request.prompt, request.max_new_tokens), reraise=False)
+        state.scheduler.run_next(lambda request: _session_generate(session, request.prompt, request.max_new_tokens, fast_decode=state.fast_decode), reraise=False)
         scheduled = state.scheduler.result_for(request_id)
     if scheduled is not None:
         data = _poll_terminal_data(request_id, scheduled)
@@ -537,7 +557,7 @@ def _activate_pending_requests(
                 raise
             return None
         try:
-            generation_state = session.start_generation(request.prompt, request.max_new_tokens)
+            generation_state = _session_start_generation(session, request.prompt, request.max_new_tokens, fast_decode=state.fast_decode)
         except Exception as exc:
             state.scheduler.fail_request(request.request_id, exc)
             return _step_failed_response(
@@ -796,7 +816,7 @@ def _active_generation_data(active: ActiveGeneration) -> dict[str, Any]:
         "request_id": active.request_id,
         "generated_tokens": len(active.state.generated_token_ids),
         "max_new_tokens": active.state.max_new_tokens,
-        "latest_token_id": latest.token_id if latest is not None else None,
+        "latest_token_id": _step_token_id(active.state, latest) if latest is not None else None,
         "latest_token_index": latest.index if latest is not None else None,
     }
 
@@ -806,6 +826,7 @@ def _generate_result_data(result: GenerateResult) -> dict[str, Any]:
         "world_size": result.world_size,
         "rank": result.rank,
         "device": str(result.device),
+        "fast_decode": result.fast_decode,
         "prompt_tokens": result.prompt_tokens,
         "max_new_tokens": result.max_new_tokens,
         "load_seconds": result.load_seconds,
@@ -837,6 +858,7 @@ def _runtime_data(result: GenerateResult) -> dict[str, Any]:
         "rank": result.rank,
         "local_rank": result.local_rank,
         "device": str(result.device),
+        "fast_decode": result.fast_decode,
     }
 
 
@@ -1034,13 +1056,14 @@ def _scheduled_result_data(result: ScheduledResult[GenerateResult]) -> dict[str,
 def _step_running_data(state: WorkerState, active: ActiveGeneration, *, event_type: str) -> dict[str, Any]:
     step = active.last_step
     assert step is not None
+    token_id = _step_token_id(active.state, step)
     return {
         "request_id": active.request_id,
         "found": True,
         "status": RequestStatus.RUNNING.value,
         "result": None,
         "error": None,
-        "progress": _step_progress_data(active.state, step, is_complete=False),
+        "progress": _step_progress_data(active.state, step, token_id=token_id, is_complete=False),
         "timings": {
             "prefill_seconds": active.state.prefill_seconds,
             "decode_seconds": active.state.decode_seconds,
@@ -1051,7 +1074,7 @@ def _step_running_data(state: WorkerState, active: ActiveGeneration, *, event_ty
             type=event_type,
             status=RequestStatus.RUNNING.value,
             sequence=len(active.state.generated_token_ids),
-            token_ids=[step.token_id] if event_type == "token" else [],
+            token_ids=[token_id] if event_type == "token" else [],
             is_terminal=False,
         ),
         "scheduler": _scheduler_snapshot_data(state.scheduler.snapshot()),
@@ -1066,6 +1089,7 @@ def _step_completed_data(
 ) -> dict[str, Any]:
     step = active.last_step
     assert step is not None
+    token_id = _step_token_id(active.state, step)
     return {
         "request_id": scheduled.request_id,
         "found": True,
@@ -1074,7 +1098,7 @@ def _step_completed_data(
         "error": None,
         "queued_seconds": scheduled.queued_seconds,
         "run_seconds": scheduled.run_seconds,
-        "progress": _step_progress_data(active.state, step, is_complete=True),
+        "progress": _step_progress_data(active.state, step, token_id=token_id, is_complete=True),
         "timings": {
             "prefill_seconds": result.prefill_seconds,
             "decode_seconds": result.decode_seconds,
@@ -1085,18 +1109,27 @@ def _step_completed_data(
             type="completed",
             status=RequestStatus.COMPLETED.value,
             sequence=scheduled.result.max_new_tokens,
-            token_ids=[step.token_id],
+            token_ids=[token_id],
             is_terminal=True,
         ),
         "scheduler": _scheduler_snapshot_data(state.scheduler.snapshot()),
     }
 
 
-def _step_progress_data(state: GenerationRequestState, step: GenerationStep, *, is_complete: bool) -> dict[str, Any]:
+def _step_token_id(state: GenerationRequestState, step: GenerationStep) -> int:
+    if step.token_id >= 0:
+        return step.token_id
+    materialize_generated_token_ids(state)
+    if 0 <= step.index < len(state.generated_token_ids):
+        return state.generated_token_ids[step.index]
+    return step.token_id
+
+
+def _step_progress_data(state: GenerationRequestState, step: GenerationStep, *, token_id: int, is_complete: bool) -> dict[str, Any]:
     return {
         "generated_tokens": len(state.generated_token_ids),
         "max_new_tokens": state.max_new_tokens,
-        "latest_token_id": step.token_id,
+        "latest_token_id": token_id,
         "latest_token_index": step.index,
         "is_complete": is_complete,
     }
@@ -1235,6 +1268,7 @@ def _serving_state_data(state: WorkerState) -> dict[str, Any]:
         "max_active_requests": state.max_active_requests,
         "max_pending_requests": state.max_pending_requests,
         "batch_step_mode": state.batch_step_mode,
+        "fast_decode": state.fast_decode,
         "active_count": len(state.active_generations),
         "pending_count": scheduler_snapshot.pending,
         "pending_event_requests": len(state.pending_events),

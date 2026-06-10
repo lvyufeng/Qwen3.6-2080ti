@@ -170,6 +170,7 @@ def test_worker_load_initializes_state(tmp_path: Path, monkeypatch: pytest.Monke
     assert result.data["loaded_tensors"] > 0
     assert result.data["loaded_bytes"] > 0
     assert result.data["native_paged_attention"] is False
+    assert result.data["fast_decode"] is False
     assert state.manifest is not None
     assert state.runtime_config is not None
     assert state.session is not None
@@ -240,6 +241,7 @@ def test_worker_load_then_generate_single_rank(tmp_path: Path, monkeypatch: pyte
     assert generate_result.data["runtime"]["rank"] == 0
     assert generate_result.data["runtime"]["local_rank"] == 0
     assert generate_result.data["runtime"]["device"] == "cpu"
+    assert generate_result.data["runtime"]["fast_decode"] is False
     assert generate_result.data["model"]["layers"] == 1
     assert generate_result.data["model"]["mapped_tensors"] > 0
     assert generate_result.data["model"]["mapped_bytes"] > 0
@@ -282,6 +284,27 @@ def test_worker_load_then_generate_single_rank(tmp_path: Path, monkeypatch: pyte
     assert generate_result.data["profile"]["scopes"] == {}
     assert generate_result.data["kv_cache"]["page_metadata_calls_total"] >= 1
     assert "page_table_entries_total" in generate_result.data["kv_cache"]
+
+
+def test_worker_fast_decode_generate_reports_materialized_tokens(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"), fast_decode=True)
+
+    load_result = execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)}))
+    generate_result = execute_command(
+        state, WorkerCommand(GENERATE, {"prompt": "hello", "max_new_tokens": 2, "request_id": "fast"})
+    )
+
+    assert load_result.ok is True
+    assert load_result.data["fast_decode"] is True
+    assert generate_result.ok is True
+    assert generate_result.data["fast_decode"] is True
+    assert generate_result.data["runtime"]["fast_decode"] is True
+    assert len(generate_result.data["generated_token_ids"]) == 2
+    assert all(token_id >= 0 for token_id in generate_result.data["generated_token_ids"])
+    assert generate_result.data["text"].startswith("decoded:")
+    assert generate_result.data["event"]["token_ids"] == generate_result.data["generated_token_ids"]
 
 
 def test_worker_profile_enabled_result_has_scopes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1650,6 +1673,7 @@ def test_worker_status_reports_serving_controls(tmp_path: Path, monkeypatch: pyt
         "max_active_requests": 2,
         "max_pending_requests": 5,
         "batch_step_mode": STEP_MODE_COOPERATIVE,
+        "fast_decode": False,
         "active_count": 0,
         "pending_count": 0,
         "pending_event_requests": 0,
