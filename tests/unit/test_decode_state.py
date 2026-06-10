@@ -63,6 +63,32 @@ def test_append_handles_prefill_chunk_then_single_steps_across_blocks() -> None:
     assert cache.capacity == 8
 
 
+def test_append_blocks_updates_cache_without_dense_view() -> None:
+    cache = FullAttentionCache(capacity_hint=4, block_size=2)
+    key, value = _kv(0, seq=3)
+
+    cache.append_blocks(key, value)
+
+    assert cache.length == 3
+    assert cache.capacity == 4
+    assert cache.block_table == [0, 1]
+    stats = cache.stats()
+    assert stats.append_calls == 1
+    assert stats.appended_tokens == 3
+    assert stats.contiguous_view_calls == 0
+    assert stats.gather_view_calls == 0
+
+    metadata = cache.page_metadata()
+    torch.testing.assert_close(metadata.block_table.cpu(), torch.tensor([0, 1], dtype=torch.long))
+    assert metadata.sequence_length == 3
+    assert metadata.key_blocks is cache.key_blocks
+    assert metadata.value_blocks is cache.value_blocks
+
+    out_key, out_value = cache.as_tensors()
+    torch.testing.assert_close(out_key, key)
+    torch.testing.assert_close(out_value, value)
+
+
 def test_length_tracks_total_appended_tokens_not_allocated_capacity() -> None:
     cache = FullAttentionCache(capacity_hint=8, block_size=4)
     assert cache.length == 0

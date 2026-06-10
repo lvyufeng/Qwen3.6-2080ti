@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from checkpoint import CheckpointError, Manifest, build_manifest
@@ -79,6 +79,8 @@ def _summarize_runtime_config(config: RuntimeConfig) -> list[str]:
         f"runtime_linear_value_state_dim: {config.linear_attention.value_state_dim}",
         f"runtime_attention_q_dim: {config.full_attention.q_dim}",
         f"runtime_attention_kv_dim: {config.full_attention.kv_dim}",
+        f"runtime_paged_kv_metadata: {config.full_attention.paged_kv_metadata}",
+        f"runtime_native_paged_attention: {config.full_attention.native_paged_attention}",
         f"runtime_experts_per_layer: {config.moe.num_experts}",
         f"runtime_experts_per_token: {config.moe.experts_per_token}",
         f"runtime_packed_expert_dispatch: {config.moe.packed_expert_dispatch}",
@@ -627,6 +629,26 @@ def _profile_config_from_args(args: argparse.Namespace) -> RuntimeProfileConfig:
     )
 
 
+def _native_paged_attention_override_from_args(args: argparse.Namespace) -> bool | None:
+    mode = getattr(args, "tp_native_paged_attention", "config")
+    if mode == "config":
+        return None
+    return mode == "on"
+
+
+def _apply_native_paged_attention_override(config: RuntimeConfig, override: bool | None) -> RuntimeConfig:
+    if override is None:
+        return config
+    return replace(config, full_attention=replace(config.full_attention, native_paged_attention=override))
+
+
+def _runtime_config_from_args(config: dict, args: argparse.Namespace) -> RuntimeConfig:
+    return _apply_native_paged_attention_override(
+        parse_runtime_config(config),
+        _native_paged_attention_override_from_args(args),
+    )
+
+
 def _benchmark_prompt_from_args(manifest: Manifest, args: argparse.Namespace) -> str:
     target = args.tp_benchmark_prompt_tokens
     if target is None:
@@ -1064,7 +1086,14 @@ def _run_tp_worker(args: argparse.Namespace) -> int:
     )
     try:
         with TpRuntime(launch) as runtime:
-            run_worker_protocol_loop(WorkerState(launch, profile_config=_profile_config_from_args(args)), runtime)
+            run_worker_protocol_loop(
+                WorkerState(
+                    launch,
+                    profile_config=_profile_config_from_args(args),
+                    native_paged_attention_override=_native_paged_attention_override_from_args(args),
+                ),
+                runtime,
+            )
     except TpRuntimeError as exc:
         raise CliError(str(exc)) from exc
     return 0
@@ -1096,6 +1125,7 @@ def _run_tp_service(args: argparse.Namespace, model_dir: Path) -> int:
                     max_pending_requests=args.tp_service_max_pending,
                     batch_step_mode=args.tp_service_batch_step_mode,
                     profile_config=_profile_config_from_args(args),
+                    native_paged_attention_override=_native_paged_attention_override_from_args(args),
                 ),
                 runtime,
                 config,
@@ -1139,7 +1169,7 @@ def run(args: argparse.Namespace) -> int:
         print(line)
     if args.inspect_config:
         try:
-            runtime_config = parse_runtime_config(config)
+            runtime_config = _runtime_config_from_args(config, args)
         except ConfigError as exc:
             raise CliError(str(exc)) from exc
         print("Loaded runtime config")
@@ -1195,7 +1225,7 @@ def run(args: argparse.Namespace) -> int:
             raise CliError(str(exc)) from exc
     if args.tp_runtime_smoke:
         try:
-            runtime_config = parse_runtime_config(config)
+            runtime_config = _runtime_config_from_args(config, args)
             print("TP runtime smoke")
             for line in _summarize_tp_runtime_smoke(
                 manifest,
@@ -1212,7 +1242,7 @@ def run(args: argparse.Namespace) -> int:
             raise CliError(str(exc)) from exc
     if args.tp_reference_forward:
         try:
-            runtime_config = parse_runtime_config(config)
+            runtime_config = _runtime_config_from_args(config, args)
             print("TP reference forward smoke")
             for line in _summarize_tp_reference_forward(
                 manifest,
@@ -1233,7 +1263,7 @@ def run(args: argparse.Namespace) -> int:
             raise CliError(f"TP reference forward failed: {exc}") from exc
     if args.tp_generate:
         try:
-            runtime_config = parse_runtime_config(config)
+            runtime_config = _runtime_config_from_args(config, args)
             print("TP resident greedy generation")
             for line in _summarize_tp_generate(
                 manifest,
@@ -1256,7 +1286,7 @@ def run(args: argparse.Namespace) -> int:
         return 0
     if args.tp_benchmark:
         try:
-            runtime_config = parse_runtime_config(config)
+            runtime_config = _runtime_config_from_args(config, args)
             concurrent = args.tp_benchmark_concurrency > 1
             print("TP resident concurrent generation benchmark" if concurrent else "TP resident generation benchmark")
             launch = _tp_launch_from_args(
@@ -1308,7 +1338,7 @@ def run(args: argparse.Namespace) -> int:
         return 0
     if args.reference_prefill:
         try:
-            runtime_config = parse_runtime_config(config)
+            runtime_config = _runtime_config_from_args(config, args)
             mapping = build_language_model_mapping(manifest, strict=True)
             device = args.reference_device or args.tensor_device or "cpu"
             print("Reference prefill smoke")
@@ -1328,7 +1358,7 @@ def run(args: argparse.Namespace) -> int:
             raise CliError(f"reference prefill failed: {exc}") from exc
     if args.reference_forward:
         try:
-            runtime_config = parse_runtime_config(config)
+            runtime_config = _runtime_config_from_args(config, args)
             mapping = build_language_model_mapping(manifest, strict=True)
             device = args.reference_device or args.tensor_device or "cpu"
             print("Reference forward smoke")
@@ -1347,7 +1377,7 @@ def run(args: argparse.Namespace) -> int:
             raise CliError(f"reference forward failed: {exc}") from exc
     if args.reference_decode_smoke:
         try:
-            runtime_config = parse_runtime_config(config)
+            runtime_config = _runtime_config_from_args(config, args)
             mapping = build_language_model_mapping(manifest, strict=True)
             device = args.reference_device or args.tensor_device or "cpu"
             print("Reference decode smoke")
@@ -1447,6 +1477,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--tp-profile-layer-detail",
         action="store_true",
         help="Include per-layer profile scope names when --tp-profile is enabled.",
+    )
+    parser.add_argument(
+        "--tp-native-paged-attention",
+        choices=("config", "on", "off"),
+        default="config",
+        help="Override text_config.native_paged_attention for TP generate/benchmark/service runs.",
     )
     parser.add_argument(
         "--tp-benchmark-iterations",

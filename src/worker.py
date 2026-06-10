@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, TextIO, cast
 
@@ -73,6 +73,7 @@ class WorkerState:
     batch_step_tokens_total: int = 0
     batch_step_max_size: int = 0
     profile_config: RuntimeProfileConfig = field(default_factory=RuntimeProfileConfig)
+    native_paged_attention_override: bool | None = None
 
     @property
     def active_generation(self) -> ActiveGeneration | None:
@@ -297,11 +298,20 @@ def _write_protocol_response(output_stream: TextIO, response: dict[str, Any]) ->
     output_stream.flush()
 
 
+def _apply_native_paged_attention_override(config: RuntimeConfig, override: bool | None) -> RuntimeConfig:
+    if override is None:
+        return config
+    return replace(config, full_attention=replace(config.full_attention, native_paged_attention=override))
+
+
 def _execute_load(state: WorkerState, command: WorkerCommand) -> WorkerResult:
     model_dir = _payload_str(command, "model_dir")
     _close_worker_state(state)
     manifest = build_manifest(Path(model_dir))
-    runtime_config = parse_runtime_config(manifest.config)
+    runtime_config = _apply_native_paged_attention_override(
+        parse_runtime_config(manifest.config),
+        state.native_paged_attention_override,
+    )
     session = TpModelSession(manifest, runtime_config, state.launch, profile_config=state.profile_config)
     session.load()
     state.manifest = manifest
@@ -320,6 +330,7 @@ def _execute_load(state: WorkerState, command: WorkerCommand) -> WorkerResult:
             "mapped_tensors": len(session.mapping.mapped_tensor_names),
             "loaded_tensors": session.load_stats.tensor_count if session.load_stats else 0,
             "loaded_bytes": session.load_stats.bytes if session.load_stats else 0,
+            "native_paged_attention": runtime_config.full_attention.native_paged_attention,
         },
     )
 

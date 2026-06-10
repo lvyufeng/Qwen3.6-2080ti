@@ -521,12 +521,10 @@ def tp_full_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig, w
         value = value[:, head_start : head_start + local_heads]
     if cache is not None:
         with runtime.profile_scope("full_attention.cache_append"):
-            key, value = cache.append(key, value)
+            cache.append_blocks(key, value)
         return _tp_full_attention_paged_or_dense(
             query,
             gate,
-            key,
-            value,
             hidden_states,
             mapping,
             config,
@@ -552,8 +550,6 @@ def tp_full_attention(hidden_states: Any, mapping: Any, config: RuntimeConfig, w
 def _tp_full_attention_paged_or_dense(
     query: Any,
     gate: Any,
-    key: Any,
-    value: Any,
     hidden_states: Any,
     mapping: Any,
     config: RuntimeConfig,
@@ -563,20 +559,42 @@ def _tp_full_attention_paged_or_dense(
     cache: FullAttentionCache,
     position_offset: int,
 ) -> Any:
+    page_table = None
     if config.full_attention.paged_kv_metadata:
         with runtime.profile_scope("full_attention.page_metadata"):
-            cache.page_metadata()
-    with runtime.profile_scope("full_attention.paged_dispatch"):
-        _record_paged_attention_dispatch(
-            runtime,
-            config,
-            query,
-            key,
-            value,
-            seq_len=int(query.shape[2]),
-            batched=False,
-        )
+            page_table = cache.page_metadata()
+    reason = _paged_attention_fallback_reason(
+        config,
+        query,
+        None if page_table is None else page_table.key_blocks,
+        None if page_table is None else page_table.value_blocks,
+        seq_len=int(query.shape[2]),
+        batched=False,
+    )
+    if reason == "no_kernel" and page_table is not None:
+        try:
+            with runtime.profile_scope("full_attention.native_paged"):
+                heads = _tp_full_attention_native_paged_decode(query, page_table)
+            with runtime.profile_scope("full_attention.paged_dispatch"):
+                _record_native_paged_dispatch(runtime, reason, native=True)
+            return _tp_full_attention_finish_from_heads(
+                heads,
+                gate,
+                hidden_states,
+                mapping,
+                config,
+                weights,
+                runtime,
+                scope_prefix="full_attention",
+            )
+        except RuntimeError:
+            with runtime.profile_scope("full_attention.paged_dispatch"):
+                _record_native_paged_dispatch(runtime, "no_kernel", native=False)
+    else:
+        with runtime.profile_scope("full_attention.paged_dispatch"):
+            _record_native_paged_dispatch(runtime, reason, native=False)
     with runtime.profile_scope("full_attention.dense_fallback"):
+        key, value = cache.as_tensors()
         return _tp_full_attention_dense_from_kv(
             query,
             gate,
@@ -589,6 +607,44 @@ def _tp_full_attention_paged_or_dense(
             runtime,
             position_offset=position_offset,
         )
+
+
+def _tp_full_attention_native_paged_decode(query: Any, page_table: Any) -> Any:
+    from fp8_cuda import paged_attention_decode
+
+    return paged_attention_decode(
+        query,
+        page_table.block_table,
+        page_table.key_blocks,
+        page_table.value_blocks,
+        int(page_table.sequence_length),
+        int(page_table.block_size),
+    )
+
+
+def _tp_full_attention_finish_from_heads(
+    heads: Any,
+    gate: Any,
+    hidden_states: Any,
+    mapping: Any,
+    config: RuntimeConfig,
+    weights: ReferenceWeights,
+    runtime: TpRuntime,
+    *,
+    scope_prefix: str,
+) -> Any:
+    import torch
+
+    batch, seq_len, _ = hidden_states.shape
+    full = config.full_attention
+    local_heads = full.num_heads // runtime.config.world_size
+    with runtime.profile_scope(f"{scope_prefix}.value"):
+        out = heads.transpose(1, 2).reshape(batch, seq_len, local_heads * full.head_dim)
+        out = out * torch.sigmoid(gate)
+    with runtime.profile_scope(f"{scope_prefix}.output_proj"):
+        partial = weights.linear(out, mapping.o_proj).to(hidden_states.dtype)
+    with runtime.profile_scope(f"{scope_prefix}.all_reduce"):
+        return runtime.all_reduce_sum(partial)
 
 
 def _tp_full_attention_dense_from_kv(
@@ -636,11 +692,18 @@ def _record_paged_attention_dispatch(
     seq_len: int,
     batched: bool,
 ) -> None:
+    reason = _paged_attention_fallback_reason(config, query, key, value, seq_len=seq_len, batched=batched)
+    _record_native_paged_dispatch(runtime, reason, native=False)
+
+
+def _record_native_paged_dispatch(runtime: TpRuntime, reason: str, *, native: bool) -> None:
     stats = runtime.paged_attention_stats
     stats.calls += 1
-    reason = _paged_attention_fallback_reason(config, query, key, value, seq_len=seq_len, batched=batched)
     if reason == "no_kernel":
         stats.eligible += 1
+    if native:
+        stats.native_hits += 1
+        return
     stats.dense_fallbacks += 1
     if reason == "disabled":
         stats.fallback_disabled += 1
@@ -673,13 +736,23 @@ def _paged_attention_fallback_reason(
         return "prefill_or_multitoken"
     if batched:
         return "per_request_pools"
-    if len(getattr(query, "shape", ())) != 4 or len(getattr(key, "shape", ())) != 4 or len(getattr(value, "shape", ())) != 4:
+    query_shape = getattr(query, "shape", ())
+    key_shape = getattr(key, "shape", ())
+    value_shape = getattr(value, "shape", ())
+    if len(query_shape) != 4 or len(key_shape) not in (4, 5) or len(value_shape) != len(key_shape):
         return "shape"
-    if int(query.shape[0]) != int(key.shape[0]) or int(query.shape[0]) != int(value.shape[0]):
+    if int(query_shape[0]) != int(key_shape[0]) or int(query_shape[0]) != int(value_shape[0]):
         return "shape"
-    if int(query.shape[1]) != int(key.shape[1]) or int(query.shape[1]) != int(value.shape[1]):
+    if int(query_shape[1]) != int(key_shape[1]) or int(query_shape[1]) != int(value_shape[1]):
         return "shape"
-    if int(query.shape[3]) != int(key.shape[3]) or int(query.shape[3]) != int(value.shape[3]):
+    key_head_dim = key_shape[4] if len(key_shape) == 5 else key_shape[3]
+    value_head_dim = value_shape[4] if len(value_shape) == 5 else value_shape[3]
+    if int(query_shape[3]) != int(key_head_dim) or int(query_shape[3]) != int(value_head_dim):
+        return "shape"
+    query_dtype = getattr(query, "dtype", None)
+    key_dtype = getattr(key, "dtype", query_dtype)
+    value_dtype = getattr(value, "dtype", query_dtype)
+    if query_dtype is not None and (str(query_dtype) != "torch.float32" or str(key_dtype) != "torch.float32" or str(value_dtype) != "torch.float32"):
         return "shape"
     return "no_kernel"
 

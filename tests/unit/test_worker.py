@@ -169,10 +169,24 @@ def test_worker_load_initializes_state(tmp_path: Path, monkeypatch: pytest.Monke
     assert result.data["mapped_tensors"] > 0
     assert result.data["loaded_tensors"] > 0
     assert result.data["loaded_bytes"] > 0
+    assert result.data["native_paged_attention"] is False
     assert state.manifest is not None
     assert state.runtime_config is not None
     assert state.session is not None
     assert state.loaded_model_dir == str(tmp_path)
+
+
+def test_worker_load_applies_native_paged_attention_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    state = WorkerState(TpLaunchConfig(backend="gloo", device="cpu"), native_paged_attention_override=True)
+
+    result = execute_command(state, WorkerCommand(LOAD, {"model_dir": str(tmp_path)}))
+
+    assert result.ok is True
+    assert result.data["native_paged_attention"] is True
+    assert state.runtime_config is not None
+    assert state.runtime_config.full_attention.native_paged_attention is True
 
 
 def test_worker_generate_requires_loaded_model() -> None:

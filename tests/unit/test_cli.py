@@ -63,6 +63,29 @@ def test_cli_inspects_runtime_config_and_checkpoint(tmp_path: Path, capsys) -> N
     assert "tensor_count: 0" in out
 
 
+def test_cli_native_paged_attention_override_updates_runtime_config(tmp_path: Path, capsys) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(_runtime_config()), encoding="utf-8")
+    (tmp_path / "model.safetensors").write_bytes(b"\x02\x00\x00\x00\x00\x00\x00\x00{}")
+
+    rc = main(
+        [
+            "--model",
+            str(tmp_path),
+            "--prompt",
+            "hello",
+            "--max-new-tokens",
+            "1",
+            "--inspect-config",
+            "--tp-native-paged-attention",
+            "on",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "runtime_native_paged_attention: True" in out
+
+
 def test_cli_inspects_tp4_mapping(tmp_path: Path, capsys) -> None:
     config = _runtime_config()
     text = config["text_config"]

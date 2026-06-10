@@ -204,3 +204,21 @@ def linear_attention_recurrent_core(query: Any, key: Any, value: Any, g: Any, be
         beta.contiguous(),
         initial_state.contiguous(),
     )
+
+
+def paged_attention_decode(
+    query: Any,
+    block_table: Any,
+    key_blocks: Any,
+    value_blocks: Any,
+    sequence_length: int,
+    block_size: int,
+) -> Any:
+    return load_fp8_extension().paged_attention_decode(
+        query.contiguous(),
+        block_table.contiguous(),
+        key_blocks,
+        value_blocks,
+        int(sequence_length),
+        int(block_size),
+    )

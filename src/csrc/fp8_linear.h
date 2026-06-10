@@ -98,3 +98,10 @@ std::tuple<torch::Tensor, torch::Tensor> linear_attention_recurrent_core(
     torch::Tensor g,
     torch::Tensor beta,
     torch::Tensor initial_state);
+torch::Tensor paged_attention_decode(
+    torch::Tensor query,
+    torch::Tensor block_table,
+    torch::Tensor key_blocks,
+    torch::Tensor value_blocks,
+    int64_t sequence_length,
+    int64_t block_size);

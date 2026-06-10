@@ -24,6 +24,74 @@ def test_fp8_cuda_linear_matches_reference_dequant_matvec_and_cublas_paths() -> 
         torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the paged attention extension")
+def test_paged_attention_decode_matches_dense_contiguous_blocks() -> None:
+    try:
+        from fp8_cuda import paged_attention_decode
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(101)
+    batch, heads, seq_len, head_dim, block_size = 1, 3, 5, 8, 2
+    query = torch.randn((batch, heads, 1, head_dim), device=device, dtype=torch.float32)
+    dense_key = torch.randn((batch, heads, seq_len, head_dim), device=device, dtype=torch.float32)
+    dense_value = torch.randn((batch, heads, seq_len, head_dim), device=device, dtype=torch.float32)
+    block_table = torch.arange((seq_len + block_size - 1) // block_size, device=device, dtype=torch.long)
+    key_blocks, value_blocks = _pack_dense_kv_blocks(dense_key, dense_value, block_table, block_size)
+
+    out = paged_attention_decode(query, block_table, key_blocks, value_blocks, seq_len, block_size)
+    ref = _dense_decode_attention_reference(query, dense_key, dense_value)
+
+    torch.testing.assert_close(out, ref, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the paged attention extension")
+def test_paged_attention_decode_respects_non_contiguous_blocks_and_ignores_padding() -> None:
+    try:
+        from fp8_cuda import paged_attention_decode
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(102)
+    batch, heads, seq_len, head_dim, block_size = 1, 2, 5, 8, 2
+    query = torch.randn((batch, heads, 1, head_dim), device=device, dtype=torch.float32)
+    dense_key = torch.randn((batch, heads, seq_len, head_dim), device=device, dtype=torch.float32)
+    dense_value = torch.randn((batch, heads, seq_len, head_dim), device=device, dtype=torch.float32)
+    block_table = torch.tensor([2, 0, 3], device=device, dtype=torch.long)
+    key_blocks, value_blocks = _pack_dense_kv_blocks(
+        dense_key,
+        dense_value,
+        block_table,
+        block_size,
+        physical_blocks=4,
+        fill=1000.0,
+    )
+
+    out = paged_attention_decode(query, block_table, key_blocks, value_blocks, seq_len, block_size)
+    ref = _dense_decode_attention_reference(query, dense_key, dense_value)
+
+    torch.testing.assert_close(out, ref, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the paged attention extension")
+def test_paged_attention_decode_rejects_non_float32_query() -> None:
+    try:
+        from fp8_cuda import paged_attention_decode
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    query = torch.zeros((1, 1, 1, 8), device=device, dtype=torch.float16)
+    block_table = torch.tensor([0], device=device, dtype=torch.long)
+    key_blocks = torch.zeros((1, 1, 1, 2, 8), device=device, dtype=torch.float32)
+    value_blocks = torch.zeros((1, 1, 1, 2, 8), device=device, dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="query must be float32"):
+        paged_attention_decode(query, block_table, key_blocks, value_blocks, 1, 2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the FP8 extension")
 def test_fp8_cuda_moe_expert_matches_reference_small_groups() -> None:
     try:
@@ -853,6 +921,37 @@ def test_fp8_cuda_linear_wrapper_falls_back_for_cpu() -> None:
     out = linear(x, weight, scale)
 
     torch.testing.assert_close(out, torch.tensor([[6.0, 4.0]]))
+
+
+def _dense_decode_attention_reference(query: torch.Tensor, dense_key: torch.Tensor, dense_value: torch.Tensor) -> torch.Tensor:
+    scores = torch.matmul(query.float(), dense_key.float().transpose(2, 3)) * (query.shape[-1] ** -0.5)
+    probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
+    return torch.matmul(probs, dense_value.float())
+
+
+def _pack_dense_kv_blocks(
+    dense_key: torch.Tensor,
+    dense_value: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    *,
+    physical_blocks: int | None = None,
+    fill: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, heads, seq_len, head_dim = dense_key.shape
+    logical_blocks = int(block_table.numel())
+    if physical_blocks is None:
+        physical_blocks = int(block_table.max().item()) + 1 if block_table.numel() else 0
+    key_blocks = torch.full((batch, heads, physical_blocks, block_size, head_dim), fill, device=dense_key.device, dtype=dense_key.dtype)
+    value_blocks = torch.full_like(key_blocks, fill)
+    for token in range(seq_len):
+        logical = token // block_size
+        offset = token % block_size
+        physical = int(block_table[logical].item())
+        key_blocks[:, :, physical, offset] = dense_key[:, :, token]
+        value_blocks[:, :, physical, offset] = dense_value[:, :, token]
+    assert logical_blocks >= (seq_len + block_size - 1) // block_size
+    return key_blocks, value_blocks
 
 
 def _make_fp8_moe_tensor_lists(

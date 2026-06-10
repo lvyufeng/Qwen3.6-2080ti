@@ -710,6 +710,18 @@ def test_paged_attention_dispatch_records_per_request_pool_fallback_for_batches(
     assert stats.native_hits == 0
 
 
+def test_paged_attention_dispatch_records_native_hit() -> None:
+    with TpRuntime(TpLaunchConfig(backend="gloo", device="cpu")) as runtime:
+        tp_runtime._record_native_paged_dispatch(runtime, "no_kernel", native=True)
+
+    stats = runtime.paged_attention_stats
+    assert stats.calls == 1
+    assert stats.eligible == 1
+    assert stats.native_hits == 1
+    assert stats.dense_fallbacks == 0
+    assert stats.fallback_no_kernel == 0
+
+
 def test_tp_greedy_next_tokens_single_rank_batch_matches_argmax() -> None:
     runtime = TpRuntime(TpLaunchConfig(world_size=1, rank=0, local_rank=0, backend="gloo", device="cpu"))
     tp = TensorParallel(world_size=1, rank=0)

@@ -820,6 +820,99 @@ void check_moe_expert_tensor_basics(const torch::Tensor& tensor, const char* nam
     TORCH_CHECK(tensor.dim() == 2, name, " must be rank-2");
 }
 
+__global__ void paged_attention_decode_f32_kernel(
+    const float* __restrict__ query,
+    const int64_t* __restrict__ block_table,
+    const float* __restrict__ key_blocks,
+    const float* __restrict__ value_blocks,
+    float* __restrict__ output,
+    int batch,
+    int heads,
+    int physical_blocks,
+    int block_size,
+    int head_dim,
+    int sequence_length) {
+    const int head_index = blockIdx.x;
+    const int b = head_index / heads;
+    const int h = head_index - b * heads;
+    if (b >= batch) return;
+
+    extern __shared__ float shared[];
+    float* reduce = shared;
+    float* acc = shared + blockDim.x;
+    __shared__ float max_score;
+    __shared__ float weight;
+    __shared__ float denom;
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        acc[d] = 0.0f;
+    }
+    if (threadIdx.x == 0) max_score = -3.402823e38f;
+    __syncthreads();
+
+    const size_t query_base = (static_cast<size_t>(b) * heads + h) * head_dim;
+    for (int token = 0; token < sequence_length; ++token) {
+        const int logical_block = token / block_size;
+        const int block_offset = token - logical_block * block_size;
+        const int64_t physical_block64 = block_table[logical_block];
+        const int physical_block = static_cast<int>(physical_block64);
+        if (physical_block < 0 || physical_block >= physical_blocks) return;
+        const size_t kv_base = ((((static_cast<size_t>(b) * heads + h) * physical_blocks + physical_block) * block_size + block_offset) * head_dim);
+
+        float partial = 0.0f;
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            partial += query[query_base + d] * key_blocks[kv_base + d];
+        }
+        reduce[threadIdx.x] = partial;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const float score = reduce[0] * rsqrtf(static_cast<float>(head_dim));
+            max_score = fmaxf(max_score, score);
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) denom = 0.0f;
+    __syncthreads();
+
+    for (int token = 0; token < sequence_length; ++token) {
+        const int logical_block = token / block_size;
+        const int block_offset = token - logical_block * block_size;
+        const int physical_block = static_cast<int>(block_table[logical_block]);
+        const size_t kv_base = ((((static_cast<size_t>(b) * heads + h) * physical_blocks + physical_block) * block_size + block_offset) * head_dim);
+
+        float partial = 0.0f;
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            partial += query[query_base + d] * key_blocks[kv_base + d];
+        }
+        reduce[threadIdx.x] = partial;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const float score = reduce[0] * rsqrtf(static_cast<float>(head_dim));
+            weight = expf(score - max_score);
+            denom += weight;
+        }
+        __syncthreads();
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            acc[d] += weight * value_blocks[kv_base + d];
+        }
+        __syncthreads();
+    }
+
+    const size_t output_base = query_base;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        output[output_base + d] = acc[d] / denom;
+    }
+}
+
 // Computes one routed-expert group with FP16 Tensor Core GEMMs:
 //   gate = hidden @ gate_w.T ; up = hidden @ up_w.T
 //   activation = silu(gate) * up   (FP16)
@@ -908,6 +1001,83 @@ bool moe_expert_tensor_core_compute(
 }
 
 }  // namespace
+
+
+torch::Tensor paged_attention_decode(
+    torch::Tensor query,
+    torch::Tensor block_table,
+    torch::Tensor key_blocks,
+    torch::Tensor value_blocks,
+    int64_t sequence_length,
+    int64_t block_size) {
+    TORCH_CHECK(query.is_cuda(), "query must be CUDA");
+    TORCH_CHECK(block_table.is_cuda(), "block_table must be CUDA");
+    TORCH_CHECK(key_blocks.is_cuda(), "key_blocks must be CUDA");
+    TORCH_CHECK(value_blocks.is_cuda(), "value_blocks must be CUDA");
+    TORCH_CHECK(query.is_contiguous(), "query must be contiguous");
+    TORCH_CHECK(block_table.is_contiguous(), "block_table must be contiguous");
+    TORCH_CHECK(key_blocks.is_contiguous(), "key_blocks must be contiguous");
+    TORCH_CHECK(value_blocks.is_contiguous(), "value_blocks must be contiguous");
+    TORCH_CHECK(query.scalar_type() == at::kFloat, "query must be float32");
+    TORCH_CHECK(key_blocks.scalar_type() == at::kFloat, "key_blocks must be float32");
+    TORCH_CHECK(value_blocks.scalar_type() == at::kFloat, "value_blocks must be float32");
+    TORCH_CHECK(block_table.scalar_type() == at::kLong, "block_table must be int64/torch.long");
+    TORCH_CHECK(query.dim() == 4, "query must have shape [batch, heads, 1, head_dim]");
+    TORCH_CHECK(key_blocks.dim() == 5, "key_blocks must have shape [batch, heads, blocks, block_size, head_dim]");
+    TORCH_CHECK(value_blocks.dim() == 5, "value_blocks must have shape [batch, heads, blocks, block_size, head_dim]");
+    TORCH_CHECK(block_table.dim() == 1, "block_table must be rank-1");
+    TORCH_CHECK(query.size(2) == 1, "query seq_len must be 1 for paged decode");
+    TORCH_CHECK(sequence_length > 0, "sequence_length must be positive");
+    TORCH_CHECK(block_size > 0, "block_size must be positive");
+
+    const auto batch64 = query.size(0);
+    const auto heads64 = query.size(1);
+    const auto head_dim64 = query.size(3);
+    const auto physical_blocks64 = key_blocks.size(2);
+    TORCH_CHECK(batch64 > 0 && batch64 <= INT_MAX, "batch must be positive and fit int32");
+    TORCH_CHECK(heads64 > 0 && heads64 <= INT_MAX, "heads must be positive and fit int32");
+    TORCH_CHECK(head_dim64 > 0 && head_dim64 <= 1024, "head_dim must be in [1, 1024]");
+    TORCH_CHECK(physical_blocks64 > 0 && physical_blocks64 <= INT_MAX, "physical block count must be positive and fit int32");
+    TORCH_CHECK(block_size <= INT_MAX, "block_size must fit int32");
+    TORCH_CHECK(sequence_length <= INT_MAX, "sequence_length must fit int32");
+    TORCH_CHECK(key_blocks.size(0) == batch64 && value_blocks.size(0) == batch64, "KV batch must match query");
+    TORCH_CHECK(key_blocks.size(1) == heads64 && value_blocks.size(1) == heads64, "KV heads must match query");
+    TORCH_CHECK(key_blocks.size(2) == value_blocks.size(2), "key/value physical block count must match");
+    TORCH_CHECK(key_blocks.size(3) == block_size && value_blocks.size(3) == block_size, "KV block_size mismatch");
+    TORCH_CHECK(key_blocks.size(4) == head_dim64 && value_blocks.size(4) == head_dim64, "KV head_dim must match query");
+    const int64_t logical_blocks = (sequence_length + block_size - 1) / block_size;
+    TORCH_CHECK(block_table.size(0) >= logical_blocks, "block_table does not cover sequence_length");
+
+    c10::cuda::CUDAGuard device_guard(query.device());
+    TORCH_CHECK(block_table.device() == query.device(), "block_table must be on same CUDA device as query");
+    TORCH_CHECK(key_blocks.device() == query.device(), "key_blocks must be on same CUDA device as query");
+    TORCH_CHECK(value_blocks.device() == query.device(), "value_blocks must be on same CUDA device as query");
+
+    const int batch = static_cast<int>(batch64);
+    const int heads = static_cast<int>(heads64);
+    const int physical_blocks = static_cast<int>(physical_blocks64);
+    const int block = static_cast<int>(block_size);
+    const int head_dim = static_cast<int>(head_dim64);
+    const int valid_tokens = static_cast<int>(sequence_length);
+    auto output = torch::empty_like(query);
+    auto stream = at::cuda::getCurrentCUDAStream(query.device().index()).stream();
+    const int threads = 256;
+    const size_t shared_bytes = static_cast<size_t>(threads + head_dim) * sizeof(float);
+    paged_attention_decode_f32_kernel<<<batch * heads, threads, shared_bytes, stream>>>(
+        query.data_ptr<float>(),
+        block_table.data_ptr<int64_t>(),
+        key_blocks.data_ptr<float>(),
+        value_blocks.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch,
+        heads,
+        physical_blocks,
+        block,
+        head_dim,
+        valid_tokens);
+    check_cuda(cudaGetLastError(), "paged_attention_decode_f32_kernel");
+    return output;
+}
 
 
 torch::Tensor fp8_e4m3_bf16_linear(torch::Tensor input, torch::Tensor weight, torch::Tensor scale) {

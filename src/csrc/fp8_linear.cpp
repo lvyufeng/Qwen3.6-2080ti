@@ -14,4 +14,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16", &moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16, "Qwen segmented offset grouped FP8 MoE dispatch");
     m.def("moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16", &moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16, "Qwen assignment-parallel offset grouped FP8 MoE dispatch");
     m.def("linear_attention_recurrent_core", &linear_attention_recurrent_core, "Qwen linear-attention recurrent gated-delta core");
+    m.def("paged_attention_decode", &paged_attention_decode, "Qwen native paged full-attention decode");
 }

@@ -265,7 +265,12 @@ class FullAttentionCache:
         return len(self.block_table) * self.block_size
 
     def append(self, key: Any, value: Any) -> tuple[Any, Any]:
-        batch, heads, seq, head_dim = key.shape
+        self.append_blocks(key, value)
+        return self.as_tensors()
+
+    def append_blocks(self, key: Any, value: Any) -> None:
+        """Append KV into paged blocks without materializing the dense valid KV view."""
+        _batch, _heads, seq, _head_dim = key.shape
         self.append_calls += 1
         self.appended_tokens += int(seq)
         needed = self.valid + seq
@@ -286,7 +291,6 @@ class FullAttentionCache:
             source_offset += take
             write_pos += take
         self.valid = needed
-        return self.as_tensors()
 
     def as_tensors(self) -> tuple[Any, Any]:
         if self.valid == 0:
