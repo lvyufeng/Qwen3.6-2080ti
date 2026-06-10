@@ -9,7 +9,7 @@ from reference_ops import linear, l2_norm, silu_mul
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the FP8 extension")
 def test_fp8_cuda_linear_matches_reference_dequant_matvec_and_cublas_paths() -> None:
     try:
-        from fp8_cuda import fp8_e4m3_bf16_linear
+        from fp8_cuda import fp8_e4m3_bf16_linear, fp8_native_stats, reset_fp8_native_stats
     except RuntimeError as exc:
         pytest.skip(str(exc))
 
@@ -17,11 +17,21 @@ def test_fp8_cuda_linear_matches_reference_dequant_matvec_and_cublas_paths() -> 
     torch.manual_seed(0)
     weight = (torch.randn((384, 256), device=device, dtype=torch.float32) * 0.05).to(torch.float8_e4m3fn)
     scale = torch.full((3, 2), 0.25, device=device, dtype=torch.bfloat16)
+    reset_fp8_native_stats()
     for batch in (3, 17):
         x = torch.randn((batch, 256), device=device, dtype=torch.float32)
         out = fp8_e4m3_bf16_linear(x, weight, scale)
         ref = linear(x, weight, scale, use_cuda_kernel=False)
         torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
+    stats = fp8_native_stats()
+    assert stats["dense_linear_calls"] == 2
+    import os
+
+    threshold = max(1, int(os.environ.get("QWEN36_FP8_LINEAR_CUBLAS_BATCH_THRESHOLD", "16")))
+    expected_matvec = sum(1 for batch in (3, 17) if batch < threshold)
+    assert stats["dense_linear_matvec_calls"] == expected_matvec
+    assert stats["dense_linear_cublas_calls"] == 2 - expected_matvec
+    assert stats["dense_linear_cublas_threshold_fallbacks"] == expected_matvec
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the paged attention extension")
@@ -192,7 +202,7 @@ def test_paged_attention_decode_batched_rejects_mismatched_pool_count() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the FP8 extension")
 def test_fp8_cuda_moe_expert_matches_reference_small_groups() -> None:
     try:
-        from fp8_cuda import fp8_e4m3_bf16_moe_expert
+        from fp8_cuda import fp8_e4m3_bf16_moe_expert, fp8_native_stats, reset_fp8_native_stats
     except RuntimeError as exc:
         pytest.skip(str(exc))
 
@@ -206,13 +216,22 @@ def test_fp8_cuda_moe_expert_matches_reference_small_groups() -> None:
     gate_scale = torch.full((3, 2), 0.25, device=device, dtype=torch.bfloat16)
     up_scale = torch.full((3, 2), 0.25, device=device, dtype=torch.bfloat16)
     down_scale = torch.full((2, 3), 0.25, device=device, dtype=torch.bfloat16)
-    for batch in (1, 3, 4, 8, 16, 32):
+    reset_fp8_native_stats()
+    batches = (1, 3, 4, 8, 16, 32)
+    for batch in batches:
         hidden = torch.randn((batch, hidden_size), device=device, dtype=torch.float32)
         out = fp8_e4m3_bf16_moe_expert(hidden, gate_weight, gate_scale, up_weight, up_scale, down_weight, down_scale)
         gate = linear(hidden, gate_weight, gate_scale, use_cuda_kernel=False)
         up = linear(hidden, up_weight, up_scale, use_cuda_kernel=False)
         ref = linear(silu_mul(gate, up), down_weight, down_scale, use_cuda_kernel=False)
         torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2)
+    stats = fp8_native_stats()
+    assert stats["moe_expert_calls"] == len(batches)
+    assert stats["moe_expert_calls"] == stats["moe_expert_tensor_core_hits"] + stats["moe_expert_scalar_hits"]
+    import os
+
+    if torch.cuda.get_device_capability(torch.device(device))[0] >= 7 and os.environ.get("QWEN36_NATIVE_MOE_TENSOR_CORE") != "0":
+        assert stats["moe_expert_tensor_core_hits"] >= 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the assignment planner extension")

@@ -2,9 +2,14 @@
 
 #include <torch/extension.h>
 
+#include <cstdint>
+#include <map>
+#include <string>
 #include <tuple>
 #include <vector>
 
+std::map<std::string, int64_t> fp8_native_stats();
+void reset_fp8_native_stats();
 torch::Tensor fp8_e4m3_bf16_linear(torch::Tensor input, torch::Tensor weight, torch::Tensor scale);
 torch::Tensor fp8_e4m3_bf16_moe_expert(
     torch::Tensor hidden,

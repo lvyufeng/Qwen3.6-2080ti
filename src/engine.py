@@ -66,6 +66,7 @@ class GenerateResult:
     total_tokens_per_second: float
     dispatch_stats: LinearDispatchStats
     paged_attention_stats: PagedAttentionDispatchStats
+    fp8_native_stats: dict[str, int]
     all_finite: bool
     cuda_memory: CudaMemoryStats
     profile: RuntimeProfileStats
@@ -184,6 +185,7 @@ class TpModelSession:
         if input_ids.shape[1] == 0:
             raise EngineError("TP generation requires at least one prompt token")
         weights.dispatch_stats = LinearDispatchStats()
+        _reset_fp8_native_stats()
         runtime.reset_profile()
         # Final cache length is prompt_tokens + max_new_tokens - 1; this upper bound lets the
         # full-attention buffers allocate once so the decode loop never reallocates.
@@ -402,6 +404,7 @@ class TpModelSession:
             total_tokens_per_second=state.max_new_tokens / total_seconds if total_seconds > 0 else float("inf"),
             dispatch_stats=weights.dispatch_stats,
             paged_attention_stats=runtime.paged_attention_stats.snapshot(),
+            fp8_native_stats=_fp8_native_stats_snapshot(),
             all_finite=all(state.step_all_finite),
             cuda_memory=_cuda_memory_stats(runtime.device),
             profile=profile,
@@ -519,6 +522,49 @@ def _cuda_graph_probe_result(
         reasons=tuple(dict.fromkeys(reasons)),
         notes=tuple(notes),
     )
+
+
+FP8_NATIVE_STAT_KEYS: tuple[str, ...] = (
+    "dense_linear_calls",
+    "dense_linear_matvec_calls",
+    "dense_linear_cublas_calls",
+    "dense_linear_cublas_threshold_fallbacks",
+    "dense_linear_workspace_resizes",
+    "moe_expert_calls",
+    "moe_expert_tensor_core_eligible",
+    "moe_expert_tensor_core_hits",
+    "moe_expert_tensor_core_workspace_fallbacks",
+    "moe_expert_scalar_hits",
+    "moe_tensor_core_workspace_resizes",
+    "moe_grouped_dispatch_calls",
+    "moe_grouped_dispatch_offsets_calls",
+    "moe_grouped_dispatch_offsets_segmented_calls",
+    "moe_grouped_dispatch_offsets_assignment_calls",
+)
+
+
+def _zero_fp8_native_stats() -> dict[str, int]:
+    return {key: 0 for key in FP8_NATIVE_STAT_KEYS}
+
+
+def _fp8_native_stats_snapshot() -> dict[str, int]:
+    stats = _zero_fp8_native_stats()
+    try:
+        from fp8_cuda import fp8_native_stats
+
+        stats.update({str(key): int(value) for key, value in fp8_native_stats().items()})
+    except Exception:
+        pass
+    return stats
+
+
+def _reset_fp8_native_stats() -> None:
+    try:
+        from fp8_cuda import reset_fp8_native_stats
+
+        reset_fp8_native_stats()
+    except Exception:
+        pass
 
 
 def materialize_generated_token_ids(state: GenerationRequestState) -> None:

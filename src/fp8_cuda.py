@@ -5,6 +5,14 @@ from typing import Any
 from cuda_loader import load_fp8_extension
 
 
+def fp8_native_stats() -> dict[str, int]:
+    return {str(key): int(value) for key, value in load_fp8_extension().fp8_native_stats().items()}
+
+
+def reset_fp8_native_stats() -> None:
+    load_fp8_extension().reset_fp8_native_stats()
+
+
 def fp8_e4m3_bf16_linear(input: Any, weight: Any, scale: Any) -> Any:
     return load_fp8_extension().fp8_e4m3_bf16_linear(input.contiguous(), weight.contiguous(), scale.contiguous())
 

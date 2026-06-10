@@ -354,6 +354,12 @@ def test_cli_tp_generate_single_rank(tmp_path: Path, capsys, monkeypatch: pytest
     assert "tp_generate_dispatch_moe_native_tensor_core_fallback_disabled:" in out
     assert "tp_generate_paged_attention_calls:" in out
     assert "tp_generate_paged_attention_dense_fallbacks:" in out
+    assert "tp_generate_fp8_native_dense_linear_calls:" in out
+    assert "tp_generate_fp8_native_dense_linear_matvec_calls:" in out
+    assert "tp_generate_fp8_native_dense_linear_cublas_calls:" in out
+    assert "tp_generate_fp8_native_moe_expert_calls:" in out
+    assert "tp_generate_fp8_native_moe_expert_tensor_core_hits:" in out
+    assert "tp_generate_fp8_native_moe_expert_scalar_hits:" in out
     assert "tp_generate_kv_full_attention_layers: 1" in out
     assert "tp_generate_kv_page_metadata_calls_total:" in out
     assert "tp_generate_kv_page_table_entries_total:" in out

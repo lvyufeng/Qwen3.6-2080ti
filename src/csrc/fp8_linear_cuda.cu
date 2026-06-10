@@ -9,18 +9,57 @@
 #include <torch/extension.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <vector>
 
 namespace {
 
 constexpr int kFp8BlockSize = 128;
-constexpr int kCublasBatchThreshold = 16;
+constexpr int kDefaultCublasBatchThreshold = 16;
+
+struct Fp8NativeStats {
+    std::atomic<int64_t> dense_linear_calls{0};
+    std::atomic<int64_t> dense_linear_matvec_calls{0};
+    std::atomic<int64_t> dense_linear_cublas_calls{0};
+    std::atomic<int64_t> dense_linear_cublas_threshold_fallbacks{0};
+    std::atomic<int64_t> dense_linear_workspace_resizes{0};
+    std::atomic<int64_t> moe_expert_calls{0};
+    std::atomic<int64_t> moe_expert_tensor_core_eligible{0};
+    std::atomic<int64_t> moe_expert_tensor_core_hits{0};
+    std::atomic<int64_t> moe_expert_tensor_core_workspace_fallbacks{0};
+    std::atomic<int64_t> moe_expert_scalar_hits{0};
+    std::atomic<int64_t> moe_tensor_core_workspace_resizes{0};
+    std::atomic<int64_t> moe_grouped_dispatch_calls{0};
+    std::atomic<int64_t> moe_grouped_dispatch_offsets_calls{0};
+    std::atomic<int64_t> moe_grouped_dispatch_offsets_segmented_calls{0};
+    std::atomic<int64_t> moe_grouped_dispatch_offsets_assignment_calls{0};
+};
+
+Fp8NativeStats& native_stats() {
+    static Fp8NativeStats stats;
+    return stats;
+}
+
+void inc(std::atomic<int64_t>& value) {
+    value.fetch_add(1, std::memory_order_relaxed);
+}
+
+int cublas_batch_threshold() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = std::getenv("QWEN36_FP8_LINEAR_CUBLAS_BATCH_THRESHOLD");
+        cached = env == nullptr ? kDefaultCublasBatchThreshold : std::max(1, std::atoi(env));
+    }
+    return cached;
+}
 
 __constant__ float kFp8E4M3Lut[256];
 
@@ -1109,6 +1148,47 @@ bool moe_expert_tensor_core_compute(
 }  // namespace
 
 
+std::map<std::string, int64_t> fp8_native_stats() {
+    Fp8NativeStats& stats = native_stats();
+    return {
+        {"dense_linear_calls", stats.dense_linear_calls.load(std::memory_order_relaxed)},
+        {"dense_linear_matvec_calls", stats.dense_linear_matvec_calls.load(std::memory_order_relaxed)},
+        {"dense_linear_cublas_calls", stats.dense_linear_cublas_calls.load(std::memory_order_relaxed)},
+        {"dense_linear_cublas_threshold_fallbacks", stats.dense_linear_cublas_threshold_fallbacks.load(std::memory_order_relaxed)},
+        {"dense_linear_workspace_resizes", stats.dense_linear_workspace_resizes.load(std::memory_order_relaxed)},
+        {"moe_expert_calls", stats.moe_expert_calls.load(std::memory_order_relaxed)},
+        {"moe_expert_tensor_core_eligible", stats.moe_expert_tensor_core_eligible.load(std::memory_order_relaxed)},
+        {"moe_expert_tensor_core_hits", stats.moe_expert_tensor_core_hits.load(std::memory_order_relaxed)},
+        {"moe_expert_tensor_core_workspace_fallbacks", stats.moe_expert_tensor_core_workspace_fallbacks.load(std::memory_order_relaxed)},
+        {"moe_expert_scalar_hits", stats.moe_expert_scalar_hits.load(std::memory_order_relaxed)},
+        {"moe_tensor_core_workspace_resizes", stats.moe_tensor_core_workspace_resizes.load(std::memory_order_relaxed)},
+        {"moe_grouped_dispatch_calls", stats.moe_grouped_dispatch_calls.load(std::memory_order_relaxed)},
+        {"moe_grouped_dispatch_offsets_calls", stats.moe_grouped_dispatch_offsets_calls.load(std::memory_order_relaxed)},
+        {"moe_grouped_dispatch_offsets_segmented_calls", stats.moe_grouped_dispatch_offsets_segmented_calls.load(std::memory_order_relaxed)},
+        {"moe_grouped_dispatch_offsets_assignment_calls", stats.moe_grouped_dispatch_offsets_assignment_calls.load(std::memory_order_relaxed)},
+    };
+}
+
+void reset_fp8_native_stats() {
+    Fp8NativeStats& stats = native_stats();
+    stats.dense_linear_calls.store(0, std::memory_order_relaxed);
+    stats.dense_linear_matvec_calls.store(0, std::memory_order_relaxed);
+    stats.dense_linear_cublas_calls.store(0, std::memory_order_relaxed);
+    stats.dense_linear_cublas_threshold_fallbacks.store(0, std::memory_order_relaxed);
+    stats.dense_linear_workspace_resizes.store(0, std::memory_order_relaxed);
+    stats.moe_expert_calls.store(0, std::memory_order_relaxed);
+    stats.moe_expert_tensor_core_eligible.store(0, std::memory_order_relaxed);
+    stats.moe_expert_tensor_core_hits.store(0, std::memory_order_relaxed);
+    stats.moe_expert_tensor_core_workspace_fallbacks.store(0, std::memory_order_relaxed);
+    stats.moe_expert_scalar_hits.store(0, std::memory_order_relaxed);
+    stats.moe_tensor_core_workspace_resizes.store(0, std::memory_order_relaxed);
+    stats.moe_grouped_dispatch_calls.store(0, std::memory_order_relaxed);
+    stats.moe_grouped_dispatch_offsets_calls.store(0, std::memory_order_relaxed);
+    stats.moe_grouped_dispatch_offsets_segmented_calls.store(0, std::memory_order_relaxed);
+    stats.moe_grouped_dispatch_offsets_assignment_calls.store(0, std::memory_order_relaxed);
+}
+
+
 torch::Tensor paged_attention_decode(
     torch::Tensor query,
     torch::Tensor block_table,
@@ -1328,14 +1408,24 @@ torch::Tensor fp8_e4m3_bf16_linear(torch::Tensor input, torch::Tensor weight, to
     auto* y_ptr = out.data_ptr<float>();
     const int scale_cols = cols / kFp8BlockSize;
     const int threads = 256;
+    inc(native_stats().dense_linear_calls);
+    const int threshold = cublas_batch_threshold();
 
-    if (batch < kCublasBatchThreshold) {
+    if (batch < threshold) {
+        inc(native_stats().dense_linear_matvec_calls);
+        inc(native_stats().dense_linear_cublas_threshold_fallbacks);
         fp8_e4m3_bf16_matvec_kernel<<<dim3(rows, batch), threads, threads * sizeof(float), stream>>>(
             x_ptr, w_ptr, s_ptr, y_ptr, rows, cols, scale_cols);
         check_cuda(cudaGetLastError(), "fp8_e4m3_bf16_matvec_kernel");
     } else {
+        inc(native_stats().dense_linear_cublas_calls);
         Fp8Workspace& ws = workspace();
-        TORCH_CHECK(ws.ensure(static_cast<size_t>(batch) * cols, static_cast<size_t>(rows) * cols), "failed to allocate FP8 workspace");
+        const size_t x_elems_needed = static_cast<size_t>(batch) * cols;
+        const size_t w_elems_needed = static_cast<size_t>(rows) * cols;
+        if (ws.x_cap < x_elems_needed || ws.w_cap < w_elems_needed) {
+            inc(native_stats().dense_linear_workspace_resizes);
+        }
+        TORCH_CHECK(ws.ensure(x_elems_needed, w_elems_needed), "failed to allocate FP8 workspace");
         const int64_t weight_elems = static_cast<int64_t>(rows) * cols;
         const int64_t x_elems = static_cast<int64_t>(batch) * cols;
         const int weight_blocks = static_cast<int>(std::min<int64_t>((weight_elems + threads - 1) / threads, 65535));
@@ -1422,6 +1512,7 @@ torch::Tensor fp8_e4m3_bf16_moe_expert(
     TORCH_CHECK(down_weight.device() == hidden.device(), "down_weight must be on same CUDA device as hidden");
     TORCH_CHECK(down_scale.device() == hidden.device(), "down_scale must be on same CUDA device as hidden");
     TORCH_CHECK(ensure_fp8_lut(), "failed to initialize FP8 LUT");
+    inc(native_stats().moe_expert_calls);
 
     const int batch = static_cast<int>(batch64);
     const int hidden_size = static_cast<int>(hidden64);
@@ -1441,6 +1532,20 @@ torch::Tensor fp8_e4m3_bf16_moe_expert(
                                       batch >= moe_tensor_core_min_group_tokens() &&
                                       hidden_size % 8 == 0 &&
                                       intermediate_size % 8 == 0;
+    if (tensor_core_eligible) {
+        inc(native_stats().moe_expert_tensor_core_eligible);
+        MoeTensorCoreWorkspace& ws = moe_tensor_core_workspace();
+        const size_t hidden_elems_needed = static_cast<size_t>(batch) * hidden_size;
+        const size_t activation_elems_needed = static_cast<size_t>(batch) * intermediate_size;
+        const size_t gate_w_elems_needed = static_cast<size_t>(intermediate_size) * hidden_size;
+        const size_t down_w_elems_needed = static_cast<size_t>(hidden_size) * intermediate_size;
+        if (ws.hidden_cap < hidden_elems_needed || ws.activation_cap < activation_elems_needed ||
+            ws.gate_w_cap < gate_w_elems_needed || ws.up_w_cap < gate_w_elems_needed ||
+            ws.down_w_cap < down_w_elems_needed || ws.gate_float_cap < activation_elems_needed ||
+            ws.up_float_cap < activation_elems_needed) {
+            inc(native_stats().moe_tensor_core_workspace_resizes);
+        }
+    }
     if (tensor_core_eligible &&
         moe_expert_tensor_core_compute(
             hidden_ptr,
@@ -1455,8 +1560,13 @@ torch::Tensor fp8_e4m3_bf16_moe_expert(
             hidden_size,
             intermediate_size,
             stream)) {
+        inc(native_stats().moe_expert_tensor_core_hits);
         return output;
     }
+    if (tensor_core_eligible) {
+        inc(native_stats().moe_expert_tensor_core_workspace_fallbacks);
+    }
+    inc(native_stats().moe_expert_scalar_hits);
 
     auto activation = torch::empty({batch, intermediate_size}, hidden.options());
     const int threads = 256;
@@ -1588,6 +1698,7 @@ torch::Tensor moe_grouped_dispatch_fp8_e4m3_bf16(
     TORCH_CHECK(unique_experts.device() == packed_hidden.device(), "unique_experts must be on same CUDA device as packed_hidden");
     TORCH_CHECK(counts.device() == packed_hidden.device(), "counts must be on same CUDA device as packed_hidden");
     TORCH_CHECK(ensure_fp8_lut(), "failed to initialize FP8 LUT");
+    inc(native_stats().moe_grouped_dispatch_calls);
 
     const auto hidden64 = packed_hidden.size(1);
     for (size_t index = 0; index < gate_weights.size(); ++index) {
@@ -1706,6 +1817,7 @@ torch::Tensor moe_grouped_dispatch_offsets_fp8_e4m3_bf16(
     TORCH_CHECK(counts.device() == flat_hidden.device(), "counts must be on same CUDA device as flat_hidden");
     TORCH_CHECK(offsets.device() == flat_hidden.device(), "offsets must be on same CUDA device as flat_hidden");
     TORCH_CHECK(ensure_fp8_lut(), "failed to initialize FP8 LUT");
+    inc(native_stats().moe_grouped_dispatch_offsets_calls);
 
     const auto hidden64 = flat_hidden.size(1);
     for (size_t index = 0; index < gate_weights.size(); ++index) {
@@ -1821,6 +1933,7 @@ torch::Tensor moe_grouped_dispatch_offsets_segmented_fp8_e4m3_bf16(
     TORCH_CHECK(counts.device() == flat_hidden.device(), "counts must be on same CUDA device as flat_hidden");
     TORCH_CHECK(offsets.device() == flat_hidden.device(), "offsets must be on same CUDA device as flat_hidden");
     TORCH_CHECK(ensure_fp8_lut(), "failed to initialize FP8 LUT");
+    inc(native_stats().moe_grouped_dispatch_offsets_segmented_calls);
 
     const auto hidden64 = flat_hidden.size(1);
     const int64_t local_experts64 = counts.size(0);
@@ -1995,6 +2108,7 @@ torch::Tensor moe_grouped_dispatch_offsets_assignment_fp8_e4m3_bf16(
     TORCH_CHECK(offsets.device() == flat_hidden.device(), "offsets must be on same CUDA device as flat_hidden");
     TORCH_CHECK(packed_local_experts.device() == flat_hidden.device(), "packed_local_experts must be on same CUDA device as flat_hidden");
     TORCH_CHECK(ensure_fp8_lut(), "failed to initialize FP8 LUT");
+    inc(native_stats().moe_grouped_dispatch_offsets_assignment_calls);
 
     const auto hidden64 = flat_hidden.size(1);
     const int64_t local_experts64 = counts.size(0);

@@ -276,6 +276,9 @@ def test_worker_load_then_generate_single_rank(tmp_path: Path, monkeypatch: pyte
     assert "moe_native_tensor_core_calls" in generate_result.data["dispatch"]
     assert "moe_native_tensor_core_hits" in generate_result.data["dispatch"]
     assert "moe_native_tensor_core_fallback_disabled" in generate_result.data["dispatch"]
+    assert generate_result.data["fp8_native"]["dense_linear_calls"] == 0
+    assert "moe_expert_tensor_core_hits" in generate_result.data["fp8_native"]
+    assert generate_result.data["runtime"]["fp8_native"]["dense_linear_calls"] == 0
     assert generate_result.data["paged_attention"]["calls"] >= 1
     assert generate_result.data["paged_attention"]["dense_fallbacks"] >= 1
     assert generate_result.data["paged_attention"]["native_hits"] == 0

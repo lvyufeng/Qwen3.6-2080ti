@@ -846,6 +846,7 @@ def _generate_result_data(result: GenerateResult) -> dict[str, Any]:
         "throughput": _throughput_data(result),
         "dispatch": _dispatch_stats_data(result),
         "paged_attention": result.paged_attention_stats.to_dict(),
+        "fp8_native": dict(result.fp8_native_stats),
         "memory": _cuda_memory_data(result),
         "profile": _profile_data(result),
         "kv_cache": _kv_cache_data(result),
@@ -861,6 +862,7 @@ def _runtime_data(result: GenerateResult) -> dict[str, Any]:
         "device": str(result.device),
         "fast_decode": result.fast_decode,
         "cuda_graph_probe": result.cuda_graph_probe.to_dict(),
+        "fp8_native": dict(result.fp8_native_stats),
     }
 
 

@@ -42,6 +42,8 @@ def test_tp_model_runner_generate_single_rank_cpu_gloo(tmp_path: Path, monkeypat
     assert result.decode_tokens_per_second >= 0
     assert result.total_tokens_per_second >= 0
     assert result.dispatch_stats.calls > 0
+    assert result.fp8_native_stats["dense_linear_calls"] == 0
+    assert "moe_expert_tensor_core_hits" in result.fp8_native_stats
     assert result.all_finite is True
     assert len(result.generated_token_ids) == 2
     assert result.text == "decoded:" + ",".join(str(token) for token in result.generated_token_ids)

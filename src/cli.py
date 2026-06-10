@@ -473,8 +473,11 @@ def _format_tp_generate_result(result: GenerateResult) -> list[str]:
         f"tp_generate_paged_attention_fallback_cpu: {result.paged_attention_stats.fallback_cpu}",
         f"tp_generate_paged_attention_fallback_per_request_pools: {result.paged_attention_stats.fallback_per_request_pools}",
         f"tp_generate_paged_attention_fallback_shape: {result.paged_attention_stats.fallback_shape}",
-        f"tp_generate_all_finite: {result.all_finite}",
     ]
+    lines.extend(_format_fp8_native_stats_lines("tp_generate", result.fp8_native_stats))
+    lines.extend([
+        f"tp_generate_all_finite: {result.all_finite}",
+    ])
     lines.extend(_format_kv_cache_lines("tp_generate", result.kv_cache.to_dict()))
     lines.extend(_format_profile_lines("tp_generate", result.profile.to_dict()))
     memory = result.cuda_memory
@@ -497,6 +500,27 @@ def _format_tp_generate_result(result: GenerateResult) -> list[str]:
             ]
         )
     return lines
+
+
+def _format_fp8_native_stats_lines(prefix: str, stats: dict[str, int]) -> list[str]:
+    keys = [
+        "dense_linear_calls",
+        "dense_linear_matvec_calls",
+        "dense_linear_cublas_calls",
+        "dense_linear_cublas_threshold_fallbacks",
+        "dense_linear_workspace_resizes",
+        "moe_expert_calls",
+        "moe_expert_tensor_core_eligible",
+        "moe_expert_tensor_core_hits",
+        "moe_expert_tensor_core_workspace_fallbacks",
+        "moe_expert_scalar_hits",
+        "moe_tensor_core_workspace_resizes",
+        "moe_grouped_dispatch_calls",
+        "moe_grouped_dispatch_offsets_calls",
+        "moe_grouped_dispatch_offsets_segmented_calls",
+        "moe_grouped_dispatch_offsets_assignment_calls",
+    ]
+    return [f"{prefix}_fp8_native_{key}: {int(stats.get(key, 0))}" for key in keys]
 
 
 def _format_kv_cache_lines(prefix: str, kv_cache: dict[str, object]) -> list[str]:
