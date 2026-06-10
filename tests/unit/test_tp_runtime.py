@@ -789,6 +789,39 @@ def test_batched_native_paged_decode_matches_dense_reference_without_dense_views
     assert all(cache.stats().gather_view_calls == 0 for cache in caches)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native paged attention helper")
+def test_batched_native_paged_decode_handles_uneven_pool_sizes() -> None:
+    torch.manual_seed(7)
+    caches: list[FullAttentionCache] = []
+    dense_keys: list[torch.Tensor] = []
+    dense_values: list[torch.Tensor] = []
+    for row, seq in enumerate((1, 9, 4)):
+        cache = FullAttentionCache(block_size=2)
+        key = torch.randn((1, 2, seq, 4), device="cuda") + row
+        value = torch.randn((1, 2, seq, 4), device="cuda") - row
+        cache.append_blocks(key, value)
+        caches.append(cache)
+        dense_keys.append(key)
+        dense_values.append(value)
+    assert len({cache.key_blocks.shape[2] for cache in caches}) > 1
+
+    query = torch.randn((3, 2, 1, 4), device="cuda")
+    page_tables = batch_page_tables(caches)
+
+    actual = _tp_full_attention_batch_native_paged_decode(query, page_tables, caches)
+    expected = torch.cat(
+        [
+            _dense_decode_attention_reference(query[row : row + 1], dense_keys[row], dense_values[row])
+            for row in range(len(caches))
+        ],
+        dim=0,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+    assert all(cache.stats().contiguous_view_calls == 0 for cache in caches)
+    assert all(cache.stats().gather_view_calls == 0 for cache in caches)
+
+
 def _dense_decode_attention_reference(query: torch.Tensor, dense_key: torch.Tensor, dense_value: torch.Tensor) -> torch.Tensor:
     scores = torch.matmul(query.float(), dense_key.float().transpose(2, 3)) * (query.shape[-1] ** -0.5)
     probs = torch.softmax(scores, dim=-1, dtype=torch.float32)

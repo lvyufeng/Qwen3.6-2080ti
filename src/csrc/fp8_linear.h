@@ -105,3 +105,10 @@ torch::Tensor paged_attention_decode(
     torch::Tensor value_blocks,
     int64_t sequence_length,
     int64_t block_size);
+torch::Tensor paged_attention_decode_batched(
+    torch::Tensor query,
+    torch::Tensor block_tables,
+    std::vector<torch::Tensor> key_blocks,
+    std::vector<torch::Tensor> value_blocks,
+    torch::Tensor sequence_lengths,
+    int64_t block_size);

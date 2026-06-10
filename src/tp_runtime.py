@@ -623,24 +623,23 @@ def _tp_full_attention_native_paged_decode(query: Any, page_table: Any) -> Any:
 
 
 def _tp_full_attention_batch_native_paged_decode(query: Any, page_tables: Any, caches: Sequence[FullAttentionCache]) -> Any:
-    import torch
-    from fp8_cuda import paged_attention_decode
+    from fp8_cuda import paged_attention_decode_batched
 
-    heads = []
-    for row, cache in enumerate(caches):
+    key_blocks = []
+    value_blocks = []
+    for cache in caches:
         if cache.key_blocks is None or cache.value_blocks is None:
             raise RuntimeError("native batched paged attention requires allocated block storage")
-        heads.append(
-            paged_attention_decode(
-                query[row : row + 1],
-                page_tables.block_tables[row],
-                cache.key_blocks,
-                cache.value_blocks,
-                int(cache.valid),
-                int(page_tables.block_size),
-            )
-        )
-    return torch.cat(heads, dim=0)
+        key_blocks.append(cache.key_blocks)
+        value_blocks.append(cache.value_blocks)
+    return paged_attention_decode_batched(
+        query,
+        page_tables.block_tables,
+        key_blocks,
+        value_blocks,
+        page_tables.sequence_lengths,
+        int(page_tables.block_size),
+    )
 
 
 def _batched_paged_attention_fallback_reason(

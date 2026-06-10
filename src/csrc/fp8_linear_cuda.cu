@@ -913,6 +913,112 @@ __global__ void paged_attention_decode_f32_kernel(
     }
 }
 
+__global__ void paged_attention_decode_batched_f32_kernel(
+    const float* __restrict__ query,
+    const int64_t* __restrict__ block_tables,
+    const float* const* __restrict__ key_block_ptrs,
+    const float* const* __restrict__ value_block_ptrs,
+    const int64_t* __restrict__ physical_block_counts,
+    const int64_t* __restrict__ sequence_lengths,
+    float* __restrict__ output,
+    int batch,
+    int heads,
+    int max_blocks,
+    int block_size,
+    int head_dim) {
+    const int head_index = blockIdx.x;
+    const int b = head_index / heads;
+    const int h = head_index - b * heads;
+    if (b >= batch) return;
+
+    extern __shared__ float shared[];
+    float* reduce = shared;
+    float* acc = shared + blockDim.x;
+    __shared__ float max_score;
+    __shared__ float weight;
+    __shared__ float denom;
+
+    const int sequence_length = static_cast<int>(sequence_lengths[b]);
+    const int physical_blocks = static_cast<int>(physical_block_counts[b]);
+    const float* key_blocks = key_block_ptrs[b];
+    const float* value_blocks = value_block_ptrs[b];
+    const int64_t* block_table = block_tables + static_cast<size_t>(b) * max_blocks;
+    const size_t query_base = (static_cast<size_t>(b) * heads + h) * head_dim;
+
+    if (sequence_length <= 0) {
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            output[query_base + d] = 0.0f;
+        }
+        return;
+    }
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        acc[d] = 0.0f;
+    }
+    if (threadIdx.x == 0) max_score = -3.402823e38f;
+    __syncthreads();
+
+    for (int token = 0; token < sequence_length; ++token) {
+        const int logical_block = token / block_size;
+        const int block_offset = token - logical_block * block_size;
+        if (logical_block >= max_blocks) return;
+        const int physical_block = static_cast<int>(block_table[logical_block]);
+        if (physical_block < 0 || physical_block >= physical_blocks) return;
+        const size_t kv_base = ((static_cast<size_t>(h) * physical_blocks + physical_block) * block_size + block_offset) * head_dim;
+
+        float partial = 0.0f;
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            partial += query[query_base + d] * key_blocks[kv_base + d];
+        }
+        reduce[threadIdx.x] = partial;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const float score = reduce[0] * rsqrtf(static_cast<float>(head_dim));
+            max_score = fmaxf(max_score, score);
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) denom = 0.0f;
+    __syncthreads();
+
+    for (int token = 0; token < sequence_length; ++token) {
+        const int logical_block = token / block_size;
+        const int block_offset = token - logical_block * block_size;
+        const int physical_block = static_cast<int>(block_table[logical_block]);
+        const size_t kv_base = ((static_cast<size_t>(h) * physical_blocks + physical_block) * block_size + block_offset) * head_dim;
+
+        float partial = 0.0f;
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            partial += query[query_base + d] * key_blocks[kv_base + d];
+        }
+        reduce[threadIdx.x] = partial;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const float score = reduce[0] * rsqrtf(static_cast<float>(head_dim));
+            weight = expf(score - max_score);
+            denom += weight;
+        }
+        __syncthreads();
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            acc[d] += weight * value_blocks[kv_base + d];
+        }
+        __syncthreads();
+    }
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        output[query_base + d] = acc[d] / denom;
+    }
+}
+
 // Computes one routed-expert group with FP16 Tensor Core GEMMs:
 //   gate = hidden @ gate_w.T ; up = hidden @ up_w.T
 //   activation = silu(gate) * up   (FP16)
@@ -1076,6 +1182,105 @@ torch::Tensor paged_attention_decode(
         head_dim,
         valid_tokens);
     check_cuda(cudaGetLastError(), "paged_attention_decode_f32_kernel");
+    return output;
+}
+
+
+torch::Tensor paged_attention_decode_batched(
+    torch::Tensor query,
+    torch::Tensor block_tables,
+    std::vector<torch::Tensor> key_blocks,
+    std::vector<torch::Tensor> value_blocks,
+    torch::Tensor sequence_lengths,
+    int64_t block_size) {
+    TORCH_CHECK(query.is_cuda(), "query must be CUDA");
+    TORCH_CHECK(block_tables.is_cuda(), "block_tables must be CUDA");
+    TORCH_CHECK(sequence_lengths.is_cuda(), "sequence_lengths must be CUDA");
+    TORCH_CHECK(query.is_contiguous(), "query must be contiguous");
+    TORCH_CHECK(block_tables.is_contiguous(), "block_tables must be contiguous");
+    TORCH_CHECK(sequence_lengths.is_contiguous(), "sequence_lengths must be contiguous");
+    TORCH_CHECK(query.scalar_type() == at::kFloat, "query must be float32");
+    TORCH_CHECK(block_tables.scalar_type() == at::kLong, "block_tables must be int64/torch.long");
+    TORCH_CHECK(sequence_lengths.scalar_type() == at::kLong, "sequence_lengths must be int64/torch.long");
+    TORCH_CHECK(query.dim() == 4, "query must have shape [batch, heads, 1, head_dim]");
+    TORCH_CHECK(block_tables.dim() == 2, "block_tables must have shape [batch, max_blocks]");
+    TORCH_CHECK(sequence_lengths.dim() == 1, "sequence_lengths must be rank-1");
+    TORCH_CHECK(query.size(2) == 1, "query seq_len must be 1 for paged decode");
+    TORCH_CHECK(block_size > 0, "block_size must be positive");
+    TORCH_CHECK(block_size <= INT_MAX, "block_size must fit int32");
+
+    const auto batch64 = query.size(0);
+    const auto heads64 = query.size(1);
+    const auto head_dim64 = query.size(3);
+    const auto max_blocks64 = block_tables.size(1);
+    TORCH_CHECK(batch64 > 0 && batch64 <= INT_MAX, "batch must be positive and fit int32");
+    TORCH_CHECK(heads64 > 0 && heads64 <= INT_MAX, "heads must be positive and fit int32");
+    TORCH_CHECK(head_dim64 > 0 && head_dim64 <= 1024, "head_dim must be in [1, 1024]");
+    TORCH_CHECK(max_blocks64 > 0 && max_blocks64 <= INT_MAX, "max_blocks must be positive and fit int32");
+    TORCH_CHECK(block_tables.size(0) == batch64, "block_tables batch must match query");
+    TORCH_CHECK(sequence_lengths.size(0) == batch64, "sequence_lengths batch must match query");
+    TORCH_CHECK(static_cast<int64_t>(key_blocks.size()) == batch64, "key_blocks list length must match batch");
+    TORCH_CHECK(static_cast<int64_t>(value_blocks.size()) == batch64, "value_blocks list length must match batch");
+
+    c10::cuda::CUDAGuard device_guard(query.device());
+    TORCH_CHECK(block_tables.device() == query.device(), "block_tables must be on same CUDA device as query");
+    TORCH_CHECK(sequence_lengths.device() == query.device(), "sequence_lengths must be on same CUDA device as query");
+
+    const size_t batch = static_cast<size_t>(batch64);
+    std::vector<int64_t> key_ptr_host(batch);
+    std::vector<int64_t> value_ptr_host(batch);
+    std::vector<int64_t> physical_block_host(batch);
+    for (size_t row = 0; row < batch; ++row) {
+        const torch::Tensor& key = key_blocks[row];
+        const torch::Tensor& value = value_blocks[row];
+        TORCH_CHECK(key.is_cuda() && value.is_cuda(), "key/value blocks must be CUDA");
+        TORCH_CHECK(key.device() == query.device() && value.device() == query.device(), "key/value blocks must be on same CUDA device as query");
+        TORCH_CHECK(key.is_contiguous() && value.is_contiguous(), "key/value blocks must be contiguous");
+        TORCH_CHECK(key.scalar_type() == at::kFloat && value.scalar_type() == at::kFloat, "key/value blocks must be float32");
+        TORCH_CHECK(key.dim() == 5 && value.dim() == 5, "key/value blocks must have shape [1, heads, blocks, block_size, head_dim]");
+        TORCH_CHECK(key.size(0) == 1 && value.size(0) == 1, "per-request KV pools must have batch dim 1");
+        TORCH_CHECK(key.size(1) == heads64 && value.size(1) == heads64, "KV heads must match query");
+        TORCH_CHECK(key.size(2) == value.size(2), "key/value physical block count must match");
+        TORCH_CHECK(key.size(2) > 0 && key.size(2) <= INT_MAX, "physical block count must be positive and fit int32");
+        TORCH_CHECK(key.size(3) == block_size && value.size(3) == block_size, "KV block_size mismatch");
+        TORCH_CHECK(key.size(4) == head_dim64 && value.size(4) == head_dim64, "KV head_dim must match query");
+        key_ptr_host[row] = reinterpret_cast<int64_t>(key.data_ptr<float>());
+        value_ptr_host[row] = reinterpret_cast<int64_t>(value.data_ptr<float>());
+        physical_block_host[row] = key.size(2);
+    }
+
+    auto pointer_options = query.options().dtype(at::kLong);
+    auto key_ptrs = torch::empty({batch64}, pointer_options);
+    auto value_ptrs = torch::empty({batch64}, pointer_options);
+    auto physical_block_counts = torch::empty({batch64}, pointer_options);
+    auto stream = at::cuda::getCurrentCUDAStream(query.device().index()).stream();
+    const size_t pointer_bytes = batch * sizeof(int64_t);
+    check_cuda(cudaMemcpyAsync(key_ptrs.data_ptr<int64_t>(), key_ptr_host.data(), pointer_bytes, cudaMemcpyHostToDevice, stream), "copy key block pointers");
+    check_cuda(cudaMemcpyAsync(value_ptrs.data_ptr<int64_t>(), value_ptr_host.data(), pointer_bytes, cudaMemcpyHostToDevice, stream), "copy value block pointers");
+    check_cuda(cudaMemcpyAsync(physical_block_counts.data_ptr<int64_t>(), physical_block_host.data(), pointer_bytes, cudaMemcpyHostToDevice, stream), "copy physical block counts");
+
+    const int batch_int = static_cast<int>(batch64);
+    const int heads = static_cast<int>(heads64);
+    const int head_dim = static_cast<int>(head_dim64);
+    const int max_blocks = static_cast<int>(max_blocks64);
+    const int block = static_cast<int>(block_size);
+    auto output = torch::empty_like(query);
+    const int threads = 256;
+    const size_t shared_bytes = static_cast<size_t>(threads + head_dim) * sizeof(float);
+    paged_attention_decode_batched_f32_kernel<<<batch_int * heads, threads, shared_bytes, stream>>>(
+        query.data_ptr<float>(),
+        block_tables.data_ptr<int64_t>(),
+        reinterpret_cast<const float* const*>(key_ptrs.data_ptr<int64_t>()),
+        reinterpret_cast<const float* const*>(value_ptrs.data_ptr<int64_t>()),
+        physical_block_counts.data_ptr<int64_t>(),
+        sequence_lengths.data_ptr<int64_t>(),
+        output.data_ptr<float>(),
+        batch_int,
+        heads,
+        max_blocks,
+        block,
+        head_dim);
+    check_cuda(cudaGetLastError(), "paged_attention_decode_batched_f32_kernel");
     return output;
 }
 

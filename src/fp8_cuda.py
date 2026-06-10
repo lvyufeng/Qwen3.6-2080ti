@@ -222,3 +222,21 @@ def paged_attention_decode(
         int(sequence_length),
         int(block_size),
     )
+
+
+def paged_attention_decode_batched(
+    query: Any,
+    block_tables: Any,
+    key_blocks: list[Any],
+    value_blocks: list[Any],
+    sequence_lengths: Any,
+    block_size: int,
+) -> Any:
+    return load_fp8_extension().paged_attention_decode_batched(
+        query.contiguous(),
+        block_tables.contiguous(),
+        list(key_blocks),
+        list(value_blocks),
+        sequence_lengths.contiguous(),
+        int(block_size),
+    )

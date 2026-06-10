@@ -92,6 +92,103 @@ def test_paged_attention_decode_rejects_non_float32_query() -> None:
         paged_attention_decode(query, block_table, key_blocks, value_blocks, 1, 2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the paged attention extension")
+def test_paged_attention_decode_batched_matches_dense_per_request_pools() -> None:
+    try:
+        from fp8_cuda import paged_attention_decode_batched
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(103)
+    heads, head_dim, block_size = 3, 8, 2
+    seq_lens = (3, 5, 8)
+    batch = len(seq_lens)
+    block_tables_rows = [
+        torch.tensor([1, 0], device=device, dtype=torch.long),
+        torch.tensor([2, 0, 1], device=device, dtype=torch.long),
+        torch.tensor([0, 3, 1, 2], device=device, dtype=torch.long),
+    ]
+    max_blocks = max(table.numel() for table in block_tables_rows)
+    block_tables = torch.full((batch, max_blocks), -1, device=device, dtype=torch.long)
+    query = torch.randn((batch, heads, 1, head_dim), device=device, dtype=torch.float32)
+    key_blocks = []
+    value_blocks = []
+    refs = []
+    for row, seq_len in enumerate(seq_lens):
+        dense_key = torch.randn((1, heads, seq_len, head_dim), device=device, dtype=torch.float32)
+        dense_value = torch.randn((1, heads, seq_len, head_dim), device=device, dtype=torch.float32)
+        table = block_tables_rows[row]
+        block_tables[row, : table.numel()] = table
+        row_key, row_value = _pack_dense_kv_blocks(
+            dense_key,
+            dense_value,
+            table,
+            block_size,
+            physical_blocks=int(table.max().item()) + 1 + row,
+            fill=1000.0,
+        )
+        key_blocks.append(row_key)
+        value_blocks.append(row_value)
+        refs.append(_dense_decode_attention_reference(query[row : row + 1], dense_key, dense_value))
+    sequence_lengths = torch.tensor(seq_lens, device=device, dtype=torch.long)
+
+    out = paged_attention_decode_batched(query, block_tables, key_blocks, value_blocks, sequence_lengths, block_size)
+
+    torch.testing.assert_close(out, torch.cat(refs, dim=0), atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the paged attention extension")
+def test_paged_attention_decode_batched_matches_single_request_kernel() -> None:
+    try:
+        from fp8_cuda import paged_attention_decode, paged_attention_decode_batched
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    torch.manual_seed(104)
+    heads, head_dim, block_size = 2, 16, 4
+    seq_lens = (1, 7)
+    batch = len(seq_lens)
+    query = torch.randn((batch, heads, 1, head_dim), device=device, dtype=torch.float32)
+    block_tables = torch.full((batch, 2), -1, device=device, dtype=torch.long)
+    key_blocks = []
+    value_blocks = []
+    singles = []
+    for row, seq_len in enumerate(seq_lens):
+        logical_blocks = (seq_len + block_size - 1) // block_size
+        table = torch.arange(logical_blocks, device=device, dtype=torch.long)
+        block_tables[row, :logical_blocks] = table
+        row_key = torch.randn((1, heads, logical_blocks, block_size, head_dim), device=device, dtype=torch.float32)
+        row_value = torch.randn((1, heads, logical_blocks, block_size, head_dim), device=device, dtype=torch.float32)
+        key_blocks.append(row_key)
+        value_blocks.append(row_value)
+        singles.append(paged_attention_decode(query[row : row + 1], table, row_key, row_value, seq_len, block_size))
+    sequence_lengths = torch.tensor(seq_lens, device=device, dtype=torch.long)
+
+    out = paged_attention_decode_batched(query, block_tables, key_blocks, value_blocks, sequence_lengths, block_size)
+
+    torch.testing.assert_close(out, torch.cat(singles, dim=0), atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the paged attention extension")
+def test_paged_attention_decode_batched_rejects_mismatched_pool_count() -> None:
+    try:
+        from fp8_cuda import paged_attention_decode_batched
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+    query = torch.zeros((2, 1, 1, 8), device=device, dtype=torch.float32)
+    block_tables = torch.zeros((2, 1), device=device, dtype=torch.long)
+    key_blocks = [torch.zeros((1, 1, 1, 2, 8), device=device, dtype=torch.float32)]
+    value_blocks = [torch.zeros((1, 1, 1, 2, 8), device=device, dtype=torch.float32)]
+    sequence_lengths = torch.ones((2,), device=device, dtype=torch.long)
+
+    with pytest.raises(RuntimeError, match="key_blocks list length must match batch"):
+        paged_attention_decode_batched(query, block_tables, key_blocks, value_blocks, sequence_lengths, 2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the FP8 extension")
 def test_fp8_cuda_moe_expert_matches_reference_small_groups() -> None:
     try:
