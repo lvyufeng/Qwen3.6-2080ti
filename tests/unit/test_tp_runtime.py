@@ -13,7 +13,7 @@ from checkpoint import TensorInfo, build_manifest
 from reference_ops import LinearDispatchStats, ReferenceWeights, decoder_layer, language_model
 from runtime_config import parse_runtime_config
 from tensor_parallel import TensorParallel
-from decode_state import DecodeState
+from decode_state import DecodeState, FullAttentionCache, batch_page_tables
 from tp_runtime import (
     RuntimeProfileConfig,
     TpLaunchConfig,
@@ -26,7 +26,9 @@ from tp_runtime import (
     tp_greedy_next_tokens,
     tp_language_model,
     tp_moe,
+    _batched_paged_attention_fallback_reason,
     _record_paged_attention_dispatch,
+    _tp_full_attention_batch_native_paged_decode,
     _recurrent_gated_delta_rule,
     _try_native_moe_assignment_offsets,
     _try_native_moe_assignment_offsets_with_experts,
@@ -720,6 +722,77 @@ def test_paged_attention_dispatch_records_native_hit() -> None:
     assert stats.native_hits == 1
     assert stats.dense_fallbacks == 0
     assert stats.fallback_no_kernel == 0
+
+
+def test_batched_paged_attention_fallback_reason_reports_disabled_without_page_tables() -> None:
+    config = parse_runtime_config(_config())
+    config = replace(config, full_attention=replace(config.full_attention, paged_kv_metadata=True, native_paged_attention=True))
+    cache = FullAttentionCache(block_size=2)
+    cache.append_blocks(*_paged_reason_kv())
+
+    reason = _batched_paged_attention_fallback_reason(
+        config, torch.zeros((1, 2, 1, 4)), [cache], None, seq_len=1
+    )
+
+    assert reason == "disabled"
+
+
+def test_batched_paged_attention_fallback_reason_reports_cpu_for_cpu_caches() -> None:
+    config = parse_runtime_config(_config())
+    config = replace(config, full_attention=replace(config.full_attention, paged_kv_metadata=True, native_paged_attention=True))
+    cache = FullAttentionCache(block_size=2)
+    cache.append_blocks(*_paged_reason_kv())
+    page_tables = batch_page_tables([cache])
+
+    reason = _batched_paged_attention_fallback_reason(
+        config, torch.zeros((1, 2, 1, 4)), [cache], page_tables, seq_len=1
+    )
+
+    assert reason == "cpu"
+
+
+def _paged_reason_kv() -> tuple[torch.Tensor, torch.Tensor]:
+    key = torch.zeros((1, 2, 1, 4), dtype=torch.float32)
+    value = torch.zeros((1, 2, 1, 4), dtype=torch.float32)
+    return key, value
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for native paged attention helper")
+def test_batched_native_paged_decode_matches_dense_reference_without_dense_views() -> None:
+    torch.manual_seed(0)
+    caches: list[FullAttentionCache] = []
+    dense_keys: list[torch.Tensor] = []
+    dense_values: list[torch.Tensor] = []
+    for row, seq in enumerate((3, 5)):
+        cache = FullAttentionCache(block_size=2)
+        key = torch.randn((1, 2, seq, 4), device="cuda") + row
+        value = torch.randn((1, 2, seq, 4), device="cuda") - row
+        cache.append_blocks(key, value)
+        caches.append(cache)
+        dense_keys.append(key)
+        dense_values.append(value)
+
+    query = torch.randn((2, 2, 1, 4), device="cuda")
+    page_tables = batch_page_tables(caches)
+
+    actual = _tp_full_attention_batch_native_paged_decode(query, page_tables, caches)
+    expected = torch.cat(
+        [
+            _dense_decode_attention_reference(query[row : row + 1], dense_keys[row], dense_values[row])
+            for row in range(len(caches))
+        ],
+        dim=0,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+    assert all(cache.stats().contiguous_view_calls == 0 for cache in caches)
+    assert all(cache.stats().gather_view_calls == 0 for cache in caches)
+
+
+def _dense_decode_attention_reference(query: torch.Tensor, dense_key: torch.Tensor, dense_value: torch.Tensor) -> torch.Tensor:
+    scores = torch.matmul(query.float(), dense_key.float().transpose(2, 3)) * (query.shape[-1] ** -0.5)
+    probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
+    return torch.matmul(probs, dense_value.float())
 
 
 def test_tp_greedy_next_tokens_single_rank_batch_matches_argmax() -> None:

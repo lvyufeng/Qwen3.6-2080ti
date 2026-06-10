@@ -622,6 +622,54 @@ def _tp_full_attention_native_paged_decode(query: Any, page_table: Any) -> Any:
     )
 
 
+def _tp_full_attention_batch_native_paged_decode(query: Any, page_tables: Any, caches: Sequence[FullAttentionCache]) -> Any:
+    import torch
+    from fp8_cuda import paged_attention_decode
+
+    heads = []
+    for row, cache in enumerate(caches):
+        if cache.key_blocks is None or cache.value_blocks is None:
+            raise RuntimeError("native batched paged attention requires allocated block storage")
+        heads.append(
+            paged_attention_decode(
+                query[row : row + 1],
+                page_tables.block_tables[row],
+                cache.key_blocks,
+                cache.value_blocks,
+                int(cache.valid),
+                int(page_tables.block_size),
+            )
+        )
+    return torch.cat(heads, dim=0)
+
+
+def _batched_paged_attention_fallback_reason(
+    config: RuntimeConfig,
+    query: Any,
+    caches: Sequence[FullAttentionCache],
+    page_tables: Any | None,
+    *,
+    seq_len: int,
+) -> str:
+    if page_tables is None:
+        return "disabled"
+    if not caches:
+        return "shape"
+    for row, cache in enumerate(caches):
+        reason = _paged_attention_fallback_reason(
+            config,
+            query[row : row + 1],
+            cache.key_blocks,
+            cache.value_blocks,
+            seq_len=seq_len,
+            batched=False,
+        )
+        if reason != "no_kernel":
+            return reason
+    return "no_kernel"
+
+
+
 def _tp_full_attention_finish_from_heads(
     heads: Any,
     gate: Any,
@@ -2368,11 +2416,12 @@ def _tp_full_attention_batch(
         key = key[:, head_start: head_start + local_heads]
         value = value[:, head_start: head_start + local_heads]
 
-    # Per-request cache append: each row has batch=1 in its cache
-    # key/value are (B, local_heads, 1, head_dim) — split per row
+    # Per-request cache append: each row has batch=1 in its cache. Use append_blocks
+    # so batched decode does not materialize dense K/V until a fallback actually needs it.
+    # key/value are (B, local_heads, 1, head_dim) — split per row.
     with runtime.profile_scope("batch.full_attention.cache_append"):
         for r in range(batch):
-            caches[r].append(key[r: r + 1], value[r: r + 1])
+            caches[r].append_blocks(key[r: r + 1], value[r: r + 1])
 
     return _tp_full_attention_batch_paged_or_dense(
         query,
@@ -2403,17 +2452,35 @@ def _tp_full_attention_batch_paged_or_dense(
     if config.full_attention.paged_kv_metadata:
         with runtime.profile_scope("batch.full_attention.page_metadata"):
             page_tables = batch_page_tables(caches)
-    with runtime.profile_scope("batch.full_attention.paged_dispatch"):
-        first_cache = next(cache for cache in caches if cache.key_blocks is not None and cache.value_blocks is not None)
-        _record_paged_attention_dispatch(
-            runtime,
-            config,
-            query,
-            first_cache.key_blocks,
-            first_cache.value_blocks,
-            seq_len=int(query.shape[2]),
-            batched=True,
-        )
+    reason = _batched_paged_attention_fallback_reason(
+        config,
+        query,
+        caches,
+        page_tables,
+        seq_len=int(query.shape[2]),
+    )
+    if reason == "no_kernel" and page_tables is not None:
+        try:
+            with runtime.profile_scope("batch.full_attention.native_paged"):
+                heads = _tp_full_attention_batch_native_paged_decode(query, page_tables, caches)
+            with runtime.profile_scope("batch.full_attention.paged_dispatch"):
+                _record_native_paged_dispatch(runtime, reason, native=True)
+            return _tp_full_attention_finish_from_heads(
+                heads,
+                gate,
+                hidden_states,
+                mapping,
+                config,
+                weights,
+                runtime,
+                scope_prefix="batch.full_attention",
+            )
+        except RuntimeError:
+            with runtime.profile_scope("batch.full_attention.paged_dispatch"):
+                _record_native_paged_dispatch(runtime, "no_kernel", native=False)
+    else:
+        with runtime.profile_scope("batch.full_attention.paged_dispatch"):
+            _record_native_paged_dispatch(runtime, reason, native=False)
     with runtime.profile_scope("batch.full_attention.dense_fallback"):
         return _tp_full_attention_batch_dense_from_kv(
             query,

@@ -396,6 +396,33 @@ def test_step_generations_batch_skips_redundant_token_broadcast(tmp_path: Path, 
     assert sync_calls == 0
 
 
+def test_step_generations_batch_appends_blocks_without_extra_dense_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_tiny_model(tmp_path)
+    _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
+    manifest = build_manifest(tmp_path)
+
+    with TpModelSession(manifest, parse_runtime_config(manifest.config), TpLaunchConfig(backend="gloo", device="cpu")) as session:
+        state_a = session.start_generation("hello", max_new_tokens=2)
+        state_b = session.start_generation("hello", max_new_tokens=2)
+        cache_a = state_a.decode_state.layers[0]
+        cache_b = state_b.decode_state.layers[0]
+        assert isinstance(cache_a, FullAttentionCache)
+        assert isinstance(cache_b, FullAttentionCache)
+        before_a = cache_a.stats()
+        before_b = cache_b.stats()
+
+        session.step_generations_batch([state_a, state_b])
+
+        after_a = cache_a.stats()
+        after_b = cache_b.stats()
+
+    assert after_a.append_calls == before_a.append_calls + 1
+    assert after_b.append_calls == before_b.append_calls + 1
+    assert after_a.contiguous_view_calls + after_a.gather_view_calls == before_a.contiguous_view_calls + before_a.gather_view_calls + 1
+    assert after_b.contiguous_view_calls + after_b.gather_view_calls == before_b.contiguous_view_calls + before_b.gather_view_calls + 1
+
+
+
 def test_tp_model_session_fast_decode_defers_step_syncs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_tiny_model(tmp_path)
     _patch_tokenizer(monkeypatch, torch.tensor([[1, 2]]))
